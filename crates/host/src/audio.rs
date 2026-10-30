@@ -1,4 +1,6 @@
 //! Windows default-output loopback; microphone devices are never opened.
+// Capture is Windows-only; elsewhere only the tests use most of this.
+#![cfg_attr(not(windows), allow(dead_code, unused_imports))]
 
 use anyhow::{Context, Result, bail, ensure};
 use bytes::Bytes;

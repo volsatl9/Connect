@@ -110,7 +110,7 @@ async fn allow_streams_video() {
         while frames < 10 {
             if let Some(frame) = client.take_frame() {
                 assert_eq!((frame.width, frame.height), (320, 240));
-                assert_eq!(frame.rgba.len(), 320 * 240 * 4);
+                assert_eq!(frame.yuv.len(), 320 * 240 * 3 / 2);
                 frames += 1;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -155,7 +155,7 @@ async fn high_refresh_video_decodes_over_datagrams() {
             while received < 20 {
                 if let Some(frame) = client.take_frame() {
                     assert_eq!((frame.width, frame.height), (640, 360));
-                    assert_eq!(frame.rgba.len(), 640 * 360 * 4);
+                    assert_eq!(frame.yuv.len(), 640 * 360 * 3 / 2);
                     assert!(previous.is_none_or(|seq| frame.meta.seq > seq));
                     previous = Some(frame.meta.seq);
                     received += 1;
@@ -449,7 +449,8 @@ async fn keyframe_request_is_honoured() {
     let mut asm = FrameAssembler::new();
     let mut next_frame = async || loop {
         let datagram = timeout(WAIT, conn.read_datagram()).await.unwrap().unwrap();
-        if let Some(frame) = asm.push(datagram).unwrap() {
+        asm.push(datagram).unwrap();
+        if let Some(frame) = asm.next_frame() {
             return frame;
         }
     };

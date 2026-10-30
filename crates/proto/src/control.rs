@@ -58,6 +58,13 @@ pub enum HostMsg {
         reason: Option<String>,
     },
     CursorShape(CursorShape),
+    /// How the host is fitting video to the connection, about once a second.
+    VideoStats {
+        /// The bitrate the encoder is aiming for now, at most the host's cap.
+        bitrate_kbps: u32,
+        /// Share of packets the path has been losing, in thousandths.
+        loss_permille: u16,
+    },
 }
 
 /// Serialises `msg` with its length prefix, ready to write to the stream.

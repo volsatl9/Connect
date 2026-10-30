@@ -10,6 +10,7 @@ mod session;
 mod settings;
 mod theme;
 mod updates;
+mod video;
 mod welcome;
 
 use std::{
@@ -65,6 +66,9 @@ pub fn run(runtime: Runtime, config_dir: PathBuf) -> Result<()> {
             .with_inner_size([980.0, 640.0])
             .with_min_inner_size([760.0, 520.0]),
         renderer,
+        // One frame queued for the screen, not two: a refresh less of delay.
+        wgpu_options: eframe::WgpuConfiguration::default()
+            .with_surface_config(eframe::egui_wgpu::SurfaceConfig::LOW_LATENCY),
         ..Default::default()
     };
     let handle = runtime.handle().clone();
@@ -109,6 +113,7 @@ impl Root {
         restart: Restart,
     ) -> Self {
         theme::apply(&cc.egui_ctx);
+        video::init(cc);
         let settings: Settings = cc.storage.and_then(|s| eframe::get_value(s, eframe::APP_KEY)).unwrap_or_default();
         let screen = match endpoint {
             Some(endpoint) => Screen::Main(Box::new(App::new(&cc.egui_ctx, endpoint, settings, restart.clone()))),
@@ -211,7 +216,9 @@ struct ClientSession {
     host_id: EndpointId,
     started: Instant,
     state: ClientState,
-    video: Option<egui::TextureHandle>,
+    video: video::VideoView,
+    /// The pointer position last sent to the host, and when.
+    pointer_sent: Option<((u16, u16, bool), Instant)>,
     host_cursor_texture: Option<(u64, egui::TextureHandle)>,
     encoder: String,
     audio_active: bool,
@@ -328,7 +335,8 @@ impl App {
             host_id,
             started: Instant::now(),
             state: ClientState::Connecting,
-            video: None,
+            video: Default::default(),
+            pointer_sent: None,
             host_cursor_texture: None,
             encoder: "Starting encoder…".into(),
             audio_active: false,

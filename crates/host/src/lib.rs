@@ -10,7 +10,9 @@ mod capture;
 mod cursor;
 mod encode;
 mod input;
+mod rate;
 mod session;
+mod yuv;
 
 use std::{
     collections::HashSet,

@@ -66,6 +66,10 @@ impl TestPattern {
 }
 
 impl Capturer for TestPattern {
+    fn refresh_hz(&self) -> Option<u32> {
+        Some((Duration::from_secs(1).as_secs_f64() / self.interval.as_secs_f64()).round() as u32)
+    }
+
     fn next_frame(&mut self, timeout: Duration) -> Result<Option<Frame<'_>>> {
         let now = Instant::now();
         if self.next_at > now {

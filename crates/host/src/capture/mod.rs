@@ -49,4 +49,9 @@ pub(crate) struct Frame<'a> {
 pub(crate) trait Capturer {
     /// Waits up to `timeout` for the screen to change; `Ok(None)` if it didn't.
     fn next_frame(&mut self, timeout: Duration) -> Result<Option<Frame<'_>>>;
+
+    /// How many times a second the source can change, if known.
+    fn refresh_hz(&self) -> Option<u32> {
+        None
+    }
 }

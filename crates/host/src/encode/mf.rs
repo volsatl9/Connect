@@ -1,7 +1,8 @@
 //! Direct hardware-only Media Foundation H.264 encoding.
 //!
-//! The object, COM apartment and MF startup all belong to the capture thread. CPU I420 to
-//! NV12 packing is intentional; the selected encoder itself must be a hardware MFT.
+//! The object, COM apartment and MF startup all belong to the capture thread. Pictures arrive
+//! as NV12 in CPU memory, converted straight from the captured image; the selected encoder
+//! itself must be a hardware MFT.
 
 use std::{
     marker::PhantomData,
@@ -11,7 +12,8 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
-use openh264::formats::YUVSource;
+
+use crate::yuv::{Layout, Picture};
 use windows::{
     Win32::{
         Foundation::{E_NOTIMPL, S_FALSE, S_OK},
@@ -29,6 +31,9 @@ const MAX_RAW_BYTES: usize = 128 * 1024 * 1024;
 const FRAME_TIMEOUT: Duration = Duration::from_millis(500);
 const START_TIMEOUT: Duration = Duration::from_secs(2);
 const GOP_FRAMES: u64 = 600;
+/// How long to wait between looks at a hardware encoder that isn't ready yet: short, as a
+/// frame takes only a few milliseconds and every one waited past adds to the delay.
+const WAIT_STEP: Duration = Duration::from_micros(200);
 
 pub(crate) struct HardwareFrame {
     pub data: Vec<u8>,
@@ -51,6 +56,8 @@ pub(crate) struct HardwareEncoder {
     output_credit: u32,
     frames: u64,
     last_timestamp: Option<i64>,
+    /// Whether the driver has already turned down a bitrate change, so it isn't asked again.
+    fixed_bitrate: bool,
     bitstream: H264Bitstream,
     // Declared last: all COM interfaces are released before MF/COM shutdown.
     _runtime: Runtime,
@@ -62,7 +69,7 @@ impl Runtime {
     fn new() -> Result<Self> {
         unsafe {
             CoInitializeEx(None, COINIT_MULTITHREADED).ok().context("initializing video COM apartment")?;
-            if let Err(error) = MFStartup(MF_VERSION, MFSTARTUP_FULL) {
+            if let Err(error) = mfplat::startup(MF_VERSION, MFSTARTUP_FULL) {
                 CoUninitialize();
                 return Err(error).context("starting Media Foundation");
             }
@@ -74,7 +81,7 @@ impl Runtime {
 impl Drop for Runtime {
     fn drop(&mut self) {
         unsafe {
-            let _ = MFShutdown();
+            mfplat::shutdown();
             CoUninitialize();
         }
     }
@@ -122,6 +129,7 @@ impl HardwareEncoder {
                         output_credit: 0,
                         frames: 0,
                         last_timestamp: None,
+                        fixed_bitrate: false,
                         bitstream: H264Bitstream::default(),
                         _runtime: runtime,
                     });
@@ -222,13 +230,25 @@ impl HardwareEncoder {
         &self.name
     }
 
+    /// Changes the target bitrate for the frames that follow, if the driver allows it mid-stream.
+    pub fn set_bitrate(&mut self, bps: u32) {
+        if self.fixed_bitrate {
+            return;
+        }
+        if let Err(error) = set_u32(&self.codec, &CODECAPI_AVEncCommonMeanBitRate, bps) {
+            tracing::info!("hardware encoder keeps its bitrate: {error:#}");
+            self.fixed_bitrate = true;
+        }
+    }
+
     pub fn encode(
         &mut self,
-        image: &impl YUVSource,
+        image: &Picture,
         capture_time_us: u64,
         force_keyframe: bool,
     ) -> Result<Vec<HardwareFrame>> {
-        ensure!(image.dimensions() == (self.width, self.height), "recreate hardware encoder after resizing");
+        ensure!(image.size() == (self.width, self.height), "recreate hardware encoder after resizing");
+        ensure!(image.layout() == Layout::Nv12, "hardware encoder takes NV12");
         let timestamp = i64::try_from(capture_time_us.checked_mul(10).context("capture timestamp overflow")?)?;
         ensure!(self.last_timestamp.is_none_or(|last| timestamp > last), "capture timestamps must increase");
         let timeout = if self.frames == 0 { START_TIMEOUT } else { FRAME_TIMEOUT };
@@ -237,7 +257,7 @@ impl HardwareEncoder {
             self.poll_events()?;
             ensure!(Instant::now() < deadline, "hardware encoder timed out requesting input");
             if self.input_credit == 0 {
-                std::thread::sleep(Duration::from_millis(1));
+                std::thread::sleep(WAIT_STEP);
             }
         }
         let keyframe_requested = force_keyframe || self.frames.is_multiple_of(GOP_FRAMES);
@@ -271,7 +291,7 @@ impl HardwareEncoder {
                 return Ok(vec![HardwareFrame { data, keyframe, capture_time_us: (output_time / 10) as u64 }]);
             }
             ensure!(Instant::now() < deadline, "hardware encoder timed out producing a frame (one frame in flight)");
-            std::thread::sleep(Duration::from_millis(1));
+            std::thread::sleep(WAIT_STEP);
         }
     }
 
@@ -315,16 +335,17 @@ impl HardwareEncoder {
         bail!("hardware encoder flooded its event queue")
     }
 
-    fn input_sample(&self, image: &impl YUVSource, timestamp: i64) -> Result<IMFSample> {
-        let nv12 = pack_nv12(image)?;
+    fn input_sample(&self, image: &Picture, timestamp: i64) -> Result<IMFSample> {
+        let nv12 = image.data();
+        ensure!(nv12.len() <= MAX_RAW_BYTES, "NV12 image exceeds input limit");
         unsafe {
-            let buffer = MFCreateMemoryBuffer(nv12.len() as u32)?;
+            let buffer = mfplat::memory_buffer(nv12.len() as u32)?;
             let mut pointer = std::ptr::null_mut();
             buffer.Lock(&mut pointer, None, None)?;
             std::ptr::copy_nonoverlapping(nv12.as_ptr(), pointer, nv12.len());
             buffer.Unlock()?;
             buffer.SetCurrentLength(nv12.len() as u32)?;
-            let sample = MFCreateSample()?;
+            let sample = mfplat::sample()?;
             sample.AddBuffer(&buffer)?;
             sample.SetSampleTime(timestamp)?;
             sample.SetSampleDuration(10_000_000 / i64::from(self.fps))?;
@@ -347,9 +368,9 @@ impl HardwareEncoder {
                         info.cbSize > 0 && info.cbSize as usize <= MAX_BITSTREAM,
                         "invalid hardware output buffer size"
                     );
-                    let sample = MFCreateSample()?;
+                    let sample = mfplat::sample()?;
                     // cbAlignment is an alignment mask (0 means no alignment requirement).
-                    sample.AddBuffer(&MFCreateAlignedMemoryBuffer(info.cbSize, info.cbAlignment)?)?;
+                    sample.AddBuffer(&mfplat::aligned_memory_buffer(info.cbSize, info.cbAlignment)?)?;
                     Some(sample)
                 };
                 let mut output = [MFT_OUTPUT_DATA_BUFFER {
@@ -422,11 +443,11 @@ fn hardware_encoders() -> Result<Vec<Activation>> {
         let input = MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Video, guidSubtype: MFVideoFormat_NV12 };
         let output = MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Video, guidSubtype: MFVideoFormat_H264 };
         let (mut pointer, mut count) = (std::ptr::null_mut(), 0);
-        MFTEnumEx(
+        mfplat::enum_ex(
             MFT_CATEGORY_VIDEO_ENCODER,
-            MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
-            Some(&input),
-            Some(&output),
+            (MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER).0 as u32,
+            &input,
+            &output,
             &mut pointer,
             &mut count,
         )
@@ -483,7 +504,7 @@ fn pack_pair(first: u32, second: u32) -> u64 {
 
 fn video_type(width: u32, height: u32, fps: u32, subtype: &GUID) -> Result<IMFMediaType> {
     unsafe {
-        let media_type = MFCreateMediaType()?;
+        let media_type = mfplat::media_type()?;
         media_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
         media_type.SetGUID(&MF_MT_SUBTYPE, subtype)?;
         media_type.SetUINT64(&MF_MT_FRAME_SIZE, pack_pair(width, height))?;
@@ -508,30 +529,116 @@ fn read_buffer(buffer: &IMFMediaBuffer) -> Result<Vec<u8>> {
     }
 }
 
-fn pack_nv12(image: &impl YUVSource) -> Result<Vec<u8>> {
-    let (width, height) = image.dimensions();
-    ensure!(width > 0 && height > 0 && width % 2 == 0 && height % 2 == 0, "invalid NV12 dimensions");
-    let size = width.checked_mul(height).and_then(|n| n.checked_add(n / 2)).context("NV12 size overflow")?;
-    ensure!(size <= MAX_RAW_BYTES, "NV12 image exceeds input limit");
-    let (ys, us, vs) = image.strides();
-    let (y, u, v) = (image.y(), image.u(), image.v());
-    for (plane, stride, rows, columns) in
-        [(y, ys, height, width), (u, us, height / 2, width / 2), (v, vs, height / 2, width / 2)]
-    {
-        let required =
-            stride.checked_mul(rows - 1).and_then(|n| n.checked_add(columns)).context("YUV plane size overflow")?;
-        ensure!(stride >= columns && plane.len() >= required, "truncated YUV input plane");
+/// The few Media Foundation functions used here, looked up when first needed rather than linked:
+/// Windows "N" editions come without Media Foundation, and a hard link would stop Connect from
+/// starting there at all. Without it, hosting simply encodes with OpenH264.
+mod mfplat {
+    use std::{ffi::c_void, ptr::null_mut, sync::OnceLock};
+
+    use anyhow::{Result, anyhow, ensure};
+    use windows::{
+        Win32::{
+            Media::MediaFoundation::{IMFActivate, IMFMediaBuffer, IMFMediaType, IMFSample, MFT_REGISTER_TYPE_INFO},
+            System::LibraryLoader::{GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW},
+        },
+        core::{GUID, HRESULT, Interface, s, w},
+    };
+
+    type Out = *mut *mut c_void;
+
+    struct Api {
+        startup: unsafe extern "system" fn(u32, u32) -> HRESULT,
+        shutdown: unsafe extern "system" fn() -> HRESULT,
+        enum_ex: unsafe extern "system" fn(
+            GUID,
+            u32,
+            *const MFT_REGISTER_TYPE_INFO,
+            *const MFT_REGISTER_TYPE_INFO,
+            *mut *mut Option<IMFActivate>,
+            *mut u32,
+        ) -> HRESULT,
+        memory_buffer: unsafe extern "system" fn(u32, Out) -> HRESULT,
+        aligned_memory_buffer: unsafe extern "system" fn(u32, u32, Out) -> HRESULT,
+        sample: unsafe extern "system" fn(Out) -> HRESULT,
+        media_type: unsafe extern "system" fn(Out) -> HRESULT,
     }
-    let mut result = Vec::with_capacity(size);
-    for row in 0..height {
-        result.extend_from_slice(&y[row * ys..row * ys + width]);
+
+    fn api() -> Result<&'static Api> {
+        static API: OnceLock<Option<Api>> = OnceLock::new();
+        API.get_or_init(|| unsafe { load() })
+            .as_ref()
+            .ok_or_else(|| anyhow!("Media Foundation isn't installed (Windows N editions need the Media Feature Pack)"))
     }
-    for row in 0..height / 2 {
-        for column in 0..width / 2 {
-            result.extend_from_slice(&[u[row * us + column], v[row * vs + column]]);
+
+    /// SAFETY: each pointer is cast to the function's documented signature, spelled out in `Api`.
+    #[expect(clippy::missing_transmute_annotations, reason = "the target types are Api's fields")]
+    unsafe fn load() -> Option<Api> {
+        let module = unsafe { LoadLibraryExW(w!("mfplat.dll"), None, LOAD_LIBRARY_SEARCH_SYSTEM32) }.ok()?;
+        macro_rules! get {
+            ($name:literal) => {
+                unsafe { std::mem::transmute(GetProcAddress(module, s!($name))?) }
+            };
+        }
+        Some(Api {
+            startup: get!("MFStartup"),
+            shutdown: get!("MFShutdown"),
+            enum_ex: get!("MFTEnumEx"),
+            memory_buffer: get!("MFCreateMemoryBuffer"),
+            aligned_memory_buffer: get!("MFCreateAlignedMemoryBuffer"),
+            sample: get!("MFCreateSample"),
+            media_type: get!("MFCreateMediaType"),
+        })
+    }
+
+    /// An object a creation function handed back through `make`.
+    fn created<T: Interface>(make: impl FnOnce(Out) -> HRESULT) -> Result<T> {
+        let mut raw = null_mut();
+        make(&mut raw).ok()?;
+        ensure!(!raw.is_null(), "Media Foundation returned no object");
+        // SAFETY: a successful creation call hands over one reference to a `T`.
+        Ok(unsafe { T::from_raw(raw) })
+    }
+
+    pub unsafe fn startup(version: u32, flags: u32) -> Result<()> {
+        Ok(unsafe { (api()?.startup)(version, flags) }.ok()?)
+    }
+
+    pub unsafe fn shutdown() {
+        if let Ok(api) = api() {
+            let _ = unsafe { (api.shutdown)() };
         }
     }
-    Ok(result)
+
+    pub unsafe fn enum_ex(
+        category: GUID,
+        flags: u32,
+        input: &MFT_REGISTER_TYPE_INFO,
+        output: &MFT_REGISTER_TYPE_INFO,
+        activates: *mut *mut Option<IMFActivate>,
+        count: &mut u32,
+    ) -> Result<()> {
+        Ok(unsafe { (api()?.enum_ex)(category, flags, input, output, activates, count) }.ok()?)
+    }
+
+    pub fn memory_buffer(len: u32) -> Result<IMFMediaBuffer> {
+        let api = api()?;
+        created(|out| unsafe { (api.memory_buffer)(len, out) })
+    }
+
+    pub fn aligned_memory_buffer(len: u32, alignment: u32) -> Result<IMFMediaBuffer> {
+        let api = api()?;
+        created(|out| unsafe { (api.aligned_memory_buffer)(len, alignment, out) })
+    }
+
+    pub fn sample() -> Result<IMFSample> {
+        let api = api()?;
+        created(|out| unsafe { (api.sample)(out) })
+    }
+
+    pub fn media_type() -> Result<IMFMediaType> {
+        let api = api()?;
+        created(|out| unsafe { (api.media_type)(out) })
+    }
 }
 
 #[derive(Default)]
@@ -691,10 +798,7 @@ fn nal_units(data: &[u8], length_size: Option<usize>) -> Result<Vec<&[u8]>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openh264::{
-        decoder::Decoder,
-        formats::{BgraSliceU8, YUVBuffer},
-    };
+    use openh264::{decoder::Decoder, formats::YUVSource as _};
 
     #[test]
     fn bitstream_annex_b_and_avcc_recover_parameter_sets() {
@@ -741,13 +845,15 @@ mod tests {
         assert_eq!(nal_units(&avcc, Some(4)).unwrap()[0], &avcc[4..]);
     }
 
-    fn moving_image(width: usize, height: usize, frame: usize) -> YUVBuffer {
+    fn moving_image(width: usize, height: usize, frame: usize) -> Picture {
         let mut pixels = vec![0; width * height * 4];
         for (index, pixel) in pixels.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             let (x, y) = (index % width + frame * 7, index / width + frame * 3);
             pixel.copy_from_slice(&[(x ^ y) as u8, (y * 3) as u8, (x * 5) as u8, 255]);
         }
-        YUVBuffer::from_bgra8_source(BgraSliceU8::new(&pixels, (width, height)))
+        let mut picture = Picture::new(Layout::Nv12, width, height);
+        picture.convert_from_bgra(&pixels, width * 4);
+        picture
     }
 
     /// Real GPU encode/decode and resize/recovery check, using synthetic pixels only.

@@ -1,7 +1,7 @@
 # Connect
 
 Desktop audio, automatic GPU encoding, two-way cursor visibility, and compact session controls.
-Version 0.3 uses protocol 3: **update both PCs**. Older peers receive a version mismatch message.
+Version 0.3.1 uses protocol 4: **update both PCs**. Older peers receive a version mismatch message.
 See [performance notes](PERFORMANCE.md) for measurements and remaining stutter risks.
 
 Peer-to-peer remote desktop for gaming, built on [iroh](https://iroh.computer). Click **Generate
@@ -26,7 +26,7 @@ Grab the latest build from [Releases](../../releases):
   Allow it through the firewall so direct connections work.
 - `connect-linux-x86_64`: Linux with glibc 2.39+ (Ubuntu 24.04, Fedora 40, Debian 13 or newer).
 
-The v0.3 media changes have been verified on Windows; Linux playback is not yet verified.
+Desktop audio playback on Linux is not yet verified.
 
 Connect updates itself: when a new release is out it shows **Update available**, and **Update now**
 downloads it, checks it against the release's checksums, and restarts into it. Settings → Updates
@@ -51,9 +51,21 @@ disconnect controls. Collapse it with the arrow; shortcuts remain available whil
 is captured. The shelf's clicks stay local.
 
 Windows hosts automatically try a Media Foundation hardware H.264 encoder and fall back to
-parallel OpenH264 if initialization or encoding fails. The shelf reports the actual encoder.
-High-refresh sources are supported up to 240 Hz, subject to capture, encoder, network, decoder
-and display throughput; this does not guarantee 240 decoded frames per second.
+parallel OpenH264 if initialization or encoding fails (or if Media Foundation is missing, as on
+Windows "N" editions). The shelf reports the actual encoder. The stream follows the host
+monitor's refresh rate, up to 240 Hz, subject to capture, encoder, network, decoder and display
+throughput.
+
+Video is built to keep moving on real internet connections:
+
+- Every frame carries a few recovery packets, so a lost packet or two (or a short burst) is
+  rebuilt on arrival instead of freezing the picture until a new keyframe. More are sent when
+  the connection is losing more.
+- Packets arriving out of order are put back in order rather than counted as lost.
+- The host lowers the bitrate the moment packets start queueing up, and raises it back towards
+  your setting once the connection keeps up; it never builds up seconds of delay.
+- The viewer decodes every frame but only displays the newest, and converts it to colour on the
+  graphics card, so a busy moment doesn't make it fall behind.
 
 Desktop audio uses uncompressed floating-point PCM, preferably the Windows engine's 48 kHz
 stereo mix (about 3.1 Mbps before transport). There is no lossy audio codec; Windows may downmix
@@ -71,7 +83,7 @@ from capture, the overlay is hidden to prevent duplicate pointers.
 |---|---|
 | Ctrl+Alt+M | Capture the mouse for games (raw movement, hidden pointer), and release it again |
 | Ctrl+Alt+F | Full screen |
-| Ctrl+Alt+S | Stats: connection path, round trip, fps, bitrate, latency |
+| Ctrl+Alt+S | Stats: connection path, round trip, fps, bitrate (and the host's current target), latency, frames lost / repaired / skipped, packet loss |
 
 All other keys, including F-keys and Esc, go to the host.
 
@@ -106,14 +118,14 @@ gamepad transitions are preserved. Network and display latency still apply. See
 For testing without a display:
 
 ```text
-connect host [--test-pattern] [--print-input]
+connect host [--test-pattern[=WxH@FPS]] [--print-input]
                                     share this PC (Windows); Allow/Deny is asked on the terminal
 connect join <USER-ID> [--seconds N]
 connect id                          print this PC's User-ID
 ```
 
-`--test-pattern` shares a generated image and `--print-input` prints the remote input instead of
-acting on it, both for development. On Windows the app has no console window, so start these as
+`--test-pattern` shares a generated image (1280×720 at 60 fps, or e.g. `--test-pattern=1920x1080@144`)
+and `--print-input` prints the remote input instead of acting on it, both for development. On Windows the app has no console window, so start these as
 `start /wait connect.exe id` for the terminal to wait for them. `CONNECT_CONFIG_DIR` selects a separate identity, e.g. to run two
 copies on one PC.
 

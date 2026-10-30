@@ -4,7 +4,7 @@
 //! Connecting by User-ID alone works anywhere: iroh looks the ID up via n0's DNS address
 //! lookup, connects through a relay first, and hole-punches to a direct UDP path when it can.
 
-use std::{path::Path, time::Duration};
+use std::{path::Path, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use connect_proto::{ALPN, control};
@@ -17,6 +17,10 @@ use serde::{Serialize, de::DeserializeOwned};
 pub use iroh;
 
 const KEY_FILE: &str = "identity.key";
+
+/// Datagrams (video, audio) queued for sending beyond this push the oldest out. Room for the
+/// largest keyframe; the host keeps the queue much shorter than this by sending less.
+pub const DATAGRAM_SEND_BUFFER: usize = 2 * 1024 * 1024;
 
 /// How long to spend looking up and reaching a host before giving up.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -138,9 +142,29 @@ fn configure(builder: Builder, secret_key: SecretKey) -> Builder {
         .max_idle_timeout(Some(Duration::from_secs(10).try_into().expect("in range")))
         // Enough for a few large keyframes in flight; old datagrams are dropped past this.
         .datagram_receive_buffer_size(Some(8 * 1024 * 1024))
-        .datagram_send_buffer_size(4 * 1024 * 1024)
+        .datagram_send_buffer_size(DATAGRAM_SEND_BUFFER)
+        // BBR paces to the measured path rate and keeps queues short, and unlike the default
+        // (CUBIC) it doesn't halve its rate at every stray lost packet, which on the internet
+        // would starve a video stream that never retransmits anyway.
+        .congestion_controller_factory(Arc::new(noq_proto::congestion::Bbr3Config::default()))
         .build();
     builder.secret_key(secret_key).alpns(vec![ALPN.to_vec()]).transport_config(transport)
+}
+
+/// Bytes of datagrams waiting to be sent on `conn`.
+pub fn queued_datagram_bytes(conn: &Connection) -> usize {
+    DATAGRAM_SEND_BUFFER.saturating_sub(conn.datagram_send_buffer_space())
+}
+
+/// Packets sent and lost so far over all of `conn`'s paths, leaving out the probes that test for
+/// larger packet sizes: those are meant to get lost now and then, and say nothing about the path.
+pub fn packet_counts(conn: &Connection) -> (u64, u64) {
+    conn.paths().iter().map(|p| p.stats()).fold((0, 0), |(sent, lost), s| {
+        (
+            sent + s.sent_packets.saturating_sub(s.sent_plpmtud_probes),
+            lost + s.lost_packets.saturating_sub(s.lost_plpmtud_probes),
+        )
+    })
 }
 
 /// Connects to a host by User-ID (or by full address), giving up after [`CONNECT_TIMEOUT`].

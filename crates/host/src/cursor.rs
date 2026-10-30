@@ -2,6 +2,8 @@
 //!
 //! The native window works over windowed/borderless applications. Windows may put exclusive
 //! fullscreen surfaces above desktop windows, so the remote pointer is not guaranteed there.
+// Capture is Windows-only; elsewhere only the tests use most of this.
+#![cfg_attr(not(windows), allow(dead_code, unused_imports))]
 
 use std::{
     sync::{

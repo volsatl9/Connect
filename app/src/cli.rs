@@ -20,6 +20,8 @@ pub async fn host(key: SecretKey, args: &[String]) -> Result<()> {
     for arg in args {
         match arg.as_str() {
             "--test-pattern" => video = VideoSource::TEST_PATTERN,
+            // e.g. --test-pattern=1920x1080@144
+            spec if spec.starts_with("--test-pattern=") => video = test_pattern(&spec["--test-pattern=".len()..])?,
             "--print-input" => {
                 let (tx, mut events) = mpsc::unbounded_channel();
                 tokio::spawn(async move {
@@ -89,6 +91,15 @@ pub async fn host(key: SecretKey, args: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn test_pattern(spec: &str) -> Result<VideoSource> {
+    let parse = || -> Option<VideoSource> {
+        let (size, fps) = spec.split_once('@')?;
+        let (width, height) = size.split_once('x')?;
+        Some(VideoSource::TestPattern { width: width.parse().ok()?, height: height.parse().ok()?, fps: fps.parse().ok()? })
+    };
+    parse().with_context(|| format!("expected WIDTHxHEIGHT@FPS, like 1920x1080@144, not {spec:?}"))
+}
+
 pub async fn join(key: SecretKey, args: &[String]) -> Result<()> {
     // A User-ID is often pasted with spaces, so it may arrive split over several arguments.
     let mut id_parts = Vec::new();
@@ -107,7 +118,10 @@ pub async fn join(key: SecretKey, args: &[String]) -> Result<()> {
 
     let endpoint = net::bind_endpoint(key).await?;
     let started = Instant::now();
-    let (client, mut events) = connect_client::connect(endpoint.clone(), id, device_name(), || {});
+    // Takes each frame as it's decoded, as a window would, so the stats count what was shown.
+    let woken = std::sync::Arc::new(tokio::sync::Notify::new());
+    let wake = woken.clone();
+    let (client, mut events) = connect_client::connect(endpoint.clone(), id, device_name(), move || wake.notify_one());
     let mut ticker = tokio::time::interval(Duration::from_secs(1));
     let mut connected_at = None;
 
@@ -137,6 +151,11 @@ pub async fn join(key: SecretKey, args: &[String]) -> Result<()> {
                 }
                 None => break,
             },
+            _ = woken.notified() => {
+                if let Some(frame) = client.take_frame() {
+                    client.recycle(frame);
+                }
+            }
             _ = ticker.tick(), if connected_at.is_some() => {
                 let stats = client.stats();
                 if stats.rtt.is_some() {

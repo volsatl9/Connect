@@ -12,6 +12,8 @@ use std::time::{Duration, Instant};
 const SHELF_WIDTH: f32 = 180.0;
 const SHELF_HEIGHT: f32 = 362.0;
 const RECENTRE_MARGIN: f32 = 80.0;
+/// An unmoved pointer is reported again this often; the host hides it after a second without.
+const POINTER_REPEAT: Duration = Duration::from_millis(250);
 
 pub fn show(app: &mut App, ui: &mut egui::Ui) {
     let ctx = ui.ctx().clone();
@@ -20,10 +22,8 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     let (host_name, permissions) = (host_name.clone(), *permissions);
     let area = ui.max_rect();
     let frame = client.handle.take_frame();
-    let image_size = frame
-        .as_ref()
-        .map(|f| egui::vec2(f.width as f32, f.height as f32))
-        .or_else(|| client.video.as_ref().map(|t| t.size_vec2()));
+    let image_size =
+        frame.as_ref().map(|f| egui::vec2(f.width as f32, f.height as f32)).or_else(|| client.video.size());
     let video_rect = image_size.map_or(area, |size| fit(size, area));
     let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
     let (events, focused, pointer) = ctx.input(|i| (i.events.clone(), i.focused, i.pointer.hover_pos()));
@@ -55,24 +55,15 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         focused && !client.input.captured && video_rect.contains(*p) && !blocked.is_some_and(|rect| rect.contains(*p))
     });
     let (x, y) = remote_pointer.map_or((0, 0), |p| normalise(p, video_rect));
-    client.handle.send_cursor(x, y, remote_pointer.is_some());
-    ctx.request_repaint_after(Duration::from_millis(250));
+    send_pointer(client, (x, y, remote_pointer.is_some()));
+    ctx.request_repaint_after(POINTER_REPEAT);
     if let Some(frame) = frame {
-        let image =
-            egui::ColorImage::from_rgba_unmultiplied([frame.width as usize, frame.height as usize], &frame.rgba);
-        match &mut client.video {
-            Some(texture) => texture.set(image, TextureOptions::LINEAR),
-            None => client.video = Some(ctx.load_texture("remote-screen", image, TextureOptions::LINEAR)),
-        }
+        client.video.set_frame(&ctx, frame);
     }
+    client.video.recycle(&client.handle);
     ui.painter().rect_filled(area, 0.0, Color32::BLACK);
-    if let Some(texture) = &client.video {
-        ui.painter().image(
-            texture.id(),
-            video_rect,
-            Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-            Color32::WHITE,
-        );
+    if client.video.size().is_some() {
+        client.video.paint(ui.painter(), video_rect);
     } else {
         ui.painter().text(
             area.center(),
@@ -215,6 +206,16 @@ fn draw_host_cursor(client: &mut ClientSession, ui: &egui::Ui, video: Rect, imag
     }
 }
 
+/// Tells the host where this user's pointer is over the picture, when it moved, and now and then
+/// regardless so the host knows it's still current.
+fn send_pointer(client: &mut ClientSession, position: (u16, u16, bool)) {
+    if client.pointer_sent.is_some_and(|(sent, at)| sent == position && at.elapsed() < POINTER_REPEAT) {
+        return;
+    }
+    client.pointer_sent = Some((position, Instant::now()));
+    client.handle.send_cursor(position.0, position.1, position.2);
+}
+
 pub(super) fn set_captured(ctx: &egui::Context, client: &mut ClientSession, captured: bool) {
     if client.input.captured == captured {
         return;
@@ -223,7 +224,7 @@ pub(super) fn set_captured(ctx: &egui::Context, client: &mut ClientSession, capt
     ctx.send_viewport_cmd(ViewportCommand::CursorGrab(if captured { CursorGrab::Confined } else { CursorGrab::None }));
     ctx.send_viewport_cmd(ViewportCommand::CursorVisible(!captured));
     if captured {
-        client.handle.send_cursor(0, 0, false);
+        send_pointer(client, (0, 0, false));
         client.note("Mouse captured. Ctrl+Alt+M releases it.", 4);
     }
 }
@@ -276,7 +277,7 @@ mod tests {
                 }
                 if let Some(client) = &mut self.app.client {
                     client.note = None;
-                    if client.video.is_some()
+                    if client.video.size().is_some()
                         && !self.screenshot_requested
                         && client.started.elapsed() > Duration::from_secs(1)
                     {
@@ -369,7 +370,8 @@ mod tests {
                     host_id: host_ep.id(),
                     started: Instant::now(),
                     state: ClientState::Connecting,
-                    video: None,
+                    video: Default::default(),
+                    pointer_sent: None,
                     host_cursor_texture: None,
                     encoder: "Starting encoder…".into(),
                     audio_active: false,

@@ -19,7 +19,7 @@ pub use permissions::{DeviceClass, Permissions};
 pub const ALPN: &[u8] = b"connect/remote/1";
 
 /// Protocol version exchanged in the handshake.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// How long the host user has to answer a connection request before it counts as declined.
 pub const APPROVAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);

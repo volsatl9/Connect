@@ -4,7 +4,7 @@
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-use crate::{DeviceClass, Permissions};
+use crate::{DeviceClass, Permissions, cursor::CursorShape};
 
 /// Upper bound on a single control message; anything larger is a protocol violation.
 pub const MAX_MESSAGE_LEN: usize = 64 * 1024;
@@ -22,17 +22,49 @@ pub enum ClientMsg {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum HostMsg {
     /// The host user accepted the connection; video datagrams follow.
-    Welcome { host_name: String, width: u32, height: u32, permissions: Permissions },
+    Welcome {
+        host_name: String,
+        width: u32,
+        height: u32,
+        permissions: Permissions,
+    },
     /// The host user declined (or the host is busy / incompatible). The connection closes next.
-    Rejected { reason: String },
+    Rejected {
+        reason: String,
+    },
     /// The host user changed which input devices are allowed.
     PermissionsChanged(Permissions),
     /// The captured screen changed size; subsequent frames use this resolution.
-    VideoFormat { width: u32, height: u32 },
-    Pong { client_time_us: u64, host_time_us: u64 },
+    VideoFormat {
+        width: u32,
+        height: u32,
+    },
+    Pong {
+        client_time_us: u64,
+        host_time_us: u64,
+    },
     /// The host can't act on this kind of input even though it's allowed, e.g. the gamepad
     /// driver is missing. The text says why.
-    InputUnavailable { device: DeviceClass, reason: String },
+    InputUnavailable {
+        device: DeviceClass,
+        reason: String,
+    },
+    /// Actual selected encoder, including software fallback when necessary.
+    VideoEncoder {
+        name: String,
+    },
+    AudioStatus {
+        active: bool,
+        reason: Option<String>,
+    },
+    CursorShape(CursorShape),
+    /// How the host is fitting video to the connection, about once a second.
+    VideoStats {
+        /// The bitrate the encoder is aiming for now, at most the host's cap.
+        bitrate_kbps: u32,
+        /// Share of packets the path has been losing, in thousandths.
+        loss_permille: u16,
+    },
 }
 
 /// Serialises `msg` with its length prefix, ready to write to the stream.

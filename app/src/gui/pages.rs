@@ -44,7 +44,11 @@ fn notice(app: &App, ui: &mut egui::Ui) {
 }
 
 pub fn share(app: &mut App, ui: &mut egui::Ui) {
-    theme::page_title(ui, "Share this PC", "Give your User-ID to the person who should connect. You'll be asked to allow them.");
+    theme::page_title(
+        ui,
+        "Share this PC",
+        "Give your User-ID to the person who should connect. You'll be asked to allow them.",
+    );
 
     theme::card().show(ui, |ui| {
         ui.set_width(ui.available_width());

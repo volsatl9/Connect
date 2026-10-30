@@ -2,13 +2,13 @@
 
 use std::{
     sync::{Arc, atomic::Ordering},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
 use connect_net as net;
 use connect_proto::{
-    CLOSE_NORMAL, CLOSE_PROTOCOL, CLOSE_REJECTED, PROTOCOL_VERSION, Permissions,
+    CLOSE_NORMAL, CLOSE_PROTOCOL, CLOSE_REJECTED, CursorPosition, DeviceClass, PROTOCOL_VERSION, Permissions,
     control::{ClientMsg, HostMsg},
     video::{self, EncodedFrame},
 };
@@ -21,9 +21,15 @@ use tracing::{debug, info, warn};
 
 use crate::{
     ConnectionRequest, Decision, HostEvent, Shared, VideoSource,
+    audio::AudioStream,
+    cursor::CursorStream,
     encode::{VideoEvent, VideoStream},
     input::{self, Unavailable},
+    rate::{self, RateControl},
 };
+
+/// An unchanged pointer position is sent again this often, so the viewer knows it's current.
+const CURSOR_REPEAT: Duration = Duration::from_millis(250);
 
 /// How long a new connection may take to say hello.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
@@ -90,7 +96,8 @@ async fn serve(conn: &Connection, shared: &Shared, events: &mpsc::Sender<HostEve
     };
 
     let bitrate_bps = shared.bitrate_mbps.load(Ordering::Relaxed).saturating_mul(1_000_000);
-    let mut video = VideoStream::start(shared.video.clone(), bitrate_bps)?;
+    let rate = RateControl::new(bitrate_bps);
+    let mut video = VideoStream::start(shared.video.clone(), rate.bitrate(), Box::new(rate.backlog_check(conn.clone())))?;
     let (width, height) = match video.next().await {
         Some(Ok(VideoEvent::Format { width, height })) => (width, height),
         Some(Err(e)) => {
@@ -105,15 +112,15 @@ async fn serve(conn: &Connection, shared: &Shared, events: &mpsc::Sender<HostEve
     let welcome = HostMsg::Welcome { host_name: shared.host_name(), width, height, permissions: granted };
     net::write_msg(&mut send, &welcome).await?;
     info!(peer = %peer.fmt_short(), %client_name, width, height, ?granted, "session started");
-    let _ = events
-        .send(HostEvent::SessionStarted { peer, client_name: client_name.clone(), permissions: granted })
-        .await;
+    let _ =
+        events.send(HostEvent::SessionStarted { peer, client_name: client_name.clone(), permissions: granted }).await;
 
     let (unavailable_tx, unavailable) = mpsc::unbounded_channel();
     let input =
         tokio::spawn(input::serve(conn.clone(), shared.permissions.subscribe(), shared.input.clone(), unavailable_tx));
 
-    let result = stream(conn, send, recv, video, permissions, unavailable).await;
+    let desktop = shared.video == VideoSource::Screen;
+    let result = stream(conn, send, recv, video, rate, permissions, unavailable, desktop).await;
     let reason = end_reason(conn, &client_name, &result);
     info!(peer = %peer.fmt_short(), "session ended: {reason}");
     if conn.close_reason().is_none() {
@@ -162,17 +169,44 @@ async fn reject(conn: &Connection, send: &mut SendStream, reason: &str) -> Resul
     Ok(())
 }
 
+#[expect(clippy::too_many_arguments)]
 async fn stream(
     conn: &Connection,
     mut send: SendStream,
     recv: RecvStream,
     mut video: VideoStream,
+    mut rate: RateControl,
     mut permissions: watch::Receiver<Permissions>,
     mut unavailable: mpsc::UnboundedReceiver<Unavailable>,
+    desktop: bool,
 ) -> Result<()> {
     // Reading isn't cancel-safe (a half-read message would be lost), so it gets its own task.
     let (msg_tx, mut msgs) = mpsc::channel(16);
     tokio::spawn(read_loop(recv, msg_tx));
+    let cursor = if desktop {
+        match CursorStream::start() {
+            Ok(cursor) => Some(cursor),
+            Err(error) => {
+                warn!("cursor sharing unavailable: {error:#}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let cursor_updates = cursor.as_ref().map(CursorStream::subscribe);
+    let mut cursor_tick = tokio::time::interval(Duration::from_millis(8));
+    cursor_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut shape_id = None;
+    let mut cursor_seq = 0u32;
+    // The last position sent, and when: unchanged, it's only repeated now and then.
+    let mut cursor_sent: Option<(CursorPosition, Instant)> = None;
+    let mut rate_tick = tokio::time::interval(rate::TICK);
+    rate_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut rate_ticks = 0u32;
+    let mut remote_seq = None;
+    let mut audio_enabled = desktop && permissions.borrow().allows(DeviceClass::Audio);
+    let mut audio = start_audio(conn, &mut send, audio_enabled).await?;
 
     loop {
         tokio::select! {
@@ -191,13 +225,91 @@ async fn stream(
             },
             Ok(()) = permissions.changed() => {
                 let p = *permissions.borrow_and_update();
+                // Drop the capture callback before acknowledging a revoked permission.
+                let enabled = desktop && p.allows(DeviceClass::Audio);
+                if enabled != audio_enabled { audio = None; }
                 net::write_msg(&mut send, &HostMsg::PermissionsChanged(p)).await?;
+                if enabled != audio_enabled {
+                    audio_enabled = enabled;
+                    audio = start_audio(conn, &mut send, enabled).await?;
+                }
+            }
+            packet = async {
+                match &mut audio { Some(audio) => audio.next().await, None => std::future::pending().await }
+            } => {
+                if !permissions.borrow().allows(DeviceClass::Audio) { audio = None; continue; }
+                match packet {
+                    Some(Ok(data)) => {
+                        match conn.send_datagram(data) {
+                            Ok(()) => {},
+                            Err(SendDatagramError::TooLarge) => {
+                                // A smaller path MTU requires a fresh packetizer, not endless PCM loss.
+                                drop(audio.take());
+                                let enabled = permissions.borrow().allows(DeviceClass::Audio);
+                                audio = start_audio(conn, &mut send, enabled).await?;
+                            },
+                            Err(error) => return Err(error.into()),
+                        }
+                    }
+                    error => {
+                        let reason = match error { Some(Err(error)) => format!("Desktop audio stopped: {error:#}"), _ => "Desktop audio stopped.".into() };
+                        audio = None;
+                        net::write_msg(&mut send, &HostMsg::AudioStatus { active: false, reason: Some(reason) }).await?;
+                    }
+                }
+            }
+            _ = cursor_tick.tick(), if cursor_updates.is_some() => {
+                let state = cursor_updates.as_ref().expect("guarded").borrow().clone();
+                if let Some(shape) = state.shape && shape_id != Some(shape.id) {
+                        net::write_msg(&mut send, &HostMsg::CursorShape((*shape).clone())).await?;
+                        shape_id = Some(shape.id);
+                }
+                let mut position = state.position;
+                let unchanged = cursor_sent.is_some_and(|(sent, at)| {
+                    (sent.x, sent.y, sent.visible) == (position.x, position.y, position.visible)
+                        && at.elapsed() < CURSOR_REPEAT
+                });
+                if !unchanged {
+                    position.seq = cursor_seq;
+                    cursor_seq = cursor_seq.wrapping_add(1);
+                    cursor_sent = Some((position, Instant::now()));
+                    match conn.send_datagram(position.encode()) {
+                        Ok(()) | Err(SendDatagramError::TooLarge) => {},
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+            }
+            _ = rate_tick.tick() => {
+                let (sent, lost) = net::packet_counts(conn);
+                let queued = net::queued_datagram_bytes(conn);
+                if let Some(bps) = rate.update(Instant::now(), sent, lost, queued) {
+                    debug!(mbps = bps as f32 / 1e6, loss = rate.loss(), queued, "video bitrate changed");
+                    video.set_bitrate(bps);
+                }
+                rate_ticks += 1;
+                if rate_ticks.is_multiple_of(4) {
+                    let stats = HostMsg::VideoStats {
+                        bitrate_kbps: rate.bitrate() / 1000,
+                        loss_permille: (rate.loss() * 1000.0).round() as u16,
+                    };
+                    net::write_msg(&mut send, &stats).await?;
+                }
+            }
+            datagram = conn.read_datagram() => {
+                let Ok(datagram) = datagram else { return Ok(()); };
+                if let Ok(position) = CursorPosition::decode(&datagram) && remote_seq.is_none_or(|seq| position.is_newer_than(seq)) {
+                        remote_seq = Some(position.seq);
+                        if let Some(cursor) = &cursor { cursor.set_remote_pointer(position); }
+                }
             }
             Some(Unavailable { device, reason }) = unavailable.recv() => {
                 net::write_msg(&mut send, &HostMsg::InputUnavailable { device, reason }).await?;
             }
             event = video.next() => match event {
-                Some(Ok(VideoEvent::Frame(frame))) => send_frame(conn, &frame)?,
+                Some(Ok(VideoEvent::Frame(frame))) => send_frame(conn, &frame, rate.loss())?,
+                Some(Ok(VideoEvent::Encoder { name })) => {
+                    net::write_msg(&mut send, &HostMsg::VideoEncoder { name }).await?;
+                }
                 Some(Ok(VideoEvent::Format { width, height })) => {
                     net::write_msg(&mut send, &HostMsg::VideoFormat { width, height }).await?;
                 }
@@ -205,6 +317,30 @@ async fn stream(
                 None => bail!("video thread stopped"),
             },
             _ = conn.closed() => return Ok(()),
+        }
+    }
+}
+
+async fn start_audio(conn: &Connection, send: &mut SendStream, enabled: bool) -> Result<Option<AudioStream>> {
+    if !enabled {
+        net::write_msg(send, &HostMsg::AudioStatus { active: false, reason: None }).await?;
+        return Ok(None);
+    }
+    let max = conn.max_datagram_size().context("peer does not accept audio datagrams")?;
+    match tokio::task::spawn_blocking(move || AudioStream::start(max)).await {
+        Ok(Ok(audio)) => {
+            net::write_msg(send, &HostMsg::AudioStatus { active: true, reason: None }).await?;
+            Ok(Some(audio))
+        }
+        result => {
+            let reason = match result {
+                Ok(Err(error)) => format!("Desktop audio unavailable: {error:#}"),
+                Err(error) => format!("Desktop audio capture stopped: {error}"),
+                _ => unreachable!(),
+            };
+            warn!(%reason);
+            net::write_msg(send, &HostMsg::AudioStatus { active: false, reason: Some(reason) }).await?;
+            Ok(None)
         }
     }
 }
@@ -226,24 +362,24 @@ async fn read_loop(mut recv: RecvStream, tx: mpsc::Sender<Result<ClientMsg>>) {
     }
 }
 
-fn send_frame(conn: &Connection, frame: &EncodedFrame) -> Result<()> {
+/// Sends one frame, with recovery data in proportion to how lossy the path has been.
+fn send_frame(conn: &Connection, frame: &EncodedFrame, loss: f32) -> Result<()> {
     let max = conn.max_datagram_size().context("the client doesn't accept video datagrams")?;
-    let chunks = video::packetize(frame.meta, &frame.data, max)?;
+    let data_chunks = frame.data.len().div_ceil(max.saturating_sub(video::HEADER_LEN).max(2) & !1);
+    let recovery = video::recovery_count(data_chunks, loss, frame.meta.keyframe);
+    let chunks = video::packetize(frame.meta, &frame.data, max, recovery)?;
     if frame.meta.keyframe {
         debug!(seq = frame.meta.seq, bytes = frame.data.len(), datagrams = chunks.len(), max, "sending keyframe");
     }
-    for chunk in chunks {
-        match conn.send_datagram(chunk) {
-            Ok(()) => {}
-            // The path MTU shrank mid-frame; the client will notice the gap and ask for a keyframe.
-            Err(SendDatagramError::TooLarge) => {
-                debug!(max, "datagram too large for the path; frame dropped");
-                return Ok(());
-            }
-            Err(e) => return Err(e.into()),
+    match conn.send_many_datagrams(&chunks) {
+        Ok(_) => Ok(()),
+        // The path MTU shrank; the client will notice the gap and ask for a keyframe.
+        Err(SendDatagramError::TooLarge) => {
+            debug!(max, "datagram too large for the path; frame dropped");
+            Ok(())
         }
+        Err(e) => Err(e.into()),
     }
-    Ok(())
 }
 
 fn end_reason(conn: &Connection, client_name: &str, result: &Result<()>) -> String {

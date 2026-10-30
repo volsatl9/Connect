@@ -5,10 +5,14 @@
 //! may use; an allowed peer then gets the screen as H.264 over QUIC datagrams and may drive the
 //! permitted devices. One session runs at a time.
 
+mod audio;
 mod capture;
+mod cursor;
 mod encode;
 mod input;
+mod rate;
 mod session;
+mod yuv;
 
 use std::{
     collections::HashSet,

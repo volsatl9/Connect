@@ -20,10 +20,7 @@ use tokio::{sync::mpsc, time::timeout};
 const WAIT: Duration = Duration::from_secs(20);
 
 fn config() -> HostConfig {
-    HostConfig {
-        video: VideoSource::TestPattern { width: 320, height: 240, fps: 30 },
-        ..HostConfig::new("Test host")
-    }
+    HostConfig { video: VideoSource::TestPattern { width: 320, height: 240, fps: 30 }, ..HostConfig::new("Test host") }
 }
 
 async fn endpoint() -> Endpoint {
@@ -113,7 +110,7 @@ async fn allow_streams_video() {
         while frames < 10 {
             if let Some(frame) = client.take_frame() {
                 assert_eq!((frame.width, frame.height), (320, 240));
-                assert_eq!(frame.rgba.len(), 320 * 240 * 4);
+                assert_eq!(frame.yuv.len(), 320 * 240 * 3 / 2);
                 frames += 1;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -143,6 +140,39 @@ async fn trusted_peer_needs_no_prompt() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn high_refresh_video_decodes_over_datagrams() {
+    for fps in [120, 240] {
+        let mut cfg = config();
+        cfg.video = VideoSource::TestPattern { width: 640, height: 360, fps };
+        let (host_ep, host, mut host_events) = start_host(cfg).await;
+        let (_client_ep, client, mut client_events) = start_client(&host_ep).await;
+        request(&mut host_events).await.respond(Decision::Allow(Permissions::VIEW_ONLY));
+        accepted(&mut client_events).await;
+
+        timeout(WAIT, async {
+            let mut previous = None;
+            let mut received = 0;
+            while received < 20 {
+                if let Some(frame) = client.take_frame() {
+                    assert_eq!((frame.width, frame.height), (640, 360));
+                    assert_eq!(frame.yuv.len(), 640 * 360 * 3 / 2);
+                    assert!(previous.is_none_or(|seq| frame.meta.seq > seq));
+                    previous = Some(frame.meta.seq);
+                    received += 1;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("high-refresh video keeps decoding");
+
+        client.disconnect();
+        assert_eq!(ended(&mut client_events).await, EndReason::Disconnected);
+        timeout(WAIT, host.shutdown()).await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn second_client_is_told_host_is_busy() {
     let (host_ep, host, mut host_events) = start_host(config()).await;
     let (first_ep, _first, mut first_events) = start_client(&host_ep).await;
@@ -151,7 +181,10 @@ async fn second_client_is_told_host_is_busy() {
     assert_eq!(host.current_peer(), Some(first_ep.id()));
 
     let (_second_ep, _second, mut second_events) = start_client(&host_ep).await;
-    assert_eq!(ended(&mut second_events).await, EndReason::Rejected("The host is in another session right now.".into()));
+    assert_eq!(
+        ended(&mut second_events).await,
+        EndReason::Rejected("The host is in another session right now.".into())
+    );
 
     host.disconnect();
     assert_eq!(ended(&mut first_events).await, EndReason::HostEnded("The host ended the session.".into()));
@@ -202,8 +235,7 @@ async fn chosen_permissions_reach_the_client() {
 #[tokio::test(flavor = "multi_thread")]
 async fn input_obeys_permissions_and_is_released() {
     let (sink, mut injected) = mpsc::unbounded_channel();
-    let (host_ep, host, mut host_events) =
-        start_host(HostConfig { input: InputSink::Channel(sink), ..config() }).await;
+    let (host_ep, host, mut host_events) = start_host(HostConfig { input: InputSink::Channel(sink), ..config() }).await;
     let (_client_ep, client, mut client_events) = start_client(&host_ep).await;
     let no_gamepad = Permissions::ALL.with(DeviceClass::Gamepad, false);
     request(&mut host_events).await.respond(Decision::Allow(no_gamepad));
@@ -235,8 +267,7 @@ async fn input_obeys_permissions_and_is_released() {
 #[tokio::test(flavor = "multi_thread")]
 async fn shutdown_releases_input_before_returning() {
     let (sink, mut injected) = mpsc::unbounded_channel();
-    let (host_ep, host, mut host_events) =
-        start_host(HostConfig { input: InputSink::Channel(sink), ..config() }).await;
+    let (host_ep, host, mut host_events) = start_host(HostConfig { input: InputSink::Channel(sink), ..config() }).await;
     let (_client_ep, client, mut client_events) = start_client(&host_ep).await;
     request(&mut host_events).await.respond(Decision::Allow(Permissions::ALL));
     accepted(&mut client_events).await;
@@ -250,6 +281,105 @@ async fn shutdown_releases_input_before_returning() {
     assert_eq!(ended(&mut client_events).await, EndReason::HostEnded("The host ended the session.".into()));
     assert!(!host.accepting());
     timeout(WAIT, host.shutdown()).await.expect("a second shutdown returns at once");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rapid_gamepad_edges_and_visual_pointer_preserve_input_permissions() {
+    let (sink, mut injected) = mpsc::unbounded_channel();
+    let (host_ep, host, mut host_events) = start_host(HostConfig { input: InputSink::Channel(sink), ..config() }).await;
+    let (_ep, client, mut events) = start_client(&host_ep).await;
+    request(&mut host_events).await.respond(Decision::Allow(Permissions::ALL));
+    accepted(&mut events).await;
+    let down =
+        InputEvent::Gamepad { pad: 0, state: GamepadState { buttons: GamepadState::A, ..GamepadState::NEUTRAL } };
+    let up = InputEvent::Gamepad { pad: 0, state: GamepadState::NEUTRAL };
+    client.send_cursor(123, 456, true);
+    client.send_input(down);
+    client.send_input(up);
+    assert_eq!(timeout(WAIT, injected.recv()).await.unwrap().unwrap(), down);
+    assert_eq!(timeout(WAIT, injected.recv()).await.unwrap().unwrap(), up);
+    host.set_permissions(Permissions::VIEW_ONLY);
+    loop {
+        if matches!(next(&mut events).await, ClientEvent::PermissionsChanged(Permissions::VIEW_ONLY)) {
+            break;
+        }
+    }
+    client.send_cursor(500, 600, true);
+    assert!(
+        timeout(Duration::from_millis(50), injected.recv()).await.is_err(),
+        "visual pointer telemetry must never inject mouse input"
+    );
+    client.disconnect();
+    timeout(WAIT, host.shutdown()).await.unwrap();
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "captures the local desktop over localhost, requires GPU and audio devices"]
+async fn native_desktop_gpu_cursor_audio_and_revocation() {
+    let (sink, _injected) = mpsc::unbounded_channel();
+    let cfg = HostConfig {
+        video: VideoSource::Screen,
+        input: InputSink::Channel(sink),
+        ..HostConfig::new("Native media probe")
+    };
+    let (host_ep, host, mut host_events) = start_host(cfg).await;
+    let (_client_ep, client, mut client_events) = start_client(&host_ep).await;
+    // Same-PC loopback playback must stay silent to avoid recapturing its own output.
+    client.set_audio_muted(true);
+    request(&mut host_events).await.respond(Decision::Allow(Permissions::VIEW_ONLY));
+    accepted(&mut client_events).await;
+    let mut gpu = false;
+    let mut frames = 0;
+    timeout(WAIT, async {
+        while !(gpu && frames >= 5 && client.cursor().shape.is_some()) {
+            while let Ok(event) = client_events.try_recv() {
+                match event {
+                    ClientEvent::VideoEncoder { name } => {
+                        println!("Native session encoder: {name}");
+                        gpu = name.starts_with("GPU:");
+                    }
+                    ClientEvent::Ended(reason) => panic!("native session ended: {reason}"),
+                    _ => {}
+                }
+            }
+            if let Some(frame) = client.take_frame() {
+                assert!(frame.width > 0 && frame.height > 0);
+                frames += 1;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("GPU desktop video and independent host cursor arrive");
+    client.send_cursor(20000, 30000, true);
+    host.set_permissions(Permissions::VIEW_ONLY.with(DeviceClass::Audio, true));
+    timeout(WAIT, async {
+        loop {
+            match next(&mut client_events).await {
+                ClientEvent::AudioStatus { active: true, .. } => break,
+                ClientEvent::AudioStatus { reason: Some(reason), .. } => panic!("audio unavailable: {reason}"),
+                ClientEvent::Ended(reason) => panic!("session ended: {reason}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    host.set_permissions(Permissions::VIEW_ONLY);
+    timeout(WAIT, async {
+        loop {
+            if matches!(next(&mut client_events).await, ClientEvent::AudioStatus { active: false, reason: None }) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    client.send_cursor(0, 0, false);
+    client.disconnect();
+    timeout(WAIT, host.shutdown()).await.unwrap();
+    println!("Native localhost session passed: GPU video, cursor, audio startup/revocation, clean shutdown");
 }
 
 #[cfg(not(windows))]
@@ -319,7 +449,8 @@ async fn keyframe_request_is_honoured() {
     let mut asm = FrameAssembler::new();
     let mut next_frame = async || loop {
         let datagram = timeout(WAIT, conn.read_datagram()).await.unwrap().unwrap();
-        if let Some(frame) = asm.push(datagram).unwrap() {
+        asm.push(datagram).unwrap();
+        if let Some(frame) = asm.next_frame() {
             return frame;
         }
     };

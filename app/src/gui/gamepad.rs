@@ -66,28 +66,38 @@ fn run(host: &ClientHandle, active: &AtomicBool, stop: &AtomicBool) {
                 sent[slot as usize] = None;
                 host.send_input(InputEvent::GamepadRemoved { pad: slot });
             }
+            // Preserve queued press/release edges instead of collapsing a burst to its final state.
+            forward_current(host, &gilrs, &mut slots, &mut sent, active.load(Ordering::Relaxed));
             next = gilrs.next_event();
         }
-
-        let active = active.load(Ordering::Relaxed);
-        for (id, pad) in gilrs.gamepads() {
-            let slot = match slots.get(&id) {
-                Some(&slot) => slot,
-                None => {
-                    let Some(free) = (0..MAX_GAMEPADS).find(|s| !slots.values().any(|v| v == s)) else { continue };
-                    slots.insert(id, free);
-                    free
-                }
-            };
-            let state = if active { read(&pad) } else { GamepadState::NEUTRAL };
-            if sent[slot as usize] != Some(state) {
-                sent[slot as usize] = Some(state);
-                host.send_input(InputEvent::Gamepad { pad: slot, state });
-            }
-        }
+        forward_current(host, &gilrs, &mut slots, &mut sent, active.load(Ordering::Relaxed));
     }
     for slot in slots.into_values() {
         host.send_input(InputEvent::GamepadRemoved { pad: slot });
+    }
+}
+
+fn forward_current(
+    host: &ClientHandle,
+    gilrs: &Gilrs,
+    slots: &mut HashMap<GamepadId, u8>,
+    sent: &mut [Option<GamepadState>; MAX_GAMEPADS as usize],
+    active: bool,
+) {
+    for (id, pad) in gilrs.gamepads() {
+        let slot = match slots.get(&id) {
+            Some(&slot) => slot,
+            None => {
+                let Some(free) = (0..MAX_GAMEPADS).find(|s| !slots.values().any(|v| v == s)) else { continue };
+                slots.insert(id, free);
+                free
+            }
+        };
+        let state = if active { read(&pad) } else { GamepadState::NEUTRAL };
+        if sent[slot as usize] != Some(state) {
+            sent[slot as usize] = Some(state);
+            host.send_input(InputEvent::Gamepad { pad: slot, state });
+        }
     }
 }
 

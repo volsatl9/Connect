@@ -20,8 +20,11 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
         ui.label(RichText::new("Connection request").size(20.0).strong());
         ui.add_space(4.0);
         ui.label(
-            RichText::new(format!("{} wants to connect to this PC and see your screen.", request.inner.client_name))
-                .size(15.0),
+            RichText::new(format!(
+                "{} wants to connect to this PC and see your screen. Desktop sound is shared only when enabled below.",
+                request.inner.client_name
+            ))
+            .size(15.0),
         );
         ui.add_space(4.0);
         ui.label(RichText::new("User-ID").weak().small());
@@ -33,7 +36,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
         );
 
         ui.add_space(8.0);
-        ui.label(RichText::new("Let them use").strong());
+        ui.label(RichText::new("Share and allow").strong());
         permission_toggles(ui, &mut request.permissions);
         if request.permissions.allows(DeviceClass::Gamepad) {
             driver.setup_row(ui);
@@ -69,7 +72,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
 /// A checkbox per input device, plus a "View only" shortcut. True if anything changed.
 pub fn permission_toggles(ui: &mut egui::Ui, permissions: &mut Permissions) -> bool {
     let before = *permissions;
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         for device in DeviceClass::ALL {
             let mut allowed = permissions.allows(device);
             if ui.checkbox(&mut allowed, device.label()).changed() {

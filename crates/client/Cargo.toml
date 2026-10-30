@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+cpal.workspace = true
 connect-net.workspace = true
 connect-proto.workspace = true
 iroh.workspace = true

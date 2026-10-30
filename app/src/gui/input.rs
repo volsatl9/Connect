@@ -63,7 +63,11 @@ impl InputCapture {
                 Event::Key { key, physical_key, pressed, modifiers, .. } => {
                     // Hotkeys go by the letter on the key; everything sent goes by position.
                     let position = physical_key.unwrap_or(*key);
-                    if *pressed && modifiers.ctrl && modifiers.alt && let Some(hotkey) = hotkey_of(*key) {
+                    if *pressed
+                        && modifiers.ctrl
+                        && modifiers.alt
+                        && let Some(hotkey) = hotkey_of(*key)
+                    {
                         if self.swallowed.insert(position) {
                             hotkeys.push(hotkey);
                         }
@@ -186,13 +190,10 @@ fn whole(v: Vec2) -> Vec2 {
 }
 
 /// `pos` inside `video` as 0..=65535 on each axis.
-fn normalise(pos: Pos2, video: Rect) -> (u16, u16) {
+pub(super) fn normalise(pos: Pos2, video: Rect) -> (u16, u16) {
     let fraction = |v: f32, min: f32, size: f32| ((v - min) / size).clamp(0.0, 1.0);
     let to_u16 = |f: f32| (f * u16::MAX as f32).round() as u16;
-    (
-        to_u16(fraction(pos.x, video.min.x, video.width())),
-        to_u16(fraction(pos.y, video.min.y, video.height())),
-    )
+    (to_u16(fraction(pos.x, video.min.x, video.width())), to_u16(fraction(pos.y, video.min.y, video.height())))
 }
 
 fn notches_per_unit(unit: MouseWheelUnit) -> f32 {

@@ -215,17 +215,16 @@ impl Held {
 
     pub(crate) fn release(&mut self, device: DeviceClass) -> Vec<InputEvent> {
         match device {
+            DeviceClass::Audio => Vec::new(),
             DeviceClass::Keyboard => {
                 self.keys.drain().map(|scancode| InputEvent::Key { scancode, down: false }).collect()
             }
             DeviceClass::Mouse => {
                 self.buttons.drain().map(|button| InputEvent::MouseButton { button, down: false }).collect()
             }
-            DeviceClass::Gamepad => self
-                .pads
-                .drain()
-                .map(|pad| InputEvent::Gamepad { pad, state: GamepadState::NEUTRAL })
-                .collect(),
+            DeviceClass::Gamepad => {
+                self.pads.drain().map(|pad| InputEvent::Gamepad { pad, state: GamepadState::NEUTRAL }).collect()
+            }
         }
     }
 }

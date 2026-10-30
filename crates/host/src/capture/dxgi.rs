@@ -1,8 +1,8 @@
 //! Primary-monitor capture with DXGI Desktop Duplication.
 //!
-//! Frames are copied GPU → CPU through a staging texture because the encoder is software
-//! (openh264). The mouse pointer is not part of the duplicated image; it will be sent
-//! separately once remote input lands.
+//! Frames are copied GPU → CPU through a staging texture, and handed out straight from the
+//! mapped staging memory: the encoder converts them to YUV from there. The mouse pointer is not
+//! part of the duplicated image; it travels separately.
 
 use std::time::Duration;
 
@@ -34,7 +34,9 @@ pub(crate) struct DxgiCapturer {
     output: IDXGIOutput1,
     duplication: Option<IDXGIOutputDuplication>,
     staging: Option<(ID3D11Texture2D, u32, u32)>,
-    buf: Vec<u8>,
+    /// Whether the staging texture is mapped, i.e. the last frame handed out is still readable.
+    mapped: bool,
+    refresh_hz: Option<u32>,
     width: u32,
     height: u32,
 }
@@ -59,7 +61,11 @@ impl DxgiCapturer {
             let device = device.context("no Direct3D device")?;
             let context = context.context("no Direct3D context")?;
 
-            let adapter = device.cast::<IDXGIDevice>()?.GetAdapter()?;
+            let dxgi = device.cast::<IDXGIDevice>()?;
+            // Ahead of the game's rendering, the copy out of the desktop finishes sooner. Windows
+            // only grants this to administrators; without it, the copy just waits its turn.
+            let _ = dxgi.SetGPUThreadPriority(7);
+            let adapter = dxgi.GetAdapter()?;
             let output = adapter
                 .EnumOutputs(0)
                 .context("no monitor attached to the primary graphics adapter")?
@@ -71,7 +77,8 @@ impl DxgiCapturer {
                 output,
                 duplication: None,
                 staging: None,
-                buf: Vec::new(),
+                mapped: false,
+                refresh_hz: None,
                 width: 0,
                 height: 0,
             };
@@ -86,6 +93,10 @@ impl DxgiCapturer {
         self.duplication = None;
         let duplication =
             unsafe { self.output.DuplicateOutput(&self.device) }.context("starting desktop duplication")?;
+        let rate = unsafe { duplication.GetDesc() }.ModeDesc.RefreshRate;
+        if rate.Numerator > 0 && rate.Denominator > 0 {
+            self.refresh_hz = Some((rate.Numerator as f64 / rate.Denominator as f64).round() as u32);
+        }
         self.duplication = Some(duplication);
         Ok(())
     }
@@ -117,8 +128,30 @@ impl DxgiCapturer {
     }
 }
 
+impl DxgiCapturer {
+    fn unmap(&mut self) {
+        if std::mem::take(&mut self.mapped)
+            && let Some((staging, ..)) = &self.staging
+        {
+            unsafe { self.context.Unmap(staging, 0) };
+        }
+    }
+}
+
+impl Drop for DxgiCapturer {
+    fn drop(&mut self) {
+        self.unmap();
+    }
+}
+
 impl Capturer for DxgiCapturer {
+    fn refresh_hz(&self) -> Option<u32> {
+        self.refresh_hz
+    }
+
     fn next_frame(&mut self, timeout: Duration) -> Result<Option<Frame<'_>>> {
+        // The previous frame has been read by now; its staging texture takes the next one.
+        self.unmap();
         if self.duplication.is_none() {
             // Lost earlier and couldn't restart yet (e.g. the secure desktop is showing).
             if self.duplicate().is_err() {
@@ -160,20 +193,15 @@ impl Capturer for DxgiCapturer {
         copied?;
 
         let (staging, w, h) = self.staging.clone().expect("created above");
-        let row = w as usize * 4;
-        self.buf.resize(row * h as usize, 0);
-        unsafe {
-            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-            self.context
-                .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
-                .context("reading desktop image")?;
-            let src = std::slice::from_raw_parts(mapped.pData as *const u8, mapped.RowPitch as usize * h as usize);
-            for (dst, src) in self.buf.chunks_exact_mut(row).zip(src.chunks(mapped.RowPitch as usize)) {
-                dst.copy_from_slice(&src[..row]);
-            }
-            self.context.Unmap(&staging, 0);
-        }
-
-        Ok(Some(Frame { width: self.width, height: self.height, stride: row, bgra: &self.buf }))
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        unsafe { self.context.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped)) }
+            .context("reading desktop image")?;
+        self.mapped = true;
+        let stride = mapped.RowPitch as usize;
+        // SAFETY: the texture stays mapped, and so this memory readable, until the next call
+        // (or drop), which the returned frame's borrow of `self` outlives.
+        let len = stride * (h as usize - 1) + w as usize * 4;
+        let bgra = unsafe { std::slice::from_raw_parts(mapped.pData as *const u8, len) };
+        Ok(Some(Frame { width: self.width, height: self.height, stride, bgra }))
     }
 }

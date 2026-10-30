@@ -312,7 +312,7 @@ impl LocalInput {
         let at = match device {
             DeviceClass::Mouse => &LOCAL_MOUSE_AT,
             DeviceClass::Keyboard => &LOCAL_KEYBOARD_AT,
-            DeviceClass::Gamepad => return false,
+            DeviceClass::Gamepad | DeviceClass::Audio => return false,
         };
         unsafe { GetTickCount64() }.saturating_sub(at.load(Ordering::Relaxed)) < HOST_PRIORITY_MS
     }

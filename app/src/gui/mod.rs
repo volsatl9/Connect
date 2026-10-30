@@ -10,6 +10,7 @@ mod session;
 mod settings;
 mod theme;
 mod updates;
+mod video;
 mod welcome;
 
 use std::{
@@ -65,6 +66,9 @@ pub fn run(runtime: Runtime, config_dir: PathBuf) -> Result<()> {
             .with_inner_size([980.0, 640.0])
             .with_min_inner_size([760.0, 520.0]),
         renderer,
+        // One frame queued for the screen, not two: a refresh less of delay.
+        wgpu_options: eframe::WgpuConfiguration::default()
+            .with_surface_config(eframe::egui_wgpu::SurfaceConfig::LOW_LATENCY),
         ..Default::default()
     };
     let handle = runtime.handle().clone();
@@ -109,6 +113,7 @@ impl Root {
         restart: Restart,
     ) -> Self {
         theme::apply(&cc.egui_ctx);
+        video::init(cc);
         let settings: Settings = cc.storage.and_then(|s| eframe::get_value(s, eframe::APP_KEY)).unwrap_or_default();
         let screen = match endpoint {
             Some(endpoint) => Screen::Main(Box::new(App::new(&cc.egui_ctx, endpoint, settings, restart.clone()))),
@@ -211,7 +216,14 @@ struct ClientSession {
     host_id: EndpointId,
     started: Instant,
     state: ClientState,
-    video: Option<egui::TextureHandle>,
+    video: video::VideoView,
+    /// The pointer position last sent to the host, and when.
+    pointer_sent: Option<((u16, u16, bool), Instant)>,
+    host_cursor_texture: Option<(u64, egui::TextureHandle)>,
+    encoder: String,
+    audio_active: bool,
+    audio_muted: bool,
+    shelf_open: bool,
     show_stats: bool,
     input: input::InputCapture,
     gamepads: Option<gamepad::Forwarder>,
@@ -313,19 +325,23 @@ impl App {
             return;
         }
         let ctx = ctx.clone();
-        let (handle, events) = connect_client::connect(
-            self.endpoint.clone(),
-            host_id,
-            self.settings.device_name.clone(),
-            move || ctx.request_repaint(),
-        );
+        let (handle, events) =
+            connect_client::connect(self.endpoint.clone(), host_id, self.settings.device_name.clone(), move || {
+                ctx.request_repaint()
+            });
         self.client = Some(ClientSession {
             handle,
             events,
             host_id,
             started: Instant::now(),
             state: ClientState::Connecting,
-            video: None,
+            video: Default::default(),
+            pointer_sent: None,
+            host_cursor_texture: None,
+            encoder: "Starting encoder…".into(),
+            audio_active: false,
+            audio_muted: false,
+            shelf_open: true,
             show_stats: false,
             input: input::InputCapture::default(),
             gamepads: None,
@@ -360,6 +376,13 @@ impl App {
                     }
                 }
                 ClientEvent::InputUnavailable { reason, .. } => client.note(reason, 10),
+                ClientEvent::VideoEncoder { name } => client.encoder = name,
+                ClientEvent::AudioStatus { active, reason } => {
+                    client.audio_active = active;
+                    if let Some(reason) = reason {
+                        client.note(reason, 10);
+                    }
+                }
                 ClientEvent::VideoFormat { .. } => {}
                 ClientEvent::Ended(reason) => ended = Some(reason),
             }
@@ -447,7 +470,10 @@ fn permission_change(before: Permissions, now: Permissions) -> String {
 
 /// Passes host events to the UI, waking it and bringing the window forward for a request,
 /// even when it's minimised.
-fn forward_host_events(mut events: mpsc::Receiver<HostEvent>, ctx: egui::Context) -> mpsc::UnboundedReceiver<HostEvent> {
+fn forward_host_events(
+    mut events: mpsc::Receiver<HostEvent>,
+    ctx: egui::Context,
+) -> mpsc::UnboundedReceiver<HostEvent> {
     let (tx, rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
         while let Some(event) = events.recv().await {

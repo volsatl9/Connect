@@ -9,6 +9,7 @@ anyhow.workspace = true
 connect-proto.workspace = true
 directories = "6"
 iroh.workspace = true
+noq-proto = { version = "1.4", default-features = false }
 serde.workspace = true
 tokio.workspace = true
 tracing.workspace = true

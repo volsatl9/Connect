@@ -15,6 +15,7 @@ gethostname = "1"
 gilrs = "0.11.2"
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
+ron = "0.12"
 sha2 = "0.11"
 serde.workspace = true
 tokio.workspace = true
@@ -27,5 +28,4 @@ windows = { version = "0.62", features = ["Win32_System_Console"] }
 [dev-dependencies]
 winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
-ron = "0.12"
 naga = { version = "30.0.1", features = ["wgsl-in"] }

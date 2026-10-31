@@ -26,8 +26,9 @@ const CODEC_SHIFT: u8 = 1;
 const CODEC_MASK: u8 = 0b11 << CODEC_SHIFT;
 
 /// kind u8 | flags u8 | index u16 | data_count u16 | recovery_count u16 | frame_seq u32 |
-/// frame_len u32 | capture_time_us u64 | encode_time_us u32
-pub const HEADER_LEN: usize = 28;
+/// frame_len u32 | capture_time_us u64 | encode_time_us u32 | present_to_capture_us u32 |
+/// capture_us u32 | sent_after_us u32
+pub const HEADER_LEN: usize = 40;
 
 /// Frames still being reassembled at once; older partial frames are abandoned beyond this.
 const MAX_PARTIAL_FRAMES: usize = 16;
@@ -41,23 +42,36 @@ const BASE_RECOVERY: f32 = 0.08;
 /// Recovery never exceeds this share of the data, however lossy the path.
 const MAX_RECOVERY: f32 = 0.6;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// One frame's identity and where its time went on the host. Every stage is measured on the
+/// host's clock, so the viewer can line them up with its own through the clock offset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct FrameMeta {
     /// Increments by one per encoded frame.
     pub seq: u32,
     pub keyframe: bool,
     /// What the frame is encoded with. It only changes at a keyframe.
     pub codec: Codec,
-    /// Host wall clock when the frame was captured.
+    /// Host wall clock when the captured image was ready for the encoder.
     pub capture_time_us: u64,
     /// Time the host spent encoding this frame.
     pub encode_time_us: u32,
+    /// From Windows putting the image on the host's screen to capture picking it up; 0 where
+    /// unknown.
+    pub present_to_capture_us: u32,
+    /// Taking the image from the screen and getting it ready for the encoder (copy, colour
+    /// conversion).
+    pub capture_us: u32,
+    /// From [`Self::capture_time_us`] to the frame going out: waiting for the network, encoding,
+    /// packetizing.
+    pub sent_after_us: u32,
 }
 
 #[derive(Debug, Clone)]
 pub struct EncodedFrame {
     pub meta: FrameMeta,
     pub data: Bytes,
+    /// On the viewer: when the frame's first datagram arrived.
+    pub first_seen: Option<Instant>,
 }
 
 /// Recovery chunks for a frame of `data_count` chunks on a path losing `loss` (0..1) of its
@@ -106,6 +120,9 @@ pub fn packetize(meta: FrameMeta, data: &[u8], max_datagram: usize, recovery: us
         buf.put_u32_le(data.len() as u32);
         buf.put_u64_le(meta.capture_time_us);
         buf.put_u32_le(meta.encode_time_us);
+        buf.put_u32_le(meta.present_to_capture_us);
+        buf.put_u32_le(meta.capture_us);
+        buf.put_u32_le(meta.sent_after_us);
         buf.put_slice(body);
         buf.freeze()
     };
@@ -161,6 +178,9 @@ fn parse(datagram: Bytes) -> Result<Chunk> {
             seq: u32_at(8),
             capture_time_us: u64_at(16),
             encode_time_us: u32_at(24),
+            present_to_capture_us: u32_at(28),
+            capture_us: u32_at(32),
+            sent_after_us: u32_at(36),
         },
         index: u16_at(2),
         data_count: u16_at(4),
@@ -184,6 +204,7 @@ fn parse(datagram: Bytes) -> Result<Chunk> {
 
 struct Partial {
     meta: FrameMeta,
+    first_seen: Instant,
     frame_len: usize,
     data_count: usize,
     chunks: Vec<Option<Bytes>>,
@@ -194,6 +215,7 @@ impl Partial {
     fn new(chunk: &Chunk) -> Self {
         Self {
             meta: chunk.meta,
+            first_seen: Instant::now(),
             frame_len: chunk.frame_len,
             data_count: chunk.data_count,
             chunks: vec![None; chunk.data_count + chunk.recovery_count],
@@ -246,7 +268,7 @@ impl Partial {
             }
             frame.truncate(self.frame_len);
         }
-        Ok((EncodedFrame { meta: self.meta, data: frame.freeze() }, missing > 0))
+        Ok((EncodedFrame { meta: self.meta, data: frame.freeze(), first_seen: Some(self.first_seen) }, missing > 0))
     }
 }
 
@@ -445,7 +467,7 @@ mod tests {
 
     fn frame(seq: u32, keyframe: bool, len: usize) -> (FrameMeta, Vec<u8>) {
         let meta =
-            FrameMeta { seq, keyframe, codec: Codec::H264, capture_time_us: 1_000 + seq as u64, encode_time_us: 7 };
+            FrameMeta { seq, keyframe, capture_time_us: 1_000 + seq as u64, encode_time_us: 7, ..Default::default() };
         (meta, (0..len).map(|i| (i * 7 + seq as usize) as u8).collect())
     }
 
@@ -653,7 +675,8 @@ mod tests {
 
     #[test]
     fn codec_travels_in_the_flags() {
-        let meta = |codec| FrameMeta { seq: 0, keyframe: true, codec, capture_time_us: 5, encode_time_us: 1 };
+        let meta =
+            |codec| FrameMeta { keyframe: true, codec, capture_time_us: 5, encode_time_us: 1, ..Default::default() };
         for codec in Codec::BY_EFFICIENCY {
             let mut asm = FrameAssembler::new();
             for datagram in packetize(meta(codec), &[1, 2, 3, 4], 1200, 0).unwrap() {

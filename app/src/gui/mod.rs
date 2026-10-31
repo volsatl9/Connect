@@ -61,6 +61,31 @@ pub fn run(runtime: Runtime, config_dir: PathBuf) -> Result<()> {
         Ok("glow" | "opengl") => eframe::Renderer::Glow,
         _ => eframe::Renderer::Wgpu,
     };
+    // Where hardware decoding is wanted and the graphics card decodes through Vulkan, the window
+    // renders with the decoder's own device, so decoded pictures go straight to the screen.
+    let shared_gpu = (renderer == eframe::Renderer::Wgpu
+        && Settings::saved().hardware_decoding
+        && std::env::var("CONNECT_RENDERER").as_deref() != Ok("separate"))
+    .then(|| match connect_client::SharedGpu::open() {
+        Ok(gpu) => Some(gpu),
+        Err(e) => {
+            tracing::info!("the window draws on its own device: {e:#}");
+            None
+        }
+    })
+    .flatten();
+    let mut wgpu_options =
+        eframe::WgpuConfiguration::default().with_surface_config(eframe::egui_wgpu::SurfaceConfig::LOW_LATENCY);
+    if let Some(gpu) = &shared_gpu {
+        tracing::info!(gpu = gpu.name, "the window and the video decoder share the graphics card");
+        let (instance, adapter, device, queue) = gpu.wgpu();
+        wgpu_options.wgpu_setup = eframe::egui_wgpu::WgpuSetup::Existing(eframe::egui_wgpu::WgpuSetupExisting {
+            instance,
+            adapter,
+            device,
+            queue,
+        });
+    }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Connect")
@@ -68,8 +93,7 @@ pub fn run(runtime: Runtime, config_dir: PathBuf) -> Result<()> {
             .with_min_inner_size([760.0, 520.0]),
         renderer,
         // One frame queued for the screen, not two: a refresh less of delay.
-        wgpu_options: eframe::WgpuConfiguration::default()
-            .with_surface_config(eframe::egui_wgpu::SurfaceConfig::LOW_LATENCY),
+        wgpu_options,
         ..Default::default()
     };
     let handle = runtime.handle().clone();
@@ -79,7 +103,13 @@ pub fn run(runtime: Runtime, config_dir: PathBuf) -> Result<()> {
         options,
         Box::new({
             let restart = restart.clone();
-            |cc| Ok(Box::new(Root::new(cc, handle, config_dir, endpoint, restart)))
+            move |cc| {
+                // The window opened on the shared card: decoders hand it textures from now on.
+                if let (Some(gpu), Some(_)) = (&shared_gpu, &cc.wgpu_render_state) {
+                    gpu.install();
+                }
+                Ok(Box::new(Root::new(cc, handle, config_dir, endpoint, restart)))
+            }
         }),
     )
     .map_err(|e| anyhow::anyhow!("couldn't open the window: {e}"));
@@ -269,6 +299,8 @@ enum ClientState {
 impl App {
     fn new(ctx: &egui::Context, endpoint: Endpoint, settings: Settings, restart: Restart) -> Self {
         connect_client::set_hardware_decoding(settings.hardware_decoding);
+        connect_client::set_smooth_pacing(settings.smooth_pacing);
+        connect_client::set_allow_h265(settings.allow_h265);
         let online = Arc::new(AtomicBool::new(false));
         tokio::spawn({
             let (endpoint, online, ctx) = (endpoint.clone(), online.clone(), ctx.clone());

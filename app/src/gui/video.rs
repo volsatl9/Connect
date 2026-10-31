@@ -66,7 +66,7 @@ impl VideoView {
     }
 
     /// Shows `frame` from the next repaint on.
-    pub fn set_frame(&mut self, ctx: &egui::Context, frame: VideoFrame) {
+    pub fn set_frame(&mut self, ctx: &egui::Context, mut frame: VideoFrame) {
         self.size = Some(egui::vec2(frame.width as f32, frame.height as f32));
         if !matches!(gpu(), Gpu::Cpu) {
             let mut exchange = lock(&self.exchange);
@@ -92,6 +92,7 @@ impl VideoView {
         // Opaque, so these are already premultiplied.
         let image = ColorImage::from_rgba_premultiplied(size, rgba);
         self.cpu.as_mut().expect("set above").0.set(image, TextureOptions::LINEAR);
+        frame.timing.mark_painted();
         lock(&self.exchange).done.push(frame);
     }
 
@@ -165,24 +166,49 @@ fn vs_main(@builtin(vertex_index) index: u32) -> VsOut {
 @group(0) @binding(2) var v_plane: texture_2d<f32>;
 @group(0) @binding(3) var planes: sampler;
 
-fn rgb(uv: vec2<f32>) -> vec3<f32> {
-    let y = (textureSample(y_plane, planes, uv).r - 16.0 / 255.0) * 1.164383;
-    let u = textureSample(u_plane, planes, uv).r - 128.0 / 255.0;
-    let v = textureSample(v_plane, planes, uv).r - 128.0 / 255.0;
+fn convert(luma: f32, cb: f32, cr: f32) -> vec3<f32> {
+    let y = (luma - 16.0 / 255.0) * 1.164383;
+    let u = cb - 128.0 / 255.0;
+    let v = cr - 128.0 / 255.0;
     let rgb = vec3<f32>(y + 1.596027 * v, y - 0.391762 * u - 0.812968 * v, y + 2.017232 * u);
     return clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
+// Three uploaded planes.
+fn i420(uv: vec2<f32>) -> vec3<f32> {
+    let y = textureSample(y_plane, planes, uv).r;
+    return convert(y, textureSample(u_plane, planes, uv).r, textureSample(v_plane, planes, uv).r);
+}
+
+// A decoded NV12 texture: its luma plane, and its chroma plane (bound twice) with U in red
+// and V in green.
+fn nv12(uv: vec2<f32>) -> vec3<f32> {
+    let chroma = textureSample(u_plane, planes, uv).rg;
+    return convert(textureSample(y_plane, planes, uv).r, chroma.r, chroma.g);
+}
+
+fn to_linear(c: vec3<f32>) -> vec4<f32> {
+    return vec4<f32>(select(c / 12.92, pow((c + 0.055) / 1.055, vec3<f32>(2.4)), c > vec3<f32>(0.04045)), 1.0);
+}
+
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    return vec4<f32>(rgb(in.uv), 1.0);
+    return vec4<f32>(i420(in.uv), 1.0);
 }
 
 @fragment
 fn fs_linear(in: VsOut) -> @location(0) vec4<f32> {
-    let c = rgb(in.uv);
-    let linear = select(c / 12.92, pow((c + 0.055) / 1.055, vec3<f32>(2.4)), c > vec3<f32>(0.04045));
-    return vec4<f32>(linear, 1.0);
+    return to_linear(i420(in.uv));
+}
+
+@fragment
+fn fs_nv12(in: VsOut) -> @location(0) vec4<f32> {
+    return vec4<f32>(nv12(in.uv), 1.0);
+}
+
+@fragment
+fn fs_nv12_linear(in: VsOut) -> @location(0) vec4<f32> {
+    return to_linear(nv12(in.uv));
 }
 "#;
 
@@ -194,9 +220,20 @@ struct WgpuVideo {
 /// Lives in egui's renderer for the life of the window.
 struct WgpuResources {
     pipeline: wgpu::RenderPipeline,
+    /// For decoded textures, on a window sharing the decoder's graphics card.
+    nv12_pipeline: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     planes: Option<WgpuPlanes>,
+    /// The picture to draw.
+    showing: Option<Showing>,
+}
+
+enum Showing {
+    /// The uploaded planes in `planes`.
+    Planes,
+    /// A decoded texture, kept alive while it's drawn.
+    Nv12 { bind_group: wgpu::BindGroup, _texture: wgpu::Texture },
 }
 
 struct WgpuPlanes {
@@ -240,34 +277,68 @@ impl WgpuResources {
             bind_group_layouts: &[Some(&layout)],
             immediate_size: 0,
         });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("remote screen"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &module,
-                entry_point: Some("vs_main"),
-                compilation_options: Default::default(),
-                buffers: &[],
-            },
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &module,
-                entry_point: Some(if format.is_srgb() { "fs_linear" } else { "fs_main" }),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL })],
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
+        let pipeline = |fragment: &str| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("remote screen"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &module,
+                    entry_point: Some("vs_main"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &module,
+                    entry_point: Some(fragment),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let srgb = format.is_srgb();
+        let nv12_pipeline = pipeline(if srgb { "fs_nv12_linear" } else { "fs_nv12" });
+        let pipeline = pipeline(if srgb { "fs_linear" } else { "fs_main" });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("remote screen"),
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
-        Self { pipeline, layout, sampler, planes: None }
+        Self { pipeline, nv12_pipeline, layout, sampler, planes: None, showing: None }
+    }
+
+    /// Binds a decoded NV12 texture for drawing.
+    fn show_texture(&mut self, device: &wgpu::Device, texture: wgpu::Texture) {
+        let plane = |aspect, format| {
+            texture.create_view(&wgpu::TextureViewDescriptor {
+                label: Some("remote screen plane"),
+                format: Some(format),
+                aspect,
+                ..Default::default()
+            })
+        };
+        let luma = plane(wgpu::TextureAspect::Plane0, wgpu::TextureFormat::R8Unorm);
+        let chroma = plane(wgpu::TextureAspect::Plane1, wgpu::TextureFormat::Rg8Unorm);
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("remote screen"),
+            layout: &self.layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&luma) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&chroma) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&chroma) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+            ],
+        });
+        self.showing = Some(Showing::Nv12 { bind_group, _texture: texture });
     }
 
     fn planes_for(&mut self, device: &wgpu::Device, frame: &VideoFrame) -> &WgpuPlanes {
@@ -315,8 +386,16 @@ impl egui_wgpu::CallbackTrait for WgpuVideo {
             resources.insert(WgpuResources::new(device, self.format));
         }
         let mut exchange = lock(&self.exchange);
-        let Some(frame) = exchange.next.take() else { return Vec::new() };
+        let Some(mut frame) = exchange.next.take() else { return Vec::new() };
         let gpu = resources.get_mut::<WgpuResources>().expect("inserted above");
+        if let Some(texture) = frame.texture.take() {
+            // Decoded on this graphics card: nothing to upload.
+            gpu.show_texture(device, texture);
+            frame.timing.mark_painted();
+            exchange.done.push(frame);
+            return Vec::new();
+        }
+        gpu.showing = Some(Showing::Planes);
         let textures = &gpu.planes_for(device, &frame).textures;
         for (texture, (width, height, bytes)) in textures.iter().zip(planes(&frame)) {
             queue.write_texture(
@@ -326,6 +405,7 @@ impl egui_wgpu::CallbackTrait for WgpuVideo {
                 wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
             );
         }
+        frame.timing.mark_painted();
         exchange.done.push(frame);
         Vec::new()
     }
@@ -337,9 +417,18 @@ impl egui_wgpu::CallbackTrait for WgpuVideo {
         resources: &egui_wgpu::CallbackResources,
     ) {
         let Some(gpu) = resources.get::<WgpuResources>() else { return };
-        let Some(planes) = &gpu.planes else { return };
-        render_pass.set_pipeline(&gpu.pipeline);
-        render_pass.set_bind_group(0, &planes.bind_group, &[]);
+        match &gpu.showing {
+            Some(Showing::Planes) => {
+                let Some(planes) = &gpu.planes else { return };
+                render_pass.set_pipeline(&gpu.pipeline);
+                render_pass.set_bind_group(0, &planes.bind_group, &[]);
+            }
+            Some(Showing::Nv12 { bind_group, .. }) => {
+                render_pass.set_pipeline(&gpu.nv12_pipeline);
+                render_pass.set_bind_group(0, bind_group, &[]);
+            }
+            None => return,
+        }
         render_pass.draw(0..3, 0..1);
     }
 }
@@ -388,7 +477,7 @@ unsafe fn paint_gl(gl: &glow::Context, exchange: &Mutex<Exchange>) {
     };
     unsafe {
         let mut exchange = lock(exchange);
-        if let Some(frame) = exchange.next.take() {
+        if let Some(mut frame) = exchange.next.take() {
             let size = [frame.width, frame.height];
             let resize = resources.size != Some(size);
             gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
@@ -415,6 +504,7 @@ unsafe fn paint_gl(gl: &glow::Context, exchange: &Mutex<Exchange>) {
             }
             gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
             resources.size = Some(size);
+            frame.timing.mark_painted();
             exchange.done.push(frame);
         }
         if resources.size.is_none() {

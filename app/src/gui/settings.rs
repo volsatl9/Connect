@@ -30,6 +30,10 @@ pub struct Settings {
     pub sidebar_collapsed: bool,
     /// Decode video on the graphics card where it can, rather than the processor.
     pub hardware_decoding: bool,
+    /// Show frames evenly paced rather than as soon as they arrive.
+    pub smooth_pacing: bool,
+    /// Let hosts send H.265 where this PC's graphics card decodes it.
+    pub allow_h265: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -63,11 +67,24 @@ impl Default for Settings {
             computers: Vec::new(),
             sidebar_collapsed: false,
             hardware_decoding: true,
+            smooth_pacing: false,
+            allow_h265: true,
         }
     }
 }
 
 impl Settings {
+    /// The saved settings, read straight from the file before the window opens (the window's
+    /// renderer depends on them); the defaults if there are none.
+    pub fn saved() -> Self {
+        let Some(file) = eframe::storage_dir("Connect").map(|dir| dir.join("app.ron")) else { return Self::default() };
+        let Ok(text) = std::fs::read_to_string(file) else { return Self::default() };
+        ron::from_str::<std::collections::HashMap<String, String>>(&text)
+            .ok()
+            .and_then(|values| ron::from_str(values.get(eframe::APP_KEY)?).ok())
+            .unwrap_or_default()
+    }
+
     pub fn trusted_ids(&self) -> HashSet<EndpointId> {
         self.trusted.iter().filter_map(KnownDevice::user_id).collect()
     }

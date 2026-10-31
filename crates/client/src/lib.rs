@@ -9,9 +9,14 @@ mod audio;
 mod decoder;
 pub mod diagnostics;
 mod gpu_decode;
+mod latency;
+mod pacing;
 mod video;
 
+pub use connect_gpu_load::GpuLoad;
 pub use decoder::{GpuDecodeSupport, gpu_decode_support};
+pub use gpu_decode::SharedGpu;
+pub use latency::{FrameTiming, Latency};
 
 use std::{
     fmt,
@@ -46,6 +51,26 @@ static HARDWARE_DECODING: AtomicBool = AtomicBool::new(true);
 /// default; sessions fall back to the processor anyway where the graphics card can't do it.
 pub fn set_hardware_decoding(enabled: bool) {
     HARDWARE_DECODING.store(enabled, Ordering::Relaxed);
+}
+
+/// Whether H.265 may be offered to hosts; see [`set_allow_h265`].
+static ALLOW_H265: AtomicBool = AtomicBool::new(true);
+
+/// Offers H.265 to hosts where the graphics card decodes it (the default), or (`false`) keeps
+/// sessions on H.264. Applies from the next connection.
+pub fn set_allow_h265(allow: bool) {
+    ALLOW_H265.store(allow, Ordering::Relaxed);
+}
+
+/// Whether frames are shown evenly paced rather than as soon as they're decoded; see
+/// [`set_smooth_pacing`].
+static SMOOTH_PACING: AtomicBool = AtomicBool::new(false);
+
+/// Shows frames a steady delay after capture, smoothing out uneven network and decode times at
+/// the cost of that delay, or (`false`, the default) each one as soon as it's decoded. Takes
+/// effect at once.
+pub fn set_smooth_pacing(smooth: bool) {
+    SMOOTH_PACING.store(smooth, Ordering::Relaxed);
 }
 
 const PING_INTERVAL: Duration = Duration::from_secs(1);
@@ -123,8 +148,14 @@ impl fmt::Display for EndReason {
 pub struct VideoFrame {
     pub width: u32,
     pub height: u32,
+    /// The picture, unless it's in `texture`.
     pub yuv: Vec<u8>,
+    /// The picture as an NV12 texture, when hardware decoding shares the window's graphics card
+    /// ([`SharedGpu`]); `yuv` is then empty.
+    pub texture: Option<wgpu::Texture>,
     pub meta: FrameMeta,
+    /// Where the frame's time went; call [`FrameTiming::mark_painted`] when it's drawn.
+    pub timing: FrameTiming,
 }
 
 impl VideoFrame {
@@ -186,8 +217,14 @@ pub struct Stats {
     pub decode_ms: f32,
     /// Whether the graphics card is decoding the video, rather than the processor.
     pub gpu_decode: bool,
-    /// Host capture → decoded here, via the estimated clock offset between the two PCs.
+    /// The host's screen → drawn here, on average, via the estimated clock offset between the
+    /// two PCs: [`Latency::total`].
     pub latency_ms: Option<f32>,
+    /// Where that time goes, stage by stage.
+    pub latency: Option<Latency>,
+    /// How busy each PC's graphics card is, where it can tell.
+    pub host_gpu: Option<GpuLoad>,
+    pub gpu: Option<GpuLoad>,
 }
 
 impl Default for Stats {
@@ -206,6 +243,9 @@ impl Default for Stats {
             decode_ms: 0.0,
             gpu_decode: false,
             latency_ms: None,
+            latency: None,
+            host_gpu: None,
+            gpu: None,
         }
     }
 }
@@ -221,7 +261,7 @@ struct Shared {
     conn: Mutex<Option<Connection>>,
     /// Feeds the input stream while a session runs.
     input: Mutex<Option<mpsc::UnboundedSender<InputEvent>>>,
-    frame: Mutex<Option<VideoFrame>>,
+    frame: Mutex<pacing::Pacer>,
     /// Picture buffers the GUI is done with, for the decoder to reuse.
     spare_buffers: Mutex<Vec<Vec<u8>>>,
     /// Set by the decoder when a frame didn't decode: video needs a fresh keyframe.
@@ -231,6 +271,8 @@ struct Shared {
     gpu_decoding: AtomicBool,
     stats: Mutex<Stats>,
     counters: Counters,
+    latency: Mutex<latency::LatencyWindow>,
+    host_gpu: Mutex<Option<GpuLoad>>,
     cursor: Mutex<(CursorPosition, Option<Arc<CursorShape>>, Instant)>,
     cursor_sequence: AtomicU64,
     playback: Mutex<Option<Arc<audio::Playback>>>,
@@ -255,7 +297,6 @@ struct Counters {
     decode_us: AtomicU64,
     /// Client clock minus host clock, µs; `i64::MIN` until measured.
     clock_offset_us: AtomicI64,
-    latency_us: AtomicI64,
 }
 
 /// Starts connecting to `host`. `wake` is called (from any thread) whenever there's a new event
@@ -272,12 +313,14 @@ pub fn connect(
         disconnected: AtomicBool::new(false),
         conn: Mutex::new(None),
         input: Mutex::new(None),
-        frame: Mutex::new(None),
+        frame: Mutex::new(pacing::Pacer::default()),
         spare_buffers: Mutex::new(Vec::new()),
         decoder_failed: AtomicBool::new(false),
         decoder: Mutex::new(String::new()),
         gpu_decoding: AtomicBool::new(false),
         stats: Mutex::new(Stats::default()),
+        latency: Mutex::new(latency::LatencyWindow::default()),
+        host_gpu: Mutex::new(None),
         cursor: Mutex::new((CursorPosition::default(), None, Instant::now())),
         cursor_sequence: AtomicU64::new(0),
         playback: Mutex::new(None),
@@ -288,7 +331,6 @@ pub fn connect(
         counters: Counters {
             host_kbps: AtomicU32::new(u32::MAX),
             clock_offset_us: AtomicI64::new(i64::MIN),
-            latency_us: AtomicI64::new(i64::MIN),
             ..Default::default()
         },
     });
@@ -307,11 +349,23 @@ pub fn connect(
 impl ClientHandle {
     /// The newest decoded frame, if one arrived since the last call.
     pub fn take_frame(&self) -> Option<VideoFrame> {
-        lock(&self.0.frame).take()
+        let (frame, replaced) = lock(&self.0.frame).take();
+        for unseen in replaced {
+            self.0.counters.frames_superseded.fetch_add(1, Ordering::Relaxed);
+            recycle(&self.0, unseen.yuv);
+        }
+        frame
+    }
+
+    /// How long until a frame held back for smooth pacing is due; ask for a repaint then.
+    pub fn next_frame_due(&self) -> Option<Duration> {
+        lock(&self.0.frame).next_due()
     }
 
     /// Returns a shown frame's buffer for the decoder to reuse.
     pub fn recycle(&self, frame: VideoFrame) {
+        let offset = self.0.counters.clock_offset_us.load(Ordering::Relaxed);
+        lock(&self.0.latency).add(&frame.timing, (offset != i64::MIN).then_some(offset));
         recycle(&self.0, frame.yuv);
     }
 
@@ -499,7 +553,8 @@ async fn stream(
                 Some(Ok(HostMsg::VideoEncoder { name, codec })) => {
                     events.send(ClientEvent::VideoEncoder { name, codec }).await
                 }
-                Some(Ok(HostMsg::VideoStats { bitrate_kbps, loss_permille })) => {
+                Some(Ok(HostMsg::VideoStats { bitrate_kbps, loss_permille, gpu })) => {
+                    *lock(&shared.host_gpu) = gpu;
                     shared.counters.host_kbps.store(bitrate_kbps, Ordering::Relaxed);
                     shared.counters.loss_permille.store(loss_permille.into(), Ordering::Relaxed);
                 }
@@ -645,6 +700,7 @@ struct StatsWindow {
     at: Instant,
     bytes: u64,
     frames: u64,
+    gpu: Option<connect_gpu_load::Monitor>,
 }
 
 impl StatsWindow {
@@ -654,6 +710,7 @@ impl StatsWindow {
             at: Instant::now(),
             bytes: c.bytes.load(Ordering::Relaxed),
             frames: c.frames_decoded.load(Ordering::Relaxed),
+            gpu: connect_gpu_load::Monitor::new(),
         }
     }
 
@@ -665,7 +722,7 @@ impl StatsWindow {
         }
         let (bytes, frames) = (c.bytes.load(Ordering::Relaxed), c.frames_decoded.load(Ordering::Relaxed));
         let (path, rtt) = net::selected_path(conn);
-        let latency_us = c.latency_us.load(Ordering::Relaxed);
+        let latency = lock(&shared.latency).take();
         *lock(&shared.stats) = Stats {
             path,
             rtt,
@@ -683,9 +740,12 @@ impl StatsWindow {
             encode_ms: c.encode_us.load(Ordering::Relaxed) as f32 / 1000.0,
             decode_ms: c.decode_us.load(Ordering::Relaxed) as f32 / 1000.0,
             gpu_decode: shared.gpu_decoding.load(Ordering::Relaxed),
-            latency_ms: (latency_us != i64::MIN).then(|| latency_us.max(0) as f32 / 1000.0),
+            latency_ms: latency.and_then(|latency| latency.total),
+            latency,
+            host_gpu: *lock(&shared.host_gpu),
+            gpu: self.gpu.as_mut().and_then(connect_gpu_load::Monitor::sample),
         };
-        *self = Self { at: Instant::now(), bytes, frames };
+        (self.at, self.bytes, self.frames) = (Instant::now(), bytes, frames);
         (shared.wake)();
     }
 }
@@ -777,13 +837,7 @@ mod media_tests {
             .unwrap();
             let image = YUVBuffer::new(16, 16);
             let encoded = encoder.encode(&image).unwrap().to_vec();
-            let meta = FrameMeta {
-                seq: 0,
-                keyframe: true,
-                codec: Codec::H264,
-                capture_time_us: now_micros(),
-                encode_time_us: 0,
-            };
+            let meta = FrameMeta { keyframe: true, capture_time_us: now_micros(), ..Default::default() };
             for chunk in video::packetize(meta, &encoded, 1200, 0).unwrap() {
                 conn.send_datagram(chunk).unwrap();
             }

@@ -219,6 +219,7 @@ async fn stream(
     let mut rate_tick = tokio::time::interval(rate::TICK);
     rate_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut rate_ticks = 0u32;
+    let mut gpu_load = connect_gpu_load::Monitor::new();
     let mut remote_seq = None;
     let mut audio_enabled = desktop && permissions.borrow().allows(DeviceClass::Audio);
     let mut audio = start_audio(conn, &mut send, audio_enabled).await?;
@@ -313,6 +314,7 @@ async fn stream(
                     let stats = HostMsg::VideoStats {
                         bitrate_kbps: rate.bitrate() / 1000,
                         loss_permille: (rate.loss() * 1000.0).round() as u16,
+                        gpu: gpu_load.as_mut().and_then(connect_gpu_load::Monitor::sample),
                     };
                     net::write_msg(&mut send, &stats).await?;
                 }
@@ -397,7 +399,9 @@ fn send_frame(conn: &Connection, frame: &EncodedFrame, loss: f32) -> Result<()> 
     let max = conn.max_datagram_size().context("the client doesn't accept video datagrams")?;
     let data_chunks = frame.data.len().div_ceil(max.saturating_sub(video::HEADER_LEN).max(2) & !1);
     let recovery = video::recovery_count(data_chunks, loss, frame.meta.keyframe);
-    let chunks = video::packetize(frame.meta, &frame.data, max, recovery)?;
+    let sent_after = connect_proto::now_micros().saturating_sub(frame.meta.capture_time_us);
+    let meta = video::FrameMeta { sent_after_us: sent_after.min(u64::from(u32::MAX)) as u32, ..frame.meta };
+    let chunks = video::packetize(meta, &frame.data, max, recovery)?;
     if frame.meta.keyframe {
         debug!(seq = frame.meta.seq, bytes = frame.data.len(), datagrams = chunks.len(), max, "sending keyframe");
     }

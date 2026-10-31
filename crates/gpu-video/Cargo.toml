@@ -1,0 +1,42 @@
+# Vendored from gpu-video 0.4.0 (https://github.com/software-mansion/smelter, MIT, © Software
+# Mansion): moved to the wgpu version eframe uses, so the window and the decoder can share one
+# device. See VENDORED.md for the changes.
+[package]
+name = "gpu-video"
+version = "0.4.0"
+edition = "2024"
+authors = ["Software Mansion <contact@swmansion.com>"]
+license = "MIT"
+description = "Hardware video coding using Vulkan Video, with wgpu integration (vendored into Connect)."
+
+[lib]
+# The README's examples are upstream's, written against its own workspace.
+doctest = false
+
+[features]
+expose-parsers = []
+vk-api-dump = []
+vk-validation = []
+wgpu = ["dep:wgpu"]
+transcoder = ["dep:naga"]
+default = ["wgpu"]
+
+[dependencies]
+bytemuck = { version = "1.19.0", features = ["derive"] }
+bytes = "1"
+derivative = "2.2.0"
+h264-reader = "0.8.0"
+memchr = "2.7.4"
+rustc-hash = "2.1.1"
+thiserror = "1.0.59"
+tracing = "0.1.40"
+wgpu = { version = "30.0.1", optional = true }
+
+# Platforms that support vulkan are: windows and all non-apple unixes. emscripten is a web-based platform, where vulkan is not available either
+[target.'cfg(any(windows, all(unix, not(target_os = "emscripten"), not(target_os = "ios"), not(target_os = "macos"))))'.dependencies]
+ash = "0.38.0"
+vk-mem = "0.4.0"
+
+[build-dependencies]
+cfg_aliases = "0.2.1"
+naga = { version = "30.0.1", features = ["spv-out", "wgsl-in"], optional = true }

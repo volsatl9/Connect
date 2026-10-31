@@ -26,11 +26,12 @@ use windows::{
                 IDXGIOutputDuplication, IDXGIResource,
             },
         },
+        System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency},
     },
     core::Interface,
 };
 
-use super::{Capturer, Frame};
+use super::{CaptureTiming, Capturer, Frame};
 
 pub(crate) struct DxgiCapturer {
     device: ID3D11Device,
@@ -43,6 +44,7 @@ pub(crate) struct DxgiCapturer {
     /// Whether the staging texture is mapped, i.e. the last frame handed out is still readable.
     mapped: bool,
     refresh_hz: Option<u32>,
+    timing: CaptureTiming,
     width: u32,
     height: u32,
 }
@@ -79,6 +81,7 @@ impl DxgiCapturer {
                 latest: None,
                 mapped: false,
                 refresh_hz: None,
+                timing: CaptureTiming { acquired: std::time::Instant::now(), present_to_capture: None },
                 width: 0,
                 height: 0,
             };
@@ -234,6 +237,14 @@ impl DxgiCapturer {
             unsafe { duplication.ReleaseFrame() }?;
             return Ok(None);
         }
+        // LastPresentTime is the performance counter when the image went to the screen.
+        let (mut now, mut frequency) = (0, 0);
+        let present_to_capture =
+            unsafe { QueryPerformanceCounter(&mut now).is_ok() && QueryPerformanceFrequency(&mut frequency).is_ok() }
+                .then(|| now.saturating_sub(info.LastPresentTime))
+                .filter(|&ticks| frequency > 0 && ticks >= 0)
+                .map(|ticks| Duration::from_secs_f64(ticks as f64 / frequency as f64));
+        self.timing = CaptureTiming { acquired: std::time::Instant::now(), present_to_capture };
         let texture = match resource.context("no desktop image").and_then(|r| Ok(r.cast::<ID3D11Texture2D>()?)) {
             Ok(texture) => texture,
             Err(e) => {
@@ -284,6 +295,10 @@ impl Drop for DxgiCapturer {
 }
 
 impl Capturer for DxgiCapturer {
+    fn timing(&self) -> CaptureTiming {
+        self.timing
+    }
+
     fn refresh_hz(&self) -> Option<u32> {
         self.refresh_hz
     }

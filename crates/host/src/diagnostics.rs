@@ -18,6 +18,7 @@ mod windows {
     use anyhow::{Context, Result, ensure};
     use connect_proto::Codec;
     use openh264::{decoder::Decoder, formats::YUVSource};
+    use windows::Win32::Graphics::Direct3D11::ID3D11Device;
     use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE, IDXGIFactory1};
 
     use crate::{
@@ -129,7 +130,7 @@ mod windows {
             None => "but no keyframe came out".into(),
         };
         out(format!(
-            "GPU-only pipeline: OK. {} frames in {} s ({fresh} new screen images): encode {} {quality}",
+            "GPU-only pipeline: OK. {} frames in {} s ({fresh} new screen images): encode {}; {quality}",
             times.len(),
             RUN.as_secs(),
             timing(&times),
@@ -150,6 +151,33 @@ mod windows {
             cpu_convert.as_secs_f64() * 1000.0,
             timing(&times)
         ));
+
+        // H.265, which sessions pick when the viewer decodes it too. Listed isn't enough: an
+        // encoder can still refuse what a stream needs, and then the stream falls back to H.264.
+        let h265 = |device: Option<&ID3D11Device>, fps: u32| -> Result<String> {
+            let mut encoder = mf::HardwareEncoder::new(Codec::H265, w, h, BITRATE, fps, device)?;
+            let (mut times, mut frames) = (Vec::new(), 0);
+            for frame in 0..60u64 {
+                let input =
+                    if device.is_some() { Input::Texture(converter.texture()) } else { Input::Picture(&on_cpu) };
+                let encode_started = Instant::now();
+                frames += encoder.encode(input, frame * 1_000_000 / u64::from(fps), frame == 0)?.len();
+                times.push(encode_started.elapsed());
+            }
+            Ok(format!("{}, encode {}, {frames} frames out of 60", encoder.name(), timing(&times)))
+        };
+        for (how, device) in [("reading textures", Some(&device)), ("reading memory", None)] {
+            match h265(device, fps) {
+                Ok(line) => out(format!("Hardware H.265 encoding, {how}: OK. {line}")),
+                Err(e) => {
+                    out(format!("Hardware H.265 encoding, {how}: FAILED at {fps} Hz: {e:#}"));
+                    if fps != 60 {
+                        let at_60 = h265(device, 60).map_or_else(|e| format!("FAILED too: {e:#}"), |_| "OK".into());
+                        out(format!("  At 60 Hz instead: {at_60}"));
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -183,6 +211,6 @@ mod windows {
         let ms = |d: Duration| d.as_secs_f64() * 1000.0;
         let average = times.iter().map(|&d| ms(d)).sum::<f64>() / times.len().max(1) as f64;
         let slowest = times.iter().map(|&d| ms(d)).fold(0.0, f64::max);
-        format!("{average:.2} ms per frame on average, {slowest:.2} ms at most;")
+        format!("{average:.2} ms per frame on average, {slowest:.2} ms at most")
     }
 }

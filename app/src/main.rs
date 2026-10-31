@@ -95,23 +95,61 @@ fn device_name() -> String {
     if name.is_empty() { "My PC".into() } else { name }
 }
 
-/// One line of session figures, for the terminal and the in-session overlay.
+/// Session figures for the terminal and the in-session overlay: the connection, then where
+/// the latency goes.
 pub(crate) fn stats_line(s: &Stats) -> String {
     let rtt = s.rtt.map_or("–".into(), |r| format!("{:.0} ms", r.as_secs_f32() * 1000.0));
-    let latency = s.latency_ms.map_or("–".into(), |l| format!("~{l:.0} ms"));
     let target = s.host_mbps.map_or(String::new(), |m| format!(" (target {m:.1})"));
     let loss = s.loss.map_or(String::new(), |l| format!(" · packet loss {:.1}%", l * 100.0));
-    format!(
-        "{} · RTT {rtt} · {:.0} fps · {:.1} Mb/s{target} · latency {latency} (encode {:.1} / decode {:.1} ms on \
-         {}) · frames lost {} / repaired {} / skipped {}{loss}",
+    let mut text = format!(
+        "{} · RTT {rtt} · {:.0} fps · {:.1} Mb/s{target} · frames lost {} / repaired {} / skipped {}{loss}",
         s.path.label(),
         s.fps,
         s.mbps,
-        s.encode_ms,
-        s.decode_ms,
-        if s.gpu_decode { "GPU" } else { "CPU" },
         s.frames_lost,
         s.frames_recovered,
         s.frames_superseded,
-    )
+    );
+    if let Some(l) = &s.latency {
+        let ms = |v: f32| format!("{v:.1}");
+        let maybe = |v: Option<f32>| v.map_or("–".into(), ms);
+        let total = match (l.total, l.worst) {
+            (Some(total), Some(worst)) => format!("~{total:.0} ms (slowest {worst:.0})"),
+            _ => "measuring…".into(),
+        };
+        text += &format!(
+            "\nLatency to this window {total}: host screen→capture {} · capture {} · encode {} · send wait {} · \
+             network {} · reassembly {} · decode {} on {} · draw {} ms",
+            maybe(l.present_to_capture),
+            ms(l.capture),
+            ms(l.encode),
+            ms(l.host_wait),
+            maybe(l.network),
+            ms(l.reassembly),
+            ms(l.decode),
+            if s.gpu_decode { "GPU" } else { "CPU" },
+            ms(l.render),
+        );
+    }
+    let gpu = |load: Option<connect_client::GpuLoad>| {
+        load.map(|g| {
+            let mut text = format!("{}% graphics", g.graphics);
+            if let Some(encode) = g.encode {
+                text += &format!(", {encode}% encoder");
+            }
+            if let Some(decode) = g.decode {
+                text += &format!(", {decode}% decoder");
+            }
+            text
+        })
+    };
+    if s.host_gpu.is_some() || s.gpu.is_some() {
+        let unknown = || "–".to_owned();
+        text += &format!(
+            "\nGPU load: host {} · here {}",
+            gpu(s.host_gpu).unwrap_or_else(unknown),
+            gpu(s.gpu).unwrap_or_else(unknown)
+        );
+    }
+    text
 }

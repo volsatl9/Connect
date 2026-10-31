@@ -70,6 +70,8 @@ pub enum HostMsg {
         bitrate_kbps: u32,
         /// Share of packets the path has been losing, in thousandths.
         loss_permille: u16,
+        /// How busy the host's graphics card is, where it can tell.
+        gpu: Option<connect_gpu_load::GpuLoad>,
     },
 }
 

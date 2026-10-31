@@ -12,7 +12,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use connect_proto::{
-    Codec, now_micros,
+    Codec,
     video::{EncodedFrame, FrameAssembler},
 };
 use iroh::endpoint::Connection;
@@ -20,7 +20,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, info, warn};
 
 use crate::{
-    Shared, VideoFrame,
+    FrameTiming, Shared, VideoFrame,
     decoder::{self, VideoDecoder},
     lock,
 };
@@ -146,8 +146,8 @@ fn decode(
             }
         }
     }
-    let (w, h) = match result {
-        Ok(Some(size)) => size,
+    let decoded = match result {
+        Ok(Some(decoded)) => decoded,
         other => {
             if let Err(e) = other {
                 debug!(seq = frame.meta.seq, "decode failed: {e:#}");
@@ -170,14 +170,26 @@ fn decode(
 
     c.decode_us.store(started.elapsed().as_micros() as u64, Ordering::Relaxed);
     c.encode_us.store(frame.meta.encode_time_us as u64, Ordering::Relaxed);
+    let timing = FrameTiming {
+        meta: frame.meta,
+        first_seen: frame.first_seen,
+        decode_started: Some(started),
+        decoded: Some(Instant::now()),
+        painted: None,
+    };
+    let frame = VideoFrame {
+        width: decoded.width as u32,
+        height: decoded.height as u32,
+        yuv: buf,
+        texture: decoded.texture,
+        meta: frame.meta,
+        timing,
+    };
+    // Frames the GUI never got to are simply replaced; their buffers are reused.
     let offset = c.clock_offset_us.load(Ordering::Relaxed);
-    if offset != i64::MIN {
-        let latency = now_micros() as i64 - (frame.meta.capture_time_us as i64 + offset);
-        c.latency_us.store(latency, Ordering::Relaxed);
-    }
-    let frame = VideoFrame { width: w as u32, height: h as u32, yuv: buf, meta: frame.meta };
-    // A frame the GUI never got to is simply replaced; its buffer is reused.
-    if let Some(unseen) = lock(&shared.frame).replace(frame) {
+    let smooth = crate::SMOOTH_PACING.load(Ordering::Relaxed);
+    let replaced = lock(&shared.frame).push(frame, (offset != i64::MIN).then_some(offset), smooth);
+    for unseen in replaced {
         c.frames_superseded.fetch_add(1, Ordering::Relaxed);
         crate::recycle(shared, unseen.yuv);
     }

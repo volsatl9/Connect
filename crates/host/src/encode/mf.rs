@@ -76,7 +76,8 @@ pub(crate) struct HardwareEncoder {
     last_timestamp: Option<i64>,
     /// Whether the driver has already turned down a bitrate change, so it isn't asked again.
     fixed_bitrate: bool,
-    bitstream: H264Bitstream,
+    video_codec: Codec,
+    bitstream: Bitstream,
     // Declared last: all COM interfaces are released before MF/COM shutdown.
     _runtime: Runtime,
 }
@@ -118,12 +119,12 @@ impl Drop for Activation {
 /// The codecs a hardware encoder here can produce, as far as Connect can drive them.
 pub(crate) fn hardware_codecs() -> Vec<Codec> {
     let Ok(_runtime) = Runtime::new() else { return Vec::new() };
-    // H.265 and AV1 hardware encoders are listed by `encoder_names` but not used until the
-    // viewer can decode them.
-    match hardware_encoders(&MFVideoFormat_H264) {
-        Ok(list) if !list.is_empty() => vec![Codec::H264],
-        _ => Vec::new(),
-    }
+    // AV1 hardware encoders are listed by `encoder_names` but not driven yet. H.265 is only
+    // chosen when the viewer can decode it.
+    [Codec::H264, Codec::H265]
+        .into_iter()
+        .filter(|&codec| hardware_encoders(subtype(codec)).is_ok_and(|list| !list.is_empty()))
+        .collect()
 }
 
 /// The names of the hardware encoders registered for `codec`, for diagnostics.
@@ -156,7 +157,7 @@ impl HardwareEncoder {
         fps: u32,
         device: Option<&ID3D11Device>,
     ) -> Result<Self> {
-        ensure!(codec == Codec::H264, "Connect doesn't drive hardware {codec} encoders yet");
+        ensure!(codec != Codec::Av1, "Connect doesn't drive hardware {codec} encoders yet");
         ensure!(
             width > 0 && height > 0 && width.is_multiple_of(2) && height.is_multiple_of(2),
             "hardware H.264 requires nonempty even dimensions"
@@ -166,17 +167,17 @@ impl HardwareEncoder {
         ensure!(bytes <= MAX_RAW_BYTES as u64, "hardware H.264 image exceeds input limit");
         let runtime = Runtime::new()?;
         let manager = device.map(device_manager).transpose()?;
-        let activations = hardware_encoders(&MFVideoFormat_H264)?;
+        let activations = hardware_encoders(subtype(codec))?;
         let mut failures = Vec::new();
         for activation in activations {
             let name = attribute_string(&activation.0, &MFT_FRIENDLY_NAME_Attribute)
                 .unwrap_or_else(|_| "unnamed hardware H.264 MFT".into());
-            match Self::configure(&activation, width, height, bitrate_bps, fps, manager.as_ref()) {
-                Ok((transform, codec, events, input_id, output_id)) => {
+            match Self::configure(&activation, codec, width, height, bitrate_bps, fps, manager.as_ref()) {
+                Ok((transform, controls, events, input_id, output_id)) => {
                     return Ok(Self {
                         transform,
                         manager,
-                        codec,
+                        codec: controls,
                         events,
                         _activation: activation,
                         name: format!("GPU: {name}"),
@@ -190,7 +191,8 @@ impl HardwareEncoder {
                         frames: 0,
                         last_timestamp: None,
                         fixed_bitrate: false,
-                        bitstream: H264Bitstream::default(),
+                        video_codec: codec,
+                        bitstream: Bitstream::new(codec),
                         _runtime: runtime,
                     });
                 }
@@ -198,9 +200,9 @@ impl HardwareEncoder {
             }
         }
         bail!(
-            "no usable hardware H.264 encoder: {}",
+            "no usable hardware {codec} encoder: {}",
             if failures.is_empty() {
-                "MFTEnumEx returned no hardware NV12/H.264 transforms".into()
+                format!("MFTEnumEx returned no hardware NV12/{codec} transforms")
             } else {
                 failures.join("; ")
             }
@@ -209,6 +211,7 @@ impl HardwareEncoder {
 
     fn configure(
         activation: &Activation,
+        video_codec: Codec,
         width: u32,
         height: u32,
         bitrate: u32,
@@ -248,9 +251,12 @@ impl HardwareEncoder {
                 bool::try_from(&codec.GetValue(&CODECAPI_AVLowLatencyMode)?)?,
                 "hardware encoder did not enable low latency"
             );
-            // Baseline profile independently excludes B slices. If B-picture control is exposed,
-            // require the driver to accept and report zero instead of ignoring a failed setting.
-            if supports(&codec, &CODECAPI_AVEncMPVDefaultBPictureCount)? {
+            // H.264 Baseline independently excludes B slices; H.265 Main doesn't, so there the
+            // control is required. Where it's exposed, require the driver to accept and report
+            // zero instead of ignoring a failed setting.
+            let b_control = supports(&codec, &CODECAPI_AVEncMPVDefaultBPictureCount)?;
+            ensure!(b_control || video_codec == Codec::H264, "hardware {video_codec} encoder can't turn off B frames");
+            if b_control {
                 set_u32(&codec, &CODECAPI_AVEncMPVDefaultBPictureCount, 0)?;
                 ensure!(
                     u32::try_from(&codec.GetValue(&CODECAPI_AVEncMPVDefaultBPictureCount)?)? == 0,
@@ -275,11 +281,17 @@ impl HardwareEncoder {
                 ensure!(error.code() == E_NOTIMPL, "querying hardware MFT stream IDs: {error}");
             }
             let (input_id, output_id) = (input_ids[0], output_ids[0]);
-            let output = video_type(width, height, fps, &MFVideoFormat_H264)?;
+            let profile = match video_codec {
+                Codec::H264 => eAVEncH264VProfile_Base.0 as u32,
+                _ => eAVEncH265VProfile_Main_420_8.0 as u32,
+            };
+            let output = video_type(width, height, fps, subtype(video_codec))?;
             output.SetUINT32(&MF_MT_AVG_BITRATE, bitrate)?;
-            output.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Base.0 as u32)?;
+            output.SetUINT32(&MF_MT_MPEG2_PROFILE, profile)?;
             output.SetUINT32(&MF_MT_VIDEO_NO_FRAME_ORDERING, 1)?;
-            transform.SetOutputType(output_id, &output, 0).context("setting hardware H.264 output type")?;
+            transform
+                .SetOutputType(output_id, &output, 0)
+                .with_context(|| format!("setting hardware {video_codec} output type"))?;
             let input = video_type(width, height, fps, &MFVideoFormat_NV12)?;
             input.SetUINT32(&MF_MT_DEFAULT_STRIDE, width)?;
             input.SetUINT32(&MF_MT_SAMPLE_SIZE, width * height * 3 / 2)?;
@@ -288,8 +300,9 @@ impl HardwareEncoder {
             // Verify the negotiated profile, as it is our guarantee when a driver omits B control.
             let actual = transform.GetOutputCurrentType(output_id)?;
             ensure!(
-                actual.GetUINT32(&MF_MT_MPEG2_PROFILE)? == eAVEncH264VProfile_Base.0 as u32,
-                "hardware encoder did not negotiate baseline H.264"
+                actual.GetUINT32(&MF_MT_MPEG2_PROFILE)? == profile,
+                "hardware encoder did not negotiate {} {video_codec}",
+                if video_codec == Codec::H264 { "Baseline" } else { "Main" }
             );
             transform.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)?;
             transform.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)?;
@@ -466,7 +479,7 @@ impl HardwareEncoder {
                     Err(error) if error.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
                         let media_type = self.transform.GetOutputAvailableType(self.output_id, 0)?;
                         ensure!(
-                            media_type.GetGUID(&MF_MT_SUBTYPE)? == MFVideoFormat_H264,
+                            media_type.GetGUID(&MF_MT_SUBTYPE)? == *subtype(self.video_codec),
                             "hardware encoder changed output codec"
                         );
                         ensure!(
@@ -511,7 +524,7 @@ impl Drop for HardwareEncoder {
 
 impl VideoEncoder for HardwareEncoder {
     fn codec(&self) -> Codec {
-        Codec::H264
+        self.video_codec
     }
 
     fn name(&self) -> &str {
@@ -786,6 +799,35 @@ mod mfplat {
         created(|out| unsafe {
             (api.dxgi_surface_buffer)(&ID3D11Texture2D::IID, texture.as_raw(), 0, false.into(), out)
         })
+    }
+}
+
+/// Makes each codec's encoder output self-contained per keyframe.
+enum Bitstream {
+    H264(H264Bitstream),
+    H265(super::hevc::HevcBitstream),
+}
+
+impl Bitstream {
+    fn new(codec: Codec) -> Self {
+        match codec {
+            Codec::H264 => Self::H264(H264Bitstream::default()),
+            _ => Self::H265(Default::default()),
+        }
+    }
+
+    fn sequence_header(&mut self, data: &[u8]) -> Result<()> {
+        match self {
+            Self::H264(stream) => stream.sequence_header(data),
+            Self::H265(stream) => stream.sequence_header(data),
+        }
+    }
+
+    fn frame(&mut self, data: &[u8]) -> Result<(Vec<u8>, bool)> {
+        match self {
+            Self::H264(stream) => stream.frame(data),
+            Self::H265(stream) => stream.frame(data),
+        }
     }
 }
 

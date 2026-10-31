@@ -6,6 +6,7 @@
 //! is converted to NV12 there and handed to the hardware encoder as a texture. Where any part
 //! of that isn't available, or fails, pictures go through memory as before.
 
+mod hevc;
 #[cfg(windows)]
 pub(crate) mod mf;
 mod software;

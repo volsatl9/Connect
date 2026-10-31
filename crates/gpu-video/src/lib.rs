@@ -1,4 +1,6 @@
 #![doc = include_str!("../README.md")]
+// Vendored (see VENDORED.md): upstream style, so not held to this workspace's lints.
+#![allow(clippy::all)]
 
 #[cfg(vulkan)]
 mod adapter;

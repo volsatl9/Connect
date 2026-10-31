@@ -64,7 +64,7 @@ fn decode_test(out: &mut dyn FnMut(String)) -> Result<()> {
         cpu_times.push(started.elapsed());
     }
     out(format!("Processor H.264 decoding (OpenH264): {WIDTH}×{HEIGHT}: {}", timing(&cpu_times)));
-    let mut gpu = GpuDecoder::new()?;
+    let mut gpu = GpuDecoder::in_memory()?;
     let (mut picture, mut gpu_times, mut decoded) = (Vec::new(), Vec::new(), 0);
     for frame in &stream {
         let started = Instant::now();

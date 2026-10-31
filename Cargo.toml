@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/proto", "crates/net", "crates/host", "crates/client", "crates/gpu-load", "app"]
+members = ["crates/proto", "crates/net", "crates/host", "crates/client", "crates/gpu-load", "crates/gpu-video", "app"]
 
 [workspace.package]
 version = "0.6.0"
@@ -20,7 +20,8 @@ cpal = "0.17.3"
 iroh = "1.4"
 openh264 = "0.9"
 opus = "0.4"
-gpu-video = { version = "0.4", default-features = false }
+wgpu = "30.0.1"
+gpu-video = { path = "crates/gpu-video", default-features = false }
 postcard = { version = "1", features = ["use-std"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"

@@ -1,60 +1,154 @@
 //! H.264 decoding on the graphics card through Vulkan Video, which current NVIDIA, AMD and Intel
-//! drivers offer on Windows and Linux. Pictures come back to system memory as NV12, for the same
-//! upload path as software-decoded ones; what this saves is the decode itself, the biggest cost
-//! per frame on the viewer at high resolutions and frame rates.
+//! drivers offer on Windows and Linux.
+//!
+//! When the window renders on the same graphics card ([`SharedGpu`]), decoded pictures stay
+//! there as NV12 textures the window draws directly. Otherwise they come back to system memory
+//! for the same upload path as software-decoded ones; what that still saves is the decode
+//! itself.
+
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result, ensure};
 use gpu_video::{
-    BytesDecoder, EncodedInputChunk, VulkanInstance,
+    BytesDecoder, EncodedInputChunk, VulkanDevice, VulkanInstance, WgpuTexturesDecoder,
     capabilities::VulkanDeviceType,
     parameters::{DecoderParameters, DecoderUsageFlags, VulkanDeviceDescriptor},
 };
 
+/// A decoded picture: in `yuv` as I420 (when asked for), or as an NV12 texture on the shared
+/// graphics card.
+pub(crate) struct Decoded {
+    pub width: usize,
+    pub height: usize,
+    pub texture: Option<wgpu::Texture>,
+}
+
+/// A graphics card that the window and the video decoder share, so decoded pictures never
+/// leave it.
+pub struct SharedGpu {
+    device: Arc<VulkanDevice>,
+    _instance: Arc<VulkanInstance>,
+    /// The card's name, for people to read.
+    pub name: String,
+}
+
+static SHARED: OnceLock<Arc<SharedGpu>> = OnceLock::new();
+
+impl SharedGpu {
+    /// Opens the graphics card best placed to decode (see [`open_device`]) with a wgpu device
+    /// on it for the window. Fails where no card decodes H.264 through Vulkan.
+    pub fn open() -> Result<Arc<Self>> {
+        let instance = VulkanInstance::new().context("loading Vulkan")?;
+        let (device, name) = open_device(&instance)?;
+        Ok(Arc::new(Self { device, _instance: instance, name }))
+    }
+
+    /// The wgpu instance, adapter, device and queue for the window to render with.
+    pub fn wgpu(&self) -> (wgpu::Instance, wgpu::Adapter, wgpu::Device, wgpu::Queue) {
+        (
+            self._instance.wgpu_instance(),
+            self.device.wgpu_adapter(),
+            self.device.wgpu_device(),
+            self.device.wgpu_queue(),
+        )
+    }
+
+    /// From now on, hardware decoders hand out textures on this card, for a window that
+    /// renders with [`Self::wgpu`]. Only the first call counts.
+    pub fn install(self: &Arc<Self>) {
+        let _ = SHARED.set(self.clone());
+    }
+}
+
+/// Opens the best graphics card for decoding, preferring a dedicated one over one built into
+/// the processor.
+fn open_device(instance: &Arc<VulkanInstance>) -> Result<(Arc<VulkanDevice>, String)> {
+    let adapter = instance
+        .iter_adapters()
+        .context("listing graphics cards")?
+        .filter(|adapter| adapter.supports_decoding() && adapter.info().decode_capabilities.h264.is_some())
+        .max_by_key(|adapter| match adapter.info().device_type {
+            VulkanDeviceType::DISCRETE_GPU => 2,
+            VulkanDeviceType::INTEGRATED_GPU => 1,
+            _ => 0,
+        })
+        .context("no graphics card here decodes H.264 through Vulkan")?;
+    let name = adapter.info().name.clone();
+    let device = adapter.create_device(&VulkanDeviceDescriptor::default()).context("opening the graphics card")?;
+    Ok((device, name))
+}
+
+enum Output {
+    /// Pictures copied back to memory.
+    Bytes(BytesDecoder),
+    /// Pictures as textures on the shared graphics card.
+    Textures(WgpuTexturesDecoder),
+}
+
 pub(crate) struct GpuDecoder {
-    decoder: BytesDecoder,
+    output: Output,
+    /// Keeps a decoder's own device alive (the shared one lives in [`SHARED`]).
+    _instance: Option<Arc<VulkanInstance>>,
     /// The graphics card doing the work, for the session panel.
     pub(crate) name: String,
 }
 
 impl GpuDecoder {
-    /// Opens the graphics card best placed to decode, preferring a dedicated one over one built
-    /// into the processor. Fails where the driver lacks Vulkan Video H.264 decoding.
+    /// Opens a hardware decoder: on the shared graphics card if the window has one, handing
+    /// out textures; otherwise on the best card here, handing out pictures in memory.
     pub(crate) fn new() -> Result<Self> {
-        let instance = VulkanInstance::new().context("loading Vulkan")?;
-        let adapter = instance
-            .iter_adapters()
-            .context("listing graphics cards")?
-            .filter(|adapter| adapter.supports_decoding())
-            .max_by_key(|adapter| match adapter.info().device_type {
-                VulkanDeviceType::DISCRETE_GPU => 2,
-                VulkanDeviceType::INTEGRATED_GPU => 1,
-                _ => 0,
-            })
-            .context("no graphics card here decodes H.264 through Vulkan")?;
-        let name = adapter.info().name.clone();
-        let device = adapter.create_device(&VulkanDeviceDescriptor::default()).context("opening the graphics card")?;
-        let decoder = device
-            .create_bytes_decoder_h264(DecoderParameters {
-                usage_flags: DecoderUsageFlags::STREAMING,
-                ..Default::default()
-            })
-            .context("starting the hardware decoder")?;
-        Ok(Self { decoder, name })
+        let parameters = DecoderParameters { usage_flags: DecoderUsageFlags::STREAMING, ..Default::default() };
+        if let Some(shared) = SHARED.get() {
+            let decoder =
+                shared.device.create_wgpu_textures_decoder_h264(parameters).context("starting the hardware decoder")?;
+            return Ok(Self { output: Output::Textures(decoder), _instance: None, name: shared.name.clone() });
+        }
+        Self::in_memory()
     }
 
-    /// Decodes one whole frame, writing the picture to `yuv` as tightly packed I420 if given
-    /// one. Returns the picture's size, or `None` when the frame produced no picture.
-    pub(crate) fn decode(&mut self, data: &[u8], yuv: Option<&mut Vec<u8>>) -> Result<Option<(usize, usize)>> {
-        let mut pictures = self.decoder.decode(EncodedInputChunk { data, pts: None })?;
+    /// A hardware decoder on its own device, handing out pictures in memory.
+    pub(crate) fn in_memory() -> Result<Self> {
+        let parameters = DecoderParameters { usage_flags: DecoderUsageFlags::STREAMING, ..Default::default() };
+        let instance = VulkanInstance::new().context("loading Vulkan")?;
+        let (device, name) = open_device(&instance)?;
+        let decoder = device.create_bytes_decoder_h264(parameters).context("starting the hardware decoder")?;
+        Ok(Self { output: Output::Bytes(decoder), _instance: Some(instance), name })
+    }
+
+    /// Whether pictures stay on the graphics card.
+    pub(crate) fn textures(&self) -> bool {
+        matches!(self.output, Output::Textures(_))
+    }
+
+    /// Decodes one whole frame. In memory, writes the picture to `yuv` as tightly packed I420
+    /// if given one. `None` when the frame produced no picture.
+    pub(crate) fn decode(&mut self, data: &[u8], yuv: Option<&mut Vec<u8>>) -> Result<Option<Decoded>> {
+        let chunk = EncodedInputChunk { data, pts: None };
         // Each chunk is a whole frame and the host never reorders frames, so the picture can be
         // finished now rather than when the next frame's data shows this one has ended.
-        pictures.extend(self.decoder.flush()?);
-        let Some(picture) = pictures.pop() else { return Ok(None) };
-        let (w, h) = (picture.data.width as usize, picture.data.height as usize);
-        if let Some(yuv) = yuv {
-            nv12_to_i420(&picture.data.frame, w, h, yuv)?;
+        match &mut self.output {
+            Output::Bytes(decoder) => {
+                let mut pictures = decoder.decode(chunk)?;
+                pictures.extend(decoder.flush()?);
+                let Some(picture) = pictures.pop() else { return Ok(None) };
+                let (width, height) = (picture.data.width as usize, picture.data.height as usize);
+                if let Some(yuv) = yuv {
+                    nv12_to_i420(&picture.data.frame, width, height, yuv)?;
+                }
+                Ok(Some(Decoded { width, height, texture: None }))
+            }
+            Output::Textures(decoder) => {
+                let mut pictures = decoder.decode(chunk)?;
+                pictures.extend(decoder.flush()?);
+                let Some(picture) = pictures.pop() else { return Ok(None) };
+                let size = picture.data.size();
+                Ok(Some(Decoded {
+                    width: size.width as usize,
+                    height: size.height as usize,
+                    texture: Some(picture.data),
+                }))
+            }
         }
-        Ok(Some((w, h)))
     }
 }
 

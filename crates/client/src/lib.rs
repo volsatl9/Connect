@@ -14,6 +14,7 @@ mod pacing;
 mod video;
 
 pub use decoder::{GpuDecodeSupport, gpu_decode_support};
+pub use gpu_decode::SharedGpu;
 pub use connect_gpu_load::GpuLoad;
 pub use latency::{FrameTiming, Latency};
 
@@ -138,7 +139,11 @@ impl fmt::Display for EndReason {
 pub struct VideoFrame {
     pub width: u32,
     pub height: u32,
+    /// The picture, unless it's in `texture`.
     pub yuv: Vec<u8>,
+    /// The picture as an NV12 texture, when hardware decoding shares the window's graphics card
+    /// ([`SharedGpu`]); `yuv` is then empty.
+    pub texture: Option<wgpu::Texture>,
     pub meta: FrameMeta,
     /// Where the frame's time went; call [`FrameTiming::mark_painted`] when it's drawn.
     pub timing: FrameTiming,

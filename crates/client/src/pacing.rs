@@ -93,6 +93,7 @@ mod tests {
             width: 2,
             height: 2,
             yuv: Vec::new(),
+            texture: None,
             meta: FrameMeta { seq, capture_time_us: now_micros() - captured_ago_us, ..Default::default() },
             timing: Default::default(),
         }

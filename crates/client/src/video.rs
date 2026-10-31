@@ -146,8 +146,8 @@ fn decode(
             }
         }
     }
-    let (w, h) = match result {
-        Ok(Some(size)) => size,
+    let decoded = match result {
+        Ok(Some(decoded)) => decoded,
         other => {
             if let Err(e) = other {
                 debug!(seq = frame.meta.seq, "decode failed: {e:#}");
@@ -177,7 +177,14 @@ fn decode(
         decoded: Some(Instant::now()),
         painted: None,
     };
-    let frame = VideoFrame { width: w as u32, height: h as u32, yuv: buf, meta: frame.meta, timing };
+    let frame = VideoFrame {
+        width: decoded.width as u32,
+        height: decoded.height as u32,
+        yuv: buf,
+        texture: decoded.texture,
+        meta: frame.meta,
+        timing,
+    };
     // Frames the GUI never got to are simply replaced; their buffers are reused.
     let offset = c.clock_offset_us.load(Ordering::Relaxed);
     let smooth = crate::SMOOTH_PACING.load(Ordering::Relaxed);

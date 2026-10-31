@@ -71,6 +71,17 @@ impl Default for Settings {
 }
 
 impl Settings {
+    /// The saved settings, read straight from the file before the window opens (the window's
+    /// renderer depends on them); the defaults if there are none.
+    pub fn saved() -> Self {
+        let Some(file) = eframe::storage_dir("Connect").map(|dir| dir.join("app.ron")) else { return Self::default() };
+        let Ok(text) = std::fs::read_to_string(file) else { return Self::default() };
+        ron::from_str::<std::collections::HashMap<String, String>>(&text)
+            .ok()
+            .and_then(|values| ron::from_str(values.get(eframe::APP_KEY)?).ok())
+            .unwrap_or_default()
+    }
+
     pub fn trusted_ids(&self) -> HashSet<EndpointId> {
         self.trusted.iter().filter_map(KnownDevice::user_id).collect()
     }

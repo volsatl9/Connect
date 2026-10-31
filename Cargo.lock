@@ -878,7 +878,7 @@ dependencies = [
 
 [[package]]
 name = "connect"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "connect-client",
@@ -891,6 +891,7 @@ dependencies = [
  "image",
  "naga",
  "reqwest",
+ "ron",
  "rustls",
  "serde",
  "sha2",
@@ -903,7 +904,7 @@ dependencies = [
 
 [[package]]
 name = "connect-client"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "connect-net",
@@ -917,7 +918,7 @@ dependencies = [
 
 [[package]]
 name = "connect-host"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -936,7 +937,7 @@ dependencies = [
 
 [[package]]
 name = "connect-net"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "connect-proto",
@@ -950,7 +951,7 @@ dependencies = [
 
 [[package]]
 name = "connect-proto"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "bytes",

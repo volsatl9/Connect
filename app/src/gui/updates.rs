@@ -47,14 +47,7 @@ pub struct Updater {
 impl Updater {
     pub fn new(ctx: &egui::Context) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
-        Self {
-            state: State::Idle,
-            dismissed: None,
-            next_check: Instant::now() + FIRST_CHECK,
-            tx,
-            rx,
-            ctx: ctx.clone(),
-        }
+        Self { state: State::Idle, dismissed: None, next_check: Instant::now() + FIRST_CHECK, tx, rx, ctx: ctx.clone() }
     }
 
     /// Runs scheduled checks and takes in results. Returns the executable to restart into once
@@ -132,22 +125,21 @@ impl Updater {
         let mut action = None;
         match &self.state {
             State::Available(update) if self.dismissed.as_ref() != Some(&update.version) => {
-                banner_frame().show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                        ui.label(RichText::new("Update available").strong().color(theme::ACCENT));
+                banner(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Update available").font(theme::semibold(14.0)).color(theme::ACCENT));
                         ui.label(format!("Connect {} (you have {})", update.version, update::current_version()));
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if ui.button("Later").clicked() {
-                                action = Some(Action::Dismiss(update.version.clone()));
-                            }
-                            ui.hyperlink_to("What's new", &update.notes_url);
                             let now = ui
-                                .add_enabled(!in_session, theme::primary("Update now"))
+                                .add_enabled(!in_session, theme::primary("Update now").small())
                                 .on_disabled_hover_text("Available once the current session ends.");
                             if now.clicked() {
                                 action = Some(Action::Download(update.clone()));
                             }
+                            if ui.add(theme::secondary("Later").small()).clicked() {
+                                action = Some(Action::Dismiss(update.version.clone()));
+                            }
+                            ui.hyperlink_to("What's new", &update.notes_url);
                         });
                     });
                 });
@@ -155,28 +147,26 @@ impl Updater {
             }
             State::Downloading { update, progress } => {
                 let fraction = progress.load(Ordering::Relaxed) as f32 / 1000.0;
-                banner_frame().show(ui, |ui| {
-                    ui.set_width(ui.available_width());
+                banner(ui, |ui| {
                     ui.label(format!("Downloading Connect {}… Connect restarts when it's done.", update.version));
                     ui.add(egui::ProgressBar::new(fraction).show_percentage());
                 });
                 ui.add_space(6.0);
             }
             State::Failed { message, update: Some(update) } => {
-                banner_frame().show(ui, |ui| {
-                    ui.set_width(ui.available_width());
+                banner(ui, |ui| {
                     ui.horizontal_wrapped(|ui| {
-                        ui.label(RichText::new("Couldn't update:").strong().color(theme::BAD));
+                        ui.label(RichText::new("Couldn't update:").font(theme::semibold(14.0)).color(theme::BAD));
                         ui.label(message.as_str());
                     });
                     ui.horizontal(|ui| {
-                        if ui.add_enabled(!in_session, theme::primary("Try again")).clicked() {
+                        if ui.add_enabled(!in_session, theme::primary("Try again").small()).clicked() {
                             action = Some(Action::Download(update.clone()));
                         }
-                        ui.hyperlink_to("Download it yourself", &update.notes_url);
-                        if ui.button("Later").clicked() {
+                        if ui.add(theme::secondary("Later").small()).clicked() {
                             action = Some(Action::Dismiss(update.version.clone()));
                         }
+                        ui.hyperlink_to("Download it yourself", &update.notes_url);
                     });
                 });
                 ui.add_space(6.0);
@@ -192,13 +182,12 @@ impl Updater {
 
     /// The "Updates" card on the Settings page.
     pub fn settings_card(&mut self, ui: &mut egui::Ui) {
-        theme::card().show(ui, |ui| {
-            ui.set_width(ui.available_width());
+        theme::card(ui, |ui| {
             theme::section_title(ui, "Updates");
             ui.horizontal(|ui| {
                 ui.label(format!("Connect {}", env!("CARGO_PKG_VERSION")));
                 let checking = self.busy();
-                if ui.add_enabled(!checking, egui::Button::new("Check for updates")).clicked() {
+                if ui.add_enabled(!checking, theme::secondary("Check for updates").small()).clicked() {
                     self.dismissed = None;
                     self.check(true);
                 }
@@ -212,7 +201,7 @@ impl Updater {
                 };
                 ui.label(RichText::new(text).color(color));
             });
-            ui.label(RichText::new("Connect checks for updates when it starts and every few hours.").weak().small());
+            ui.label(theme::caption("Connect checks for updates when it starts and every few hours."));
         });
     }
 }
@@ -222,6 +211,12 @@ enum Action {
     Dismiss(String),
 }
 
-fn banner_frame() -> egui::Frame {
-    theme::card().stroke(egui::Stroke::new(1.0, theme::ACCENT))
+/// A full-width pane of glass with an accent-coloured rim.
+fn banner(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
+    let glass =
+        theme::Glass { rim_top: theme::ACCENT, rim_bottom: theme::ACCENT.gamma_multiply(0.4), ..theme::Glass::PANEL };
+    theme::glass(ui, glass, 16.0, egui::Margin::symmetric(16, 12), |ui| {
+        ui.set_width(ui.available_width());
+        add(ui);
+    });
 }

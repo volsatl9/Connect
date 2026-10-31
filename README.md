@@ -1,8 +1,9 @@
 # Connect
 
-Desktop audio, automatic GPU encoding, two-way cursor visibility, and compact session controls.
-Version 0.3.1 uses protocol 4: **update both PCs**. Older peers receive a version mismatch message.
-See [performance notes](PERFORMANCE.md) for measurements and remaining stutter risks.
+Version 0.4.0 has a new look: glass panels, a sidebar that collapses to icons, and your computers
+as cards. It uses the same protocol as 0.3.1 (protocol 4), so the two connect to each other; older
+peers receive a version mismatch message. See [performance notes](PERFORMANCE.md) for measurements
+and remaining stutter risks.
 
 Peer-to-peer remote desktop for gaming, built on [iroh](https://iroh.computer). Click **Generate
 Account** to get a User-ID. Give it to someone and they can connect to your PC from anywhere:
@@ -32,8 +33,24 @@ Connect updates itself: when a new release is out it shows **Update available**,
 downloads it, checks it against the release's checksums, and restarts into it. Settings → Updates
 checks on demand.
 
+## Using it
+
+The **Connect** page shows this PC and every computer you've connected to as cards:
+
+- **This PC** (Windows) has the **Sharing** switch, which lets people ask to connect. While
+  someone is connected it says so, and **Manage** changes what they may use or disconnects them.
+- Each saved computer has its owner's name for it and a **Connect** button. A computer is saved
+  the first time it lets you in, and its name follows the owner's if they rename it. Hover a card
+  and click **✕** to remove it.
+- **+ Connect** asks for a User-ID, for a computer you haven't connected to before.
+
+**Settings** has your User-ID, hidden until you click **Show** so it doesn't end up on stream or in
+a screenshot (**Copy** works either way), this PC's name, what people may use by default, the
+devices that connect without asking, stream quality and updates. The arrow at the top of the
+sidebar collapses it to icons; click the logo to open it again.
+
 Gamepads work on the host through the ViGEmBus driver, which is built into `connect.exe`. The
-welcome screen offers to set it up, and so does the Share page. Windows asks for permission once.
+welcome screen offers to set it up, and so does Settings → Sharing. Windows asks for permission once.
 The remote user's controller shows up as an Xbox 360 controller in the next free slot: player 2
 if the host has one plugged in, player 1 if not. The driver stays installed if Connect is deleted;
 remove it under Windows *Installed apps* ("ViGEm Bus Driver").
@@ -46,7 +63,7 @@ programs, run Connect as administrator on the host.
 
 ## While connected
 
-The opaque shelf on the left contains fullscreen, mouse capture, audio mute, stats and
+The glass shelf on the left contains fullscreen, mouse capture, audio mute, stats and
 disconnect controls. Collapse it with the arrow; shortcuts remain available while the mouse
 is captured. The shelf's clicks stay local.
 
@@ -133,3 +150,7 @@ copies on one PC.
 
 `connect.exe` includes the installer for [ViGEmBus](https://github.com/nefarius/ViGEmBus) 1.22.0
 (BSD-3-Clause, © Nefarius Software Solutions e.U.); see `crates/host/vendor/vigembus/`.
+
+The app's text is set in [Inter](https://rsms.me/inter/) (SIL Open Font License 1.1) and its icons
+are a subset of [Phosphor](https://phosphoricons.com/) (MIT); both are in `app/assets/fonts/` with
+their licenses.

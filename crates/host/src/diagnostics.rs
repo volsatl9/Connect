@@ -130,7 +130,7 @@ mod windows {
             None => "but no keyframe came out".into(),
         };
         out(format!(
-            "GPU-only pipeline: OK. {} frames in {} s ({fresh} new screen images): encode {} {quality}",
+            "GPU-only pipeline: OK. {} frames in {} s ({fresh} new screen images): encode {}; {quality}",
             times.len(),
             RUN.as_secs(),
             timing(&times),
@@ -211,6 +211,6 @@ mod windows {
         let ms = |d: Duration| d.as_secs_f64() * 1000.0;
         let average = times.iter().map(|&d| ms(d)).sum::<f64>() / times.len().max(1) as f64;
         let slowest = times.iter().map(|&d| ms(d)).fold(0.0, f64::max);
-        format!("{average:.2} ms per frame on average, {slowest:.2} ms at most;")
+        format!("{average:.2} ms per frame on average, {slowest:.2} ms at most")
     }
 }

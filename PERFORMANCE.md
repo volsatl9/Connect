@@ -10,8 +10,20 @@ CPU (multi-threaded, straight from the mapped texture) → H.264 (Media Foundati
 encoder, or OpenH264 on the CPU) → Reed-Solomon recovery packets → QUIC datagrams paced by BBR.
 
 Viewer: datagrams → frames, rebuilt from recovery packets where needed and put back in order →
-OpenH264 decode on the CPU → Y, U and V planes uploaded to the GPU → colour conversion in a
+H.264 decode on the GPU through Vulkan Video (OpenH264 on the CPU where that's unavailable) →
+Y, U and V planes uploaded to the GPU → colour conversion in a
 shader → screen.
+
+## Version 0.5.0: GPU decoding and Opus audio
+
+- **Decoding moved to the GPU.** The viewer opens the graphics card's Vulkan Video H.264 decoder
+  (preferring a dedicated card over integrated graphics) while the host user is still deciding,
+  so it's ready when video arrives. Each frame is finished as soon as its data is in, instead of
+  when the next frame's data starts, since the host never reorders frames. A keyframe the GPU can't
+  decode switches the session to OpenH264 on the spot, starting with that keyframe.
+- **Desktop audio is Opus**, 128 kb/s instead of about 3.1 Mb/s of float PCM: 5 ms packets in
+  restricted low-delay mode (2.5 ms of lookahead). Lost packets of up to 20 ms are concealed by
+  the decoder rather than played as silence.
 
 ## Version 0.3.1: stutter fixes
 
@@ -100,9 +112,11 @@ includes its assembly. On native Windows builds set `NASM` to `nasm.exe` (and ru
 - **GPU readback.** Capture still maps a staging texture on the CPU, which waits for the GPU to
   finish the copy; under heavy GPU load this adds delay. Converting to NV12 on the GPU and
   handing the encoder a GPU texture would remove the readback entirely.
-- **CPU decoding.** The viewer decodes with OpenH264, about 6 ms a frame at 1440p on the
-  development machine. Hardware decoding (Media Foundation / DXVA on Windows) is the next step
-  for 1440p and 4K above 144 fps.
-- **Audio** is uncompressed float PCM, about 3 Mb/s; a codec such as Opus would need a tenth.
-- Physical two-PC gaming, AMD and Intel hardware encoders, and Linux audio playback have not
+- **Decoded pictures go through system memory.** Since 0.5.0 the GPU decodes, but each picture
+  comes back to system memory as NV12 and is uploaded again for display. Rendering the decoder's
+  image directly would save that round trip (about 5.5 MB a frame at 1440p).
+- **Hardware decoding is untested on real GPUs here.** The development machine has none; it falls
+  back to OpenH264 (about 6 ms a frame at 1440p) and its stats line ends "on CPU".
+- Physical two-PC gaming, AMD and Intel hardware encoders, Vulkan Video decoding, and Linux
+  audio playback have not
   been measured here.

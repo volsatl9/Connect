@@ -6,6 +6,7 @@
 //! from the [`ClientHandle`].
 
 mod audio;
+mod gpu_decode;
 mod video;
 
 use std::{
@@ -33,6 +34,15 @@ use iroh::{
 };
 use tokio::sync::{Notify, mpsc};
 use tracing::debug;
+
+/// Whether new sessions try to decode video on the graphics card; see [`set_hardware_decoding`].
+static HARDWARE_DECODING: AtomicBool = AtomicBool::new(true);
+
+/// Turns decoding on the graphics card on or off for sessions started from now on. On by
+/// default; sessions fall back to the processor anyway where the graphics card can't do it.
+pub fn set_hardware_decoding(enabled: bool) {
+    HARDWARE_DECODING.store(enabled, Ordering::Relaxed);
+}
 
 const PING_INTERVAL: Duration = Duration::from_secs(1);
 /// Lower bound between keyframe requests; each one costs the host a large frame. Never less
@@ -169,6 +179,8 @@ pub struct Stats {
     pub loss: Option<f32>,
     pub encode_ms: f32,
     pub decode_ms: f32,
+    /// Whether the graphics card is decoding the video, rather than the processor.
+    pub gpu_decode: bool,
     /// Host capture → decoded here, via the estimated clock offset between the two PCs.
     pub latency_ms: Option<f32>,
 }
@@ -187,6 +199,7 @@ impl Default for Stats {
             loss: None,
             encode_ms: 0.0,
             decode_ms: 0.0,
+            gpu_decode: false,
             latency_ms: None,
         }
     }
@@ -208,6 +221,9 @@ struct Shared {
     spare_buffers: Mutex<Vec<Vec<u8>>>,
     /// Set by the decoder when a frame didn't decode: video needs a fresh keyframe.
     decoder_failed: AtomicBool,
+    /// What is decoding the video, for people to read.
+    decoder: Mutex<String>,
+    gpu_decoding: AtomicBool,
     stats: Mutex<Stats>,
     counters: Counters,
     cursor: Mutex<(CursorPosition, Option<Arc<CursorShape>>, Instant)>,
@@ -254,6 +270,8 @@ pub fn connect(
         frame: Mutex::new(None),
         spare_buffers: Mutex::new(Vec::new()),
         decoder_failed: AtomicBool::new(false),
+        decoder: Mutex::new(String::new()),
+        gpu_decoding: AtomicBool::new(false),
         stats: Mutex::new(Stats::default()),
         cursor: Mutex::new((CursorPosition::default(), None, Instant::now())),
         cursor_sequence: AtomicU64::new(0),
@@ -290,6 +308,12 @@ impl ClientHandle {
     /// Returns a shown frame's buffer for the decoder to reuse.
     pub fn recycle(&self, frame: VideoFrame) {
         recycle(&self.0, frame.yuv);
+    }
+
+    /// What is decoding the video, e.g. "Decoder: GPU · AMD Radeon RX 7600"; empty until
+    /// the session's decoder starts.
+    pub fn decoder(&self) -> String {
+        lock(&self.0.decoder).clone()
     }
 
     pub fn stats(&self) -> Stats {
@@ -395,6 +419,8 @@ async fn session(
     shared: &Arc<Shared>,
     events: &Events,
 ) -> Result<Option<EndReason>> {
+    // Opening the graphics card's decoder can take a moment; do it while the host user decides.
+    let decoder = video::start_decoder(shared.clone())?;
     let (mut send, mut recv) = conn.open_bi().await?;
     let hello = ClientMsg::Hello { version: PROTOCOL_VERSION, client_name: client_name.to_owned() };
     net::write_msg(&mut send, &hello).await?;
@@ -420,18 +446,18 @@ async fn session(
         Err(e) => return Err(e),
     }
 
-    stream(conn, send, recv, shared, events).await
+    stream(conn, send, recv, decoder, shared, events).await
 }
 
 async fn stream(
     conn: &Connection,
     mut send: SendStream,
     recv: RecvStream,
+    decoder: video::DecoderQueue,
     shared: &Arc<Shared>,
     events: &Events,
 ) -> Result<Option<EndReason>> {
     let (keyframe_tx, mut keyframe_rx) = mpsc::unbounded_channel();
-    let decoder = video::start_decoder(shared.clone())?;
     tokio::spawn(video::receive(conn.clone(), decoder, keyframe_tx, shared.clone()));
 
     // Reading isn't cancel-safe (a half-read message would be lost), so it gets its own task.
@@ -641,6 +667,7 @@ impl StatsWindow {
                 .then(|| c.loss_permille.load(Ordering::Relaxed) as f32 / 1000.0),
             encode_ms: c.encode_us.load(Ordering::Relaxed) as f32 / 1000.0,
             decode_ms: c.decode_us.load(Ordering::Relaxed) as f32 / 1000.0,
+            gpu_decode: shared.gpu_decoding.load(Ordering::Relaxed),
             latency_ms: (latency_us != i64::MIN).then(|| latency_us.max(0) as f32 / 1000.0),
         };
         *self = Self { at: Instant::now(), bytes, frames };
@@ -723,7 +750,7 @@ mod media_tests {
                 first_frame: 0,
                 sample_rate: 48000,
                 channels: 2,
-                samples: vec![0.0; 120],
+                payload: audio::Payload::Pcm(vec![0.0; 120]),
             };
             // Audio is ungranted: it must not open playback or corrupt video assembly.
             conn.send_datagram(audio::encode(&pcm, 1200).unwrap()).unwrap();

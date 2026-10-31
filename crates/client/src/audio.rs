@@ -1,4 +1,5 @@
-//! Bounded desktop PCM playback. The CPAL stream stays on its owning thread.
+//! Bounded desktop audio playback: Opus decoded as it arrives, then played from a short
+//! reordering buffer. The CPAL stream stays on its owning thread.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex, mpsc};
@@ -6,16 +7,86 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
-use connect_proto::audio::{self, AudioPacket};
+use connect_proto::audio::{self, AudioPacket, Payload};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 const TARGET_BUFFER_MS: u64 = 20;
 const MAX_BUFFER_MS: u64 = 80;
 const MAX_QUEUED_PACKETS: usize = 512;
+/// Longest run of lost Opus packets filled in with Opus's concealment rather than silence.
+const MAX_CONCEALED_MS: u64 = 20;
+
+/// Decoded audio: interleaved frames in the source device's channel order.
+#[derive(Clone, Debug, PartialEq)]
+struct Pcm {
+    stream_id: u64,
+    sequence: u32,
+    first_frame: u64,
+    sample_rate: u32,
+    channels: u16,
+    samples: Vec<f32>,
+}
+
+/// Opus decoding for one capture stream from the host.
+struct OpusStream {
+    stream_id: u64,
+    sample_rate: u32,
+    channels: u16,
+    decoder: opus::Decoder,
+    /// The frame after the last one decoded.
+    next_frame: u64,
+}
+
+/// Turns datagrams into [`Pcm`], decoding Opus in arrival order.
+#[derive(Default)]
+struct Depacketizer {
+    opus: Option<OpusStream>,
+}
+
+impl Depacketizer {
+    /// The audio in `packet`, or `None` if it should be dropped (late, or from an older stream).
+    fn decode(&mut self, packet: AudioPacket) -> Result<Option<Pcm>> {
+        let AudioPacket { stream_id, sequence, first_frame, sample_rate, channels, payload } = packet;
+        let pcm = |samples| Pcm { stream_id, sequence, first_frame, sample_rate, channels, samples };
+        let (frames, data) = match payload {
+            Payload::Pcm(samples) => return Ok(Some(pcm(samples))),
+            Payload::Opus { frames, data } => (u64::from(frames), data),
+        };
+        let current = self.opus.as_ref().map(|s| (s.stream_id, s.sample_rate, s.channels));
+        if current.is_some_and(|(id, ..)| stream_id < id) {
+            return Ok(None);
+        }
+        if current != Some((stream_id, sample_rate, channels)) {
+            let layout = if channels == 1 { opus::Channels::Mono } else { opus::Channels::Stereo };
+            let decoder = opus::Decoder::new(sample_rate, layout).context("starting the Opus decoder")?;
+            self.opus = Some(OpusStream { stream_id, sample_rate, channels, decoder, next_frame: first_frame });
+        }
+        let stream = self.opus.as_mut().expect("set above");
+        if first_frame < stream.next_frame {
+            // Already concealed, or a duplicate: Opus decodes strictly in order.
+            return Ok(None);
+        }
+        let width = usize::from(channels);
+        let gap = first_frame - stream.next_frame;
+        // A short loss sounds far better concealed than as a dropout; a long one is silence.
+        let concealed = if gap <= u64::from(sample_rate) * MAX_CONCEALED_MS / 1000 { gap } else { 0 };
+        let mut samples = vec![0.0; (concealed + frames) as usize * width];
+        let (lost, current) = samples.split_at_mut(concealed as usize * width);
+        // Concealment comes in whole 2.5ms steps, the shortest Opus frame; 5ms packets fit.
+        let step = (sample_rate / 400) as usize * width;
+        for chunk in lost.chunks_mut(step) {
+            stream.decoder.decode_float(&[], chunk, false).context("concealing lost audio")?;
+        }
+        let decoded = stream.decoder.decode_float(&data, current, false).context("decoding Opus audio")?;
+        ensure!(decoded as u64 == frames, "Opus packet length does not match header");
+        stream.next_frame = first_frame + frames;
+        Ok(Some(Pcm { first_frame: first_frame - concealed, ..pcm(samples) }))
+    }
+}
 
 #[derive(Default)]
 struct PlaybackBuffer {
-    packets: BTreeMap<u64, AudioPacket>,
+    packets: BTreeMap<u64, Pcm>,
     stream_id: Option<u64>,
     sample_rate: u32,
     channels: u16,
@@ -29,7 +100,7 @@ struct PlaybackBuffer {
 }
 
 impl PlaybackBuffer {
-    fn push(&mut self, packet: AudioPacket) -> Result<()> {
+    fn push(&mut self, packet: Pcm) -> Result<()> {
         if self.stream_id.is_some_and(|id| packet.stream_id < id) {
             return Ok(());
         }
@@ -222,6 +293,7 @@ impl PlaybackBuffer {
 
 /// Send-safe handle; dropping it closes the output device on its owning thread.
 pub(crate) struct Playback {
+    depacketizer: Mutex<Depacketizer>,
     buffer: Arc<Mutex<PlaybackBuffer>>,
     failure: Arc<Mutex<Option<String>>>,
     stop: mpsc::Sender<()>,
@@ -262,7 +334,7 @@ impl Playback {
             })
             .context("start audio playback thread")?;
         match started.recv_timeout(Duration::from_secs(5)) {
-            Ok(Ok(())) => Ok(Self { buffer, failure, stop, worker: Some(worker) }),
+            Ok(Ok(())) => Ok(Self { depacketizer: Default::default(), buffer, failure, stop, worker: Some(worker) }),
             Ok(Err(error)) => {
                 let _ = worker.join();
                 Err(error)
@@ -279,7 +351,10 @@ impl Playback {
             bail!("audio output unavailable: {error}");
         }
         let packet = audio::decode(data)?;
-        self.buffer.lock().map_err(|_| anyhow::anyhow!("audio playback lock poisoned"))?.push(packet)
+        let decoded =
+            self.depacketizer.lock().map_err(|_| anyhow::anyhow!("audio decoder lock poisoned"))?.decode(packet)?;
+        let Some(pcm) = decoded else { return Ok(()) };
+        self.buffer.lock().map_err(|_| anyhow::anyhow!("audio playback lock poisoned"))?.push(pcm)
     }
 
     pub(crate) fn set_muted(&self, muted: bool) {
@@ -361,8 +436,70 @@ fn open_output(buffer: Arc<Mutex<PlaybackBuffer>>, failure: Arc<Mutex<Option<Str
 mod tests {
     use super::*;
 
-    fn packet(sequence: u32, first_frame: u64, value: f32) -> AudioPacket {
-        AudioPacket { stream_id: 1, sequence, first_frame, sample_rate: 8000, channels: 1, samples: vec![value; 160] }
+    fn packet(sequence: u32, first_frame: u64, value: f32) -> Pcm {
+        Pcm { stream_id: 1, sequence, first_frame, sample_rate: 8000, channels: 1, samples: vec![value; 160] }
+    }
+
+    /// 5ms of a 1kHz tone at 48kHz stereo as host-style Opus packets, `count` of them.
+    fn opus_packets(count: u64) -> Vec<AudioPacket> {
+        let mut encoder = opus::Encoder::new(48_000, opus::Channels::Stereo, opus::Application::LowDelay).unwrap();
+        (0..count)
+            .map(|n| {
+                let tone: Vec<f32> = (n * 240..(n + 1) * 240)
+                    .flat_map(|i| [(std::f32::consts::TAU * 1000.0 * i as f32 / 48_000.0).sin() * 0.5; 2])
+                    .collect();
+                let data = encoder.encode_vec_float(&tone, audio::MAX_OPUS_LEN).unwrap();
+                AudioPacket {
+                    stream_id: 3,
+                    sequence: n as u32,
+                    first_frame: n * 240,
+                    sample_rate: 48_000,
+                    channels: 2,
+                    payload: Payload::Opus { frames: 240, data },
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn opus_decodes_in_order_and_conceals_short_losses() {
+        let packets = opus_packets(12);
+        let mut depacketizer = Depacketizer::default();
+        let first = depacketizer.decode(packets[0].clone()).unwrap().unwrap();
+        assert_eq!((first.first_frame, first.samples.len()), (0, 480));
+        depacketizer.decode(packets[1].clone()).unwrap().unwrap();
+        // Packets 2 and 3 are lost: 4 arrives covering them with concealed audio, not silence.
+        let filled = depacketizer.decode(packets[4].clone()).unwrap().unwrap();
+        assert_eq!((filled.first_frame, filled.samples.len(), filled.sequence), (480, 3 * 480, 4));
+        assert!(filled.samples[..960].iter().any(|x| x.abs() > 0.01), "concealment carries the tone on");
+        // 3 turning up late has already been covered; a duplicate of 4 is dropped too.
+        assert_eq!(depacketizer.decode(packets[3].clone()).unwrap(), None);
+        assert_eq!(depacketizer.decode(packets[4].clone()).unwrap(), None);
+        // A gap longer than 20ms stays silent: the packet after it decodes alone.
+        let late = depacketizer.decode(packets[11].clone()).unwrap().unwrap();
+        assert_eq!((late.first_frame, late.samples.len()), (11 * 240, 480));
+        // Everything decoded plays through the buffer without overlapping.
+        let mut buffer = PlaybackBuffer::default();
+        for pcm in [first, filled, late] {
+            buffer.push(pcm).unwrap();
+        }
+    }
+
+    #[test]
+    fn opus_restarts_for_a_new_capture_and_ignores_older_ones() {
+        let packets = opus_packets(2);
+        let mut depacketizer = Depacketizer::default();
+        depacketizer.decode(packets[0].clone()).unwrap().unwrap();
+        let mut restarted = packets[0].clone();
+        restarted.stream_id = 4;
+        assert_eq!(depacketizer.decode(restarted).unwrap().unwrap().first_frame, 0);
+        assert_eq!(depacketizer.decode(packets[1].clone()).unwrap(), None, "older capture");
+        let mut bad = packets[1].clone();
+        bad.stream_id = 4;
+        if let Payload::Opus { frames, .. } = &mut bad.payload {
+            *frames = 480;
+        }
+        assert!(depacketizer.decode(bad).is_err(), "header disagrees with the packet");
     }
 
     #[test]
@@ -510,7 +647,7 @@ mod tests {
         for _ in 0..2 {
             let playback = Playback::start().expect("default output opens");
             playback.set_muted(true);
-            let bytes = audio::encode(&packet(0, 0, 0.0), 1200).unwrap();
+            let bytes = audio::encode(&opus_packets(1)[0], 1200).unwrap();
             playback.push_datagram(&bytes).unwrap();
             thread::sleep(Duration::from_millis(100));
             playback.push_datagram(&bytes).expect("output stayed healthy");

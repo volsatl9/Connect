@@ -1,4 +1,5 @@
-//! Datagrams → whole frames (async task) → decoded I420 (decoder thread).
+//! Datagrams → whole frames (async task) → decoded I420 (decoder thread, on the graphics card
+//! where it can, otherwise on the processor).
 
 use std::{
     sync::{
@@ -15,11 +16,11 @@ use connect_proto::{
     video::{EncodedFrame, FrameAssembler},
 };
 use iroh::endpoint::Connection;
-use openh264::{decoder::Decoder, formats::YUVSource};
+use openh264::formats::YUVSource;
 use tokio::sync::mpsc::UnboundedSender;
-use tracing::debug;
+use tracing::{debug, info, warn};
 
-use crate::{Shared, VideoFrame, lock};
+use crate::{Shared, VideoFrame, gpu_decode::GpuDecoder, lock};
 
 /// Complete frames waiting for the decoder. Every frame has to be decoded, as the next one
 /// builds on it, but a decoder that is briefly behind only shows the newest; past this many it
@@ -53,11 +54,14 @@ impl DecoderQueue {
 pub(crate) fn start_decoder(shared: Arc<Shared>) -> Result<DecoderQueue> {
     let (tx, rx) = std_mpsc::sync_channel::<EncodedFrame>(DECODE_QUEUE);
     let queued = Arc::new(AtomicUsize::new(0));
-    let mut decoder = Decoder::new().context("starting H.264 decoder")?;
     let pending = queued.clone();
     std::thread::Builder::new()
         .name("connect-decode".into())
         .spawn(move || {
+            let mut decoder = match Decoder::open(&shared) {
+                Ok(decoder) => decoder,
+                Err(e) => return warn!("no video decoder: {e:#}"),
+            };
             let mut shown_at = Instant::now();
             while let Ok(frame) = rx.recv() {
                 let behind = pending.fetch_sub(1, Ordering::AcqRel) > 1;
@@ -72,15 +76,92 @@ pub(crate) fn start_decoder(shared: Arc<Shared>) -> Result<DecoderQueue> {
     Ok(DecoderQueue { frames: tx, queued })
 }
 
+enum Decoder {
+    Gpu(Box<GpuDecoder>),
+    Cpu(openh264::decoder::Decoder),
+}
+
+impl Decoder {
+    /// The graphics card's decoder where it has one and the user hasn't turned it off,
+    /// otherwise OpenH264 on the processor.
+    fn open(shared: &Shared) -> Result<Self> {
+        if crate::HARDWARE_DECODING.load(Ordering::Relaxed) {
+            match GpuDecoder::new() {
+                Ok(gpu) => {
+                    info!(gpu = gpu.name, "decoding video on the graphics card");
+                    *lock(&shared.decoder) = format!("Decoder: GPU · {}", gpu.name);
+                    shared.gpu_decoding.store(true, Ordering::Relaxed);
+                    return Ok(Self::Gpu(Box::new(gpu)));
+                }
+                Err(e) => info!("hardware decoding unavailable, decoding on the processor: {e:#}"),
+            }
+        }
+        Self::cpu(shared)
+    }
+
+    fn cpu(shared: &Shared) -> Result<Self> {
+        let decoder = openh264::decoder::Decoder::new().context("starting H.264 decoder")?;
+        *lock(&shared.decoder) = "Decoder: CPU (OpenH264)".into();
+        shared.gpu_decoding.store(false, Ordering::Relaxed);
+        Ok(Self::Cpu(decoder))
+    }
+
+    /// Decodes `data`, writing the picture to `yuv` as tightly packed I420 if given one.
+    /// Returns the picture's size, or `None` if this data finished no picture.
+    fn decode(&mut self, data: &[u8], yuv: Option<&mut Vec<u8>>) -> Result<Option<(usize, usize)>> {
+        match self {
+            Self::Gpu(gpu) => gpu.decode(data, yuv),
+            Self::Cpu(decoder) => {
+                let Some(picture) = decoder.decode(data)? else { return Ok(None) };
+                let (w, h) = picture.dimensions();
+                if let Some(buf) = yuv {
+                    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+                    buf.resize(w * h + 2 * cw * ch, 0);
+                    let (y, chroma) = buf.split_at_mut(w * h);
+                    let (u, v) = chroma.split_at_mut(cw * ch);
+                    let (ys, us, vs) = picture.strides();
+                    for (dst, src, stride, width) in
+                        [(y, picture.y(), ys, w), (u, picture.u(), us, cw), (v, picture.v(), vs, cw)]
+                    {
+                        for (row, line) in dst.chunks_exact_mut(width).enumerate() {
+                            line.copy_from_slice(&src[row * stride..][..width]);
+                        }
+                    }
+                }
+                Ok(Some((w, h)))
+            }
+        }
+    }
+}
+
 /// Decodes `frame`, publishing the picture if `show`. False if it didn't decode.
 fn decode(decoder: &mut Decoder, frame: &EncodedFrame, shared: &Shared, show: bool) -> bool {
     let started = Instant::now();
-    let yuv = match decoder.decode(&frame.data) {
-        Ok(Some(yuv)) => yuv,
-        Ok(None) => return false,
-        Err(e) => {
-            debug!(seq = frame.meta.seq, "decode failed: {e}");
-            shared.decoder_failed.store(true, Ordering::Relaxed);
+    // Tightly packed planes, in a buffer the GUI handed back after showing an earlier frame.
+    let mut buf = show.then(|| lock(&shared.spare_buffers).pop().unwrap_or_default());
+    let mut result = decoder.decode(&frame.data, buf.as_mut());
+    if let (Err(e), Decoder::Gpu(_), true) = (&result, &*decoder, frame.meta.keyframe) {
+        // A keyframe needs nothing before it, so failing one means the graphics card can't
+        // decode this stream at all: carry on on the processor, starting with this keyframe.
+        warn!("hardware decoding failed on a keyframe, switching to software: {e:#}");
+        match Decoder::cpu(shared) {
+            Ok(cpu) => {
+                *decoder = cpu;
+                result = decoder.decode(&frame.data, buf.as_mut());
+            }
+            Err(e) => warn!("{e:#}"),
+        }
+    }
+    let (w, h) = match result {
+        Ok(Some(size)) => size,
+        other => {
+            if let Err(e) = other {
+                debug!(seq = frame.meta.seq, "decode failed: {e:#}");
+                shared.decoder_failed.store(true, Ordering::Relaxed);
+            }
+            if let Some(buf) = buf {
+                crate::recycle(shared, buf);
+            }
             return false;
         }
     };
@@ -88,24 +169,10 @@ fn decode(decoder: &mut Decoder, frame: &EncodedFrame, shared: &Shared, show: bo
     if c.frames_decoded.fetch_add(1, Ordering::Relaxed) == 0 {
         debug!(seq = frame.meta.seq, bytes = frame.data.len(), "first frame decoded");
     }
-    if !show {
+    let Some(buf) = buf else {
         c.frames_superseded.fetch_add(1, Ordering::Relaxed);
         return true;
-    }
-
-    // Tightly packed planes, in a buffer the GUI handed back after showing an earlier frame.
-    let (w, h) = yuv.dimensions();
-    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
-    let mut buf = lock(&shared.spare_buffers).pop().unwrap_or_default();
-    buf.resize(w * h + 2 * cw * ch, 0);
-    let (y, chroma) = buf.split_at_mut(w * h);
-    let (u, v) = chroma.split_at_mut(cw * ch);
-    let (ys, us, vs) = yuv.strides();
-    for (dst, src, stride, width) in [(y, yuv.y(), ys, w), (u, yuv.u(), us, cw), (v, yuv.v(), vs, cw)] {
-        for (row, line) in dst.chunks_exact_mut(width).enumerate() {
-            line.copy_from_slice(&src[row * stride..][..width]);
-        }
-    }
+    };
 
     c.decode_us.store(started.elapsed().as_micros() as u64, Ordering::Relaxed);
     c.encode_us.store(frame.meta.encode_time_us as u64, Ordering::Relaxed);

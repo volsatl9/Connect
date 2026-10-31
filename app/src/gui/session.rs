@@ -163,6 +163,10 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     controls
         .add(egui::Label::new(theme::caption(&client.encoder).size(11.0)).truncate())
         .on_hover_text(&client.encoder);
+    let decoder = client.handle.decoder();
+    if !decoder.is_empty() {
+        controls.add(egui::Label::new(theme::caption(&decoder).size(11.0)).truncate()).on_hover_text(&decoder);
+    }
     controls.add_space(4.0);
     divider(&mut controls);
     let (icon, label) =

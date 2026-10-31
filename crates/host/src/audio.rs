@@ -4,7 +4,7 @@
 
 use anyhow::{Context, Result, bail, ensure};
 use bytes::Bytes;
-use connect_proto::audio::{self, AudioPacket};
+use connect_proto::audio::{self, AudioPacket, Payload};
 #[cfg(windows)]
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::sync::{
@@ -16,6 +16,10 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
+/// Opus bitrate per channel: near-transparent for game and desktop audio, and stereo at 128 kb/s
+/// is a twenty-fourth of the float PCM it replaces.
+const OPUS_BITRATE_PER_CHANNEL: i32 = 64_000;
+
 struct Packetizer {
     stream_id: u64,
     sequence: u32,
@@ -24,17 +28,52 @@ struct Packetizer {
     channels: u16,
     max_datagram: usize,
     frames_per_packet: usize,
+    /// Compresses each packet where Opus takes the format; otherwise packets carry PCM.
+    opus: Option<opus::Encoder>,
+    /// Captured samples not yet sent. Opus takes whole 5ms frames, so a capture callback's
+    /// remainder waits here for the next one.
+    pending: Vec<f32>,
 }
 
 impl Packetizer {
     fn new(stream_id: u64, sample_rate: u32, channels: u16, max_datagram: usize) -> Result<Self> {
+        Self::with_codec(stream_id, sample_rate, channels, max_datagram, audio::opus_supports(sample_rate, channels))
+    }
+
+    fn with_codec(stream_id: u64, sample_rate: u32, channels: u16, max_datagram: usize, opus: bool) -> Result<Self> {
         ensure!(
             (audio::MIN_SAMPLE_RATE..=audio::MAX_SAMPLE_RATE).contains(&sample_rate),
             "unsupported desktop audio sample rate"
         );
-        // At most 5ms per packet even with an unusually large negotiated QUIC datagram.
-        let frames_per_packet = audio::max_frames_per_packet(max_datagram, channels)?.min((sample_rate / 200) as usize);
-        Ok(Self { stream_id, sequence: 0, first_frame: 0, sample_rate, channels, max_datagram, frames_per_packet })
+        // At most 5ms per packet even with an unusually large negotiated QUIC datagram. Opus
+        // packets are exactly 5ms, one of its frame lengths: short enough to add little delay,
+        // long enough to stay efficient.
+        let pcm_frames = audio::max_frames_per_packet(max_datagram, channels)?.min((sample_rate / 200) as usize);
+        let (opus, frames_per_packet) = if opus {
+            ensure!(audio::opus_supports(sample_rate, channels), "Opus can't carry this audio format");
+            ensure!(max_datagram > audio::HEADER_LEN, "datagram limit cannot fit an audio packet");
+            let layout = if channels == 1 { opus::Channels::Mono } else { opus::Channels::Stereo };
+            // Restricted low delay: music-grade coding with the least lookahead (2.5ms).
+            let mut encoder = opus::Encoder::new(sample_rate, layout, opus::Application::LowDelay)
+                .context("starting the Opus encoder")?;
+            encoder
+                .set_bitrate(opus::Bitrate::Bits(OPUS_BITRATE_PER_CHANNEL * i32::from(channels)))
+                .context("setting the Opus bitrate")?;
+            (Some(encoder), (sample_rate / 200) as usize)
+        } else {
+            (None, pcm_frames)
+        };
+        Ok(Self {
+            stream_id,
+            sequence: 0,
+            first_frame: 0,
+            sample_rate,
+            channels,
+            max_datagram,
+            frames_per_packet,
+            opus,
+            pending: Vec::new(),
+        })
     }
 
     fn push<T: cpal::SizedSample>(&mut self, data: &[T], output: &mpsc::Sender<Result<Bytes>>, stopped: &AtomicBool)
@@ -43,32 +82,52 @@ impl Packetizer {
     {
         let channels = usize::from(self.channels);
         let aligned = data.len() / channels * channels;
-        for chunk in data[..aligned].chunks(self.frames_per_packet * channels) {
+        self.pending.extend(data[..aligned].iter().map(|&sample| {
+            let value = <f32 as cpal::FromSample<T>>::from_sample_(sample);
+            if value.is_finite() { value } else { 0.0 }
+        }));
+        let chunk_len = self.frames_per_packet * channels;
+        // PCM goes out at once, a short last packet included; Opus waits for a whole frame.
+        let ready = if self.opus.is_some() { self.pending.len() / chunk_len * chunk_len } else { self.pending.len() };
+        let mut start = 0;
+        while start < ready {
             if stopped.load(Ordering::Acquire) {
                 return;
             }
+            let chunk = &self.pending[start..(start + chunk_len).min(ready)];
+            start += chunk.len();
+            let frames = chunk.len() / channels;
+            let payload = match &mut self.opus {
+                Some(encoder) => {
+                    let mut out = [0; audio::MAX_OPUS_LEN];
+                    let room = audio::MAX_OPUS_LEN.min(self.max_datagram - audio::HEADER_LEN);
+                    match encoder.encode_float(chunk, &mut out[..room]) {
+                        Ok(len) => Payload::Opus { frames: frames as u16, data: out[..len].to_vec() },
+                        Err(error) => {
+                            let _ = output.try_send(Err(anyhow::anyhow!("desktop audio encoding failed: {error}")));
+                            stopped.store(true, Ordering::Release);
+                            return;
+                        }
+                    }
+                }
+                None => Payload::Pcm(chunk.to_vec()),
+            };
             let packet = AudioPacket {
                 stream_id: self.stream_id,
                 sequence: self.sequence,
                 first_frame: self.first_frame,
                 sample_rate: self.sample_rate,
                 channels: self.channels,
-                samples: chunk
-                    .iter()
-                    .map(|&sample| {
-                        let value = <f32 as cpal::FromSample<T>>::from_sample_(sample);
-                        if value.is_finite() { value } else { 0.0 }
-                    })
-                    .collect(),
+                payload,
             };
             self.sequence = self.sequence.wrapping_add(1);
-            let Some(next_frame) = self.first_frame.checked_add((chunk.len() / channels) as u64) else {
+            let Some(next_frame) = self.first_frame.checked_add(frames as u64) else {
                 let _ = output.try_send(Err(anyhow::anyhow!("desktop audio timeline exhausted")));
                 stopped.store(true, Ordering::Release);
                 return;
             };
             self.first_frame = next_frame;
-            // A full queue drops PCM, preserving sequence/timeline gaps for client silence.
+            // A full queue drops the packet, leaving a sequence/timeline gap the client fills.
             let encoded = audio::encode(&packet, self.max_datagram);
             if stopped.load(Ordering::Acquire) {
                 return;
@@ -78,6 +137,7 @@ impl Packetizer {
                 return;
             }
         }
+        self.pending.drain(..ready);
     }
 }
 
@@ -206,8 +266,8 @@ fn open_loopback(
     let supported = device.default_output_config().context("desktop audio mix format")?;
     let preferred = cpal::StreamConfig { channels: 2, sample_rate: 48_000, buffer_size: cpal::BufferSize::Default };
     // CPAL WASAPI enables AUTOCONVERTPCM + SRC_DEFAULT_QUALITY: Windows performs
-    // rate conversion AND channel matrixing (including center/surround downmix).
-    // Stereo float PCM caps the normal payload at 3.072Mbps without a lossy codec.
+    // rate conversion AND channel matrixing (including center/surround downmix), so the
+    // desktop mix arrives as 48kHz stereo, which Opus compresses to 128 kb/s.
     match start_loopback(&device, &preferred, cpal::SampleFormat::F32, max_datagram, stopped.clone()) {
         Ok(stream) => {
             tracing::info!(
@@ -215,7 +275,7 @@ fn open_loopback(
                 mix_channels = supported.channels(),
                 sample_rate = 48000,
                 channels = 2,
-                "desktop loopback ready: 48kHz stereo PCM, Windows audio engine converts the desktop mix"
+                "desktop loopback ready: 48kHz stereo Opus, Windows audio engine converts the desktop mix"
             );
             return Ok(stream);
         }
@@ -228,7 +288,7 @@ fn open_loopback(
     tracing::info!(
         sample_rate = config.sample_rate,
         channels = config.channels,
-        "desktop loopback ready: native PCM fallback (bandwidth depends on device mix format)"
+        "desktop loopback ready: native mix format (Opus where it fits, otherwise PCM)"
     );
     Ok(stream)
 }
@@ -287,13 +347,55 @@ mod tests {
     use super::*;
     use connect_proto::audio;
 
+    fn pcm(packet: &AudioPacket) -> &[f32] {
+        match &packet.payload {
+            Payload::Pcm(samples) => samples,
+            Payload::Opus { .. } => panic!("expected PCM"),
+        }
+    }
+
+    #[test]
+    fn opus_packets_are_whole_5ms_frames_that_decode_back_to_the_tone() {
+        let mut packetizer = Packetizer::new(7, 48_000, 2, 1200).unwrap();
+        assert!(packetizer.opus.is_some(), "48kHz stereo goes out as Opus");
+        let (tx, mut rx) = mpsc::channel(64);
+        // 100ms of a 1kHz tone in uneven capture callbacks, as WASAPI delivers them.
+        let tone: Vec<f32> =
+            (0..4800).flat_map(|i| [(std::f32::consts::TAU * 1000.0 * i as f32 / 48_000.0).sin() * 0.5; 2]).collect();
+        for callback in tone.chunks(2 * 441) {
+            packetizer.push(callback, &tx, &AtomicBool::new(false));
+        }
+        let mut decoder = opus::Decoder::new(48_000, opus::Channels::Stereo).unwrap();
+        let (mut decoded, mut next_frame, mut bytes) = (Vec::new(), 0, 0);
+        while let Ok(datagram) = rx.try_recv() {
+            let datagram = datagram.unwrap();
+            bytes += datagram.len();
+            let p = audio::decode(&datagram).unwrap();
+            let Payload::Opus { frames, data } = &p.payload else { panic!("expected Opus") };
+            assert_eq!((*frames, p.first_frame), (240, next_frame));
+            next_frame += 240;
+            let mut out = [0.0; 480];
+            assert_eq!(decoder.decode_float(data, &mut out, false).unwrap(), 240);
+            decoded.extend_from_slice(&out);
+        }
+        assert_eq!(next_frame, 4800, "every whole frame sent, none held back");
+        assert!(packetizer.pending.is_empty());
+        // PCM would have been 4800 × 2 × 4 bytes plus headers.
+        assert!(bytes < 4800 * 8 / 10, "{bytes} bytes");
+        // Opus's 2.5ms (120-frame) lookahead delays the output; the tone survives it.
+        let delay = 120 * 2;
+        let error: f32 = decoded[delay + 960..].iter().zip(&tone[960..]).map(|(a, b)| (a - b).powi(2)).sum();
+        let power: f32 = tone[960..decoded.len() - delay].iter().map(|x| x * x).sum();
+        assert!(error / power < 0.05, "signal-to-noise too low: {}", error / power);
+    }
+
     #[test]
     fn chunks_capture_to_negotiated_size_without_losing_pcm_or_timeline() {
-        let mut packetizer = Packetizer::new(91, 48_000, 2, 1200).unwrap();
+        let mut packetizer = Packetizer::with_codec(91, 48_000, 2, 1200, false).unwrap();
         let (tx, mut rx) = mpsc::channel(16);
         let samples: Vec<_> = (0..960).map(|x| x as f32 / 960.0).collect();
         packetizer.push(&samples, &tx, &AtomicBool::new(false));
-        let mut combined = vec![];
+        let mut combined: Vec<f32> = vec![];
         let mut first_frame = 0;
         let mut sequence = 0;
         while let Ok(bytes) = rx.try_recv() {
@@ -303,9 +405,9 @@ mod tests {
             assert_eq!(p.stream_id, 91);
             assert_eq!(p.sequence, sequence);
             assert_eq!(p.first_frame, first_frame);
-            first_frame += (p.samples.len() / 2) as u64;
+            first_frame += p.frames() as u64;
             sequence += 1;
-            combined.extend(p.samples);
+            combined.extend(pcm(&p));
         }
         assert_eq!(first_frame, 480);
         assert_eq!(combined, samples);
@@ -313,7 +415,7 @@ mod tests {
 
     #[test]
     fn queue_overflow_leaves_exact_timeline_gap_and_revocation_sends_nothing() {
-        let mut packetizer = Packetizer::new(91, 8000, 1, 1200).unwrap();
+        let mut packetizer = Packetizer::with_codec(91, 8000, 1, 1200, false).unwrap();
         let (tx, mut rx) = mpsc::channel(1);
         let stopped = AtomicBool::new(false);
         packetizer.push(&[0.5f32; 160], &tx, &stopped);
@@ -329,16 +431,16 @@ mod tests {
 
     #[test]
     fn converts_integer_source_and_silences_nonfinite_device_samples() {
-        let mut packetizer = Packetizer::new(91, 8000, 1, 1200).unwrap();
+        let mut packetizer = Packetizer::with_codec(91, 8000, 1, 1200, false).unwrap();
         let (tx, mut rx) = mpsc::channel(4);
         packetizer.push(&[i16::MIN, 0, i16::MAX], &tx, &AtomicBool::new(false));
         let p = audio::decode(&rx.try_recv().unwrap().unwrap()).unwrap();
-        assert_eq!(p.samples[0], -1.0);
-        assert_eq!(p.samples[1], 0.0);
-        assert!((p.samples[2] - 0.9999695).abs() < 1e-7);
+        assert_eq!(pcm(&p)[0], -1.0);
+        assert_eq!(pcm(&p)[1], 0.0);
+        assert!((pcm(&p)[2] - 0.9999695).abs() < 1e-7);
         packetizer.push(&[f32::NAN, f32::INFINITY, 0.5], &tx, &AtomicBool::new(false));
         let p = audio::decode(&rx.try_recv().unwrap().unwrap()).unwrap();
-        assert_eq!(p.samples, [0.0, 0.0, 0.5]);
+        assert_eq!(pcm(&p), [0.0, 0.0, 0.5]);
     }
 
     #[cfg(windows)]

@@ -219,8 +219,21 @@ impl Stage {
     }
 }
 
-/// Opens the best encoder for `codec` that reads from memory: the graphics card's, then
-/// OpenH264 for H.264.
+/// Opens `codec` with `open`, or H.264 if that fails: an encoder listed for a codec can still
+/// refuse the settings a stream needs, and every hardware encoder does H.264.
+#[cfg(windows)]
+fn or_h264<T>(codec: Codec, mut open: impl FnMut(Codec) -> Result<T>) -> Result<T> {
+    open(codec).or_else(|error| {
+        if codec == Codec::H264 {
+            return Err(error);
+        }
+        tracing::warn!("GPU {codec} encoder unavailable, trying H.264: {error:#}");
+        open(Codec::H264)
+    })
+}
+
+/// Opens the best encoder for `codec` that reads from memory: the graphics card's, then its
+/// H.264 one, then OpenH264.
 fn open_memory_encoder(
     source: &VideoSource,
     codec: Codec,
@@ -231,14 +244,14 @@ fn open_memory_encoder(
 ) -> Result<Box<dyn VideoEncoder>> {
     #[cfg(windows)]
     if *source == VideoSource::Screen {
-        match mf::HardwareEncoder::new(codec, width, height, bitrate, fps, None) {
+        match or_h264(codec, |codec| mf::HardwareEncoder::new(codec, width, height, bitrate, fps, None)) {
             Ok(encoder) => return Ok(Box::new(encoder)),
-            Err(error) => tracing::warn!("GPU {codec} encoder unavailable: {error:#}"),
+            Err(error) => tracing::warn!("GPU encoder unavailable, encoding on the processor: {error:#}"),
         }
     }
     #[cfg(not(windows))]
-    let _ = (source, width, height);
-    open_software_encoder(codec, bitrate, fps)
+    let _ = (source, codec, width, height);
+    open_software_encoder(Codec::H264, bitrate, fps)
 }
 
 fn open_software_encoder(codec: Codec, bitrate: u32, fps: u32) -> Result<Box<dyn VideoEncoder>> {
@@ -260,7 +273,7 @@ fn open_gpu_path(
     fps: u32,
 ) -> Result<(Stage, Box<dyn VideoEncoder>)> {
     let converter = crate::gpu::Nv12Converter::new(device, width, height).context("GPU colour conversion")?;
-    let encoder = mf::HardwareEncoder::new(codec, width, height, bitrate, fps, Some(device))
+    let encoder = or_h264(codec, |codec| mf::HardwareEncoder::new(codec, width, height, bitrate, fps, Some(device)))
         .context("GPU encoder taking textures")?;
     Ok((Stage::Gpu(converter), Box::new(encoder)))
 }
@@ -318,6 +331,7 @@ fn run(source: &VideoSource, tx: &mpsc::Sender<Result<VideoEvent>>, control: &Co
             &mut gpu,
             source,
             codec,
+            &mut failed,
             control.bitrate.load(Ordering::Relaxed),
             fps,
             timeout,
@@ -341,7 +355,10 @@ fn run(source: &VideoSource, tx: &mpsc::Sender<Result<VideoEvent>>, control: &Co
             let stage = std::mem::replace(&mut active.stage, Stage::Memory(Picture::new(Layout::I420, 2, 2)));
             let rebuilt = rebuild(stage, source, codec, w, h, bitrate, fps)?;
             *active = rebuilt;
-            if !send(VideoEvent::Encoder { name: active.encoder.name().to_owned(), codec }) {
+            if active.encoder.codec() != codec {
+                failed.push(codec);
+            }
+            if !send(VideoEvent::Encoder { name: active.encoder.name().to_owned(), codec: active.encoder.codec() }) {
                 return Ok(());
             }
             force_keyframe = true;
@@ -421,20 +438,22 @@ fn rebuild(
 ) -> Result<Pipeline> {
     #[cfg(windows)]
     if let Stage::Gpu(converter) = &stage {
-        match mf::HardwareEncoder::new(codec, width, height, bitrate, fps, Some(converter.device())) {
+        match or_h264(codec, |codec| {
+            mf::HardwareEncoder::new(codec, width, height, bitrate, fps, Some(converter.device()))
+        }) {
             Ok(encoder) => return Ok(Pipeline { stage, encoder: Box::new(encoder) }),
             Err(error) => tracing::warn!("GPU {codec} encoder taking textures unavailable: {error:#}"),
         }
     }
-    let encoder = open_memory_encoder(source, codec, width, height, bitrate, fps)
-        .or_else(|_| open_software_encoder(Codec::H264, bitrate, fps))?;
+    let encoder = open_memory_encoder(source, codec, width, height, bitrate, fps)?;
     let InputKind::Picture(layout) = encoder.input() else { bail!("memory encoder wants textures") };
     Ok(Pipeline { stage: Stage::Memory(stage.into_memory(layout)?), encoder })
 }
 
 /// Waits up to `timeout` for a new screen image and stages it for the encoder, (re)building
-/// the pipeline when the size changes. `Some(true)` with a new picture staged, `Some(false)`
-/// without, `None` once the session has gone.
+/// the pipeline when the size changes; a `codec` that couldn't be opened goes in `failed`.
+/// `Some(true)` with a new picture staged, `Some(false)` without, `None` once the session has
+/// gone.
 #[expect(clippy::too_many_arguments)]
 fn capture(
     capturer: &mut dyn Capturer,
@@ -442,13 +461,17 @@ fn capture(
     gpu: &mut bool,
     source: &VideoSource,
     codec: Codec,
+    failed: &mut Vec<Codec>,
     bitrate: u32,
     fps: u32,
     timeout: Duration,
     send: &dyn Fn(VideoEvent) -> bool,
 ) -> Result<Option<bool>> {
     // Announces a new size and encoder; false if the session has gone.
-    let announce = |pipeline: &Pipeline| {
+    let mut announce = |pipeline: &Pipeline| {
+        if pipeline.encoder.codec() != codec {
+            failed.push(codec);
+        }
         let (width, height) = pipeline.stage.size();
         send(VideoEvent::Format { width, height })
             && send(VideoEvent::Encoder { name: pipeline.encoder.name().to_owned(), codec: pipeline.encoder.codec() })
@@ -513,9 +536,7 @@ fn capture(
     ensure!(w > 0 && h > 0, "captured an empty image");
     let current = pipeline.as_ref().filter(|p| matches!(p.stage, Stage::Memory(_))).map(|p| p.stage.size());
     if current != Some((w, h)) {
-        let encoder = open_memory_encoder(source, codec, w, h, bitrate, fps)
-            .or_else(|_| open_software_encoder(Codec::H264, bitrate, fps))
-            .context("starting video encoder")?;
+        let encoder = open_memory_encoder(source, codec, w, h, bitrate, fps).context("starting video encoder")?;
         let InputKind::Picture(layout) = encoder.input() else { bail!("memory encoder wants textures") };
         let built = Pipeline { stage: Stage::Memory(Picture::new(layout, w as usize, h as usize)), encoder };
         if !announce(&built) {

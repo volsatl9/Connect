@@ -8,7 +8,10 @@
 mod audio;
 mod capture;
 mod cursor;
+pub mod diagnostics;
 mod encode;
+#[cfg(windows)]
+mod gpu;
 mod input;
 mod rate;
 mod session;

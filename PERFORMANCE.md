@@ -5,14 +5,29 @@ what still limits high-refresh streaming.
 
 ## The pipeline
 
-Host: DXGI desktop duplication → copy to a CPU-readable staging texture → BGRA to YUV on the
-CPU (multi-threaded, straight from the mapped texture) → H.264 (Media Foundation hardware
-encoder, or OpenH264 on the CPU) → Reed-Solomon recovery packets → QUIC datagrams paced by BBR.
+Host: DXGI desktop duplication → a GPU copy → BGRA to NV12 in Direct3D 11's video processor →
+Media Foundation hardware encoder reading the texture → Reed-Solomon recovery packets → QUIC
+datagrams paced by BBR. Without that path (no video processor, no hardware encoder that reads
+textures, or a failure), it falls back to the 0.5.0 path: a CPU-readable staging texture → BGRA
+to YUV on the CPU (multi-threaded, straight from the mapped texture) → the hardware encoder from
+memory, or OpenH264.
 
 Viewer: datagrams → frames, rebuilt from recovery packets where needed and put back in order →
 H.264 decode on the GPU through Vulkan Video (OpenH264 on the CPU where that's unavailable) →
 Y, U and V planes uploaded to the GPU → colour conversion in a
 shader → screen.
+
+## Version 0.6.0: GPU-only capture to encoder, codec negotiation
+
+- **No more round trip through memory on the host.** Through 0.5.0 each frame was copied from
+  the GPU, mapped, converted to NV12 by the processor (on several threads),
+  then copied into a Media Foundation buffer for the GPU encoder to upload again. Now the
+  video processor converts on the GPU and the encoder reads the texture it wrote. The processor
+  stays out of the per-frame work entirely, and nothing waits on a GPU-to-CPU copy, which
+  stalled behind a busy game's rendering.
+- **Codecs are negotiated.** Each frame carries its codec, and the PCs choose by hardware on
+  both ends first, then efficiency. Only H.264 has implementations so far; see
+  [CODECS.md](CODECS.md).
 
 ## Version 0.5.0: GPU decoding and Opus audio
 
@@ -109,9 +124,8 @@ includes its assembly. On native Windows builds set `NASM` to `nasm.exe` (and ru
 
 ## Remaining limits
 
-- **GPU readback.** Capture still maps a staging texture on the CPU, which waits for the GPU to
-  finish the copy; under heavy GPU load this adds delay. Converting to NV12 on the GPU and
-  handing the encoder a GPU texture would remove the readback entirely.
+- **The GPU-only host path is untested on real hardware.** `connect gpu-check` measures it
+  against the memory path on the PC it runs on.
 - **Decoded pictures go through system memory.** Since 0.5.0 the GPU decodes, but each picture
   comes back to system memory as NV12 and is uploaded again for display. Rendering the decoder's
   image directly would save that round trip (about 5.5 MB a frame at 1440p).

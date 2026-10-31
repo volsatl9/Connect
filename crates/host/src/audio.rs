@@ -554,6 +554,7 @@ mod tests {
         let mut energy = [0.0f64; 2];
         let mut sine = [0.0f64; 2];
         let mut cosine = [0.0f64; 2];
+        let mut opus = opus::Decoder::new(48_000, opus::Channels::Stereo).unwrap();
         while frames < 12_000 {
             let bytes = tokio::time::timeout_at(deadline, capture.next())
                 .await
@@ -564,7 +565,16 @@ mod tests {
             let packet = audio::decode(&bytes).expect("captured datagram validates");
             assert_eq!((packet.sample_rate, packet.channels), (48_000, 2), "preferred stereo mix is active");
             assert_eq!(*stream_id.get_or_insert(packet.stream_id), packet.stream_id);
-            let packet_frames = (packet.samples.len() / 2) as u64;
+            let packet_frames = packet.frames() as u64;
+            // Opus's 2.5ms lookahead shifts the tone, which the amplitude measure below ignores.
+            let samples = match &packet.payload {
+                Payload::Pcm(samples) => samples.clone(),
+                Payload::Opus { frames, data } => {
+                    let mut out = vec![0.0; usize::from(*frames) * 2];
+                    opus.decode_float(data, &mut out, false).expect("captured Opus decodes");
+                    out
+                }
+            };
             if let Some((sequence, end)) = previous {
                 let advance = packet.sequence.wrapping_sub(sequence);
                 assert!(advance > 0 && advance <= i32::MAX as u32, "sequence advances");
@@ -574,7 +584,7 @@ mod tests {
                 missing_frames += gap;
             }
             previous = Some((packet.sequence, packet.first_frame + packet_frames));
-            for (offset, frame) in packet.samples.as_chunks::<2>().0.iter().enumerate() {
+            for (offset, frame) in samples.as_chunks::<2>().0.iter().enumerate() {
                 let phase = std::f64::consts::TAU * 997.0 * (packet.first_frame + offset as u64) as f64 / 48_000.0;
                 for channel in 0..2 {
                     let sample = f64::from(frame[channel]);

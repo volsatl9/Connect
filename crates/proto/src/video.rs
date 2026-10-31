@@ -1,7 +1,7 @@
 //! Encoded video frames split across QUIC datagrams, with forward error correction.
 //!
 //! Every datagram carries a fixed [`HEADER_LEN`]-byte header and one chunk of one encoded
-//! frame (an H.264 Annex-B access unit). A frame is cut into equal-sized data chunks, followed
+//! frame (an Annex-B access unit, in the codec named in its flags). A frame is cut into equal-sized data chunks, followed
 //! by a few Reed-Solomon recovery chunks: any `data_count` of the frame's chunks rebuild it, so
 //! a lost datagram or two costs nothing. Datagrams are never retransmitted; a frame missing more
 //! than its recovery chunks can rebuild is lost, and the [`FrameAssembler`] then withholds what
@@ -14,11 +14,16 @@ use std::{
 
 use anyhow::{Context, Result, bail, ensure};
 use bytes::{BufMut, Bytes, BytesMut};
+
+use crate::Codec;
 use reed_solomon_simd::{ReedSolomonDecoder, ReedSolomonEncoder};
 
 /// First byte of every video datagram.
 const KIND_VIDEO: u8 = 0x56;
 const FLAG_KEYFRAME: u8 = 1 << 0;
+/// Two bits naming the frame's codec ([`Codec::wire_bits`]).
+const CODEC_SHIFT: u8 = 1;
+const CODEC_MASK: u8 = 0b11 << CODEC_SHIFT;
 
 /// kind u8 | flags u8 | index u16 | data_count u16 | recovery_count u16 | frame_seq u32 |
 /// frame_len u32 | capture_time_us u64 | encode_time_us u32
@@ -41,6 +46,8 @@ pub struct FrameMeta {
     /// Increments by one per encoded frame.
     pub seq: u32,
     pub keyframe: bool,
+    /// What the frame is encoded with. It only changes at a keyframe.
+    pub codec: Codec,
     /// Host wall clock when the frame was captured.
     pub capture_time_us: u64,
     /// Time the host spent encoding this frame.
@@ -91,7 +98,7 @@ pub fn packetize(meta: FrameMeta, data: &[u8], max_datagram: usize, recovery: us
     let header = |index: usize, body: &[u8]| {
         let mut buf = BytesMut::with_capacity(HEADER_LEN + body.len());
         buf.put_u8(KIND_VIDEO);
-        buf.put_u8(if meta.keyframe { FLAG_KEYFRAME } else { 0 });
+        buf.put_u8(if meta.keyframe { FLAG_KEYFRAME } else { 0 } | meta.codec.wire_bits() << CODEC_SHIFT);
         buf.put_u16_le(index as u16);
         buf.put_u16_le(data_count as u16);
         buf.put_u16_le(recovery as u16);
@@ -145,9 +152,12 @@ fn parse(datagram: Bytes) -> Result<Chunk> {
     let u16_at = |i: usize| u16::from_le_bytes([datagram[i], datagram[i + 1]]) as usize;
     let u32_at = |i: usize| u32::from_le_bytes(datagram[i..i + 4].try_into().unwrap());
     let u64_at = |i: usize| u64::from_le_bytes(datagram[i..i + 8].try_into().unwrap());
+    ensure!(datagram[1] & !(FLAG_KEYFRAME | CODEC_MASK) == 0, "unknown video flags");
+    let codec = Codec::from_wire_bits((datagram[1] & CODEC_MASK) >> CODEC_SHIFT).context("unknown video codec")?;
     let chunk = Chunk {
         meta: FrameMeta {
             keyframe: datagram[1] & FLAG_KEYFRAME != 0,
+            codec,
             seq: u32_at(8),
             capture_time_us: u64_at(16),
             encode_time_us: u32_at(24),
@@ -434,7 +444,8 @@ mod tests {
     use super::*;
 
     fn frame(seq: u32, keyframe: bool, len: usize) -> (FrameMeta, Vec<u8>) {
-        let meta = FrameMeta { seq, keyframe, capture_time_us: 1_000 + seq as u64, encode_time_us: 7 };
+        let meta =
+            FrameMeta { seq, keyframe, codec: Codec::H264, capture_time_us: 1_000 + seq as u64, encode_time_us: 7 };
         (meta, (0..len).map(|i| (i * 7 + seq as usize) as u8).collect())
     }
 
@@ -638,5 +649,23 @@ mod tests {
         let mut bad = chunks(0, true, 3000, 1)[0].to_vec();
         bad.pop();
         assert!(asm.push(Bytes::from(bad)).is_err());
+    }
+
+    #[test]
+    fn codec_travels_in_the_flags() {
+        let meta = |codec| FrameMeta { seq: 0, keyframe: true, codec, capture_time_us: 5, encode_time_us: 1 };
+        for codec in Codec::BY_EFFICIENCY {
+            let mut asm = FrameAssembler::new();
+            for datagram in packetize(meta(codec), &[1, 2, 3, 4], 1200, 0).unwrap() {
+                asm.push(datagram).unwrap();
+            }
+            assert_eq!(asm.next_frame().unwrap().meta.codec, codec);
+        }
+        let good = packetize(meta(Codec::H264), &[1, 2, 3, 4], 1200, 0).unwrap().remove(0);
+        for flags in [FLAG_KEYFRAME | 3 << CODEC_SHIFT, FLAG_KEYFRAME | 1 << 4] {
+            let mut bad = good.to_vec();
+            bad[1] = flags;
+            assert!(FrameAssembler::new().push(bad.into()).is_err(), "flags {flags:#b}");
+        }
     }
 }

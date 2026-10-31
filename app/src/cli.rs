@@ -140,7 +140,7 @@ pub async fn join(key: SecretKey, args: &[String]) -> Result<()> {
                 Some(ClientEvent::PermissionsChanged(p)) => println!("Host changed permissions to {:#05b}.", p.bits()),
                 Some(ClientEvent::VideoFormat { width, height }) => println!("Host screen is now {width}×{height}."),
                 Some(ClientEvent::InputUnavailable { reason, .. }) => println!("{reason}"),
-                Some(ClientEvent::VideoEncoder { name }) => println!("Video encoder: {name}"),
+                Some(ClientEvent::VideoEncoder { name, codec }) => println!("Video: {codec} · {name}"),
                 Some(ClientEvent::AudioStatus { active, reason }) => {
                     if let Some(reason) = reason { println!("{reason}"); }
                     else { println!("Desktop audio: {}", if active { "on" } else { "off" }); }

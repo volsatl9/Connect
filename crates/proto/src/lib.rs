@@ -6,12 +6,14 @@
 //! - one uni-directional stream from the client carries [`input`] events (reliable).
 
 pub mod audio;
+pub mod codec;
 pub mod control;
 pub mod cursor;
 pub mod input;
 pub mod permissions;
 pub mod video;
 
+pub use codec::{Codec, CodecSupport};
 pub use cursor::{CursorPosition, CursorShape};
 pub use permissions::{DeviceClass, Permissions};
 
@@ -19,7 +21,7 @@ pub use permissions::{DeviceClass, Permissions};
 pub const ALPN: &[u8] = b"connect/remote/1";
 
 /// Protocol version exchanged in the handshake.
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// How long the host user has to answer a connection request before it counts as declined.
 pub const APPROVAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);

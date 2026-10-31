@@ -8,7 +8,8 @@ use std::{
 use anyhow::{Context, Result, bail};
 use connect_net as net;
 use connect_proto::{
-    CLOSE_NORMAL, CLOSE_PROTOCOL, CLOSE_REJECTED, CursorPosition, DeviceClass, PROTOCOL_VERSION, Permissions,
+    CLOSE_NORMAL, CLOSE_PROTOCOL, CLOSE_REJECTED, Codec, CodecSupport, CursorPosition, DeviceClass, PROTOCOL_VERSION,
+    Permissions, codec,
     control::{ClientMsg, HostMsg},
     video::{self, EncodedFrame},
 };
@@ -43,6 +44,7 @@ const NO_ANSWER: &str = "The host didn't answer in time.";
 const BUSY: &str = "The host is in another session right now.";
 const NOT_ACCEPTING: &str = "The host isn't accepting connections right now.";
 const NO_CAPTURE: &str = "The host couldn't capture its screen.";
+const NO_COMMON_CODEC: &str = "The two PCs have no video format in common. Update both to the same version of Connect.";
 const CANNOT_HOST: &str = "That PC can't be shared: hosting needs Windows. It can still connect to others.";
 
 pub(crate) async fn run(incoming: Incoming, shared: Arc<Shared>, events: mpsc::Sender<HostEvent>) {
@@ -74,6 +76,16 @@ async fn serve(conn: &Connection, shared: &Shared, events: &mpsc::Sender<HostEve
         );
         return reject(conn, &mut send, &reason).await;
     }
+    let decoders = match timeout(HELLO_TIMEOUT, net::read_msg(&mut recv)).await.context("no decoder list")?? {
+        Some(ClientMsg::Decoders(decoders)) => decoders,
+        other => bail!("expected the decoder list, got {other:?}"),
+    };
+    let source = shared.video.clone();
+    let encoders = tokio::task::spawn_blocking(move || crate::encode::supported(&source)).await?;
+    let Some(codec) = codec::choose(&encoders, &decoders, &[]) else {
+        return reject(conn, &mut send, NO_COMMON_CODEC).await;
+    };
+    info!(?encoders, ?decoders, %codec, "video codec chosen");
     if shared.video == VideoSource::Screen && !VideoSource::SCREEN_SUPPORTED {
         return reject(conn, &mut send, CANNOT_HOST).await;
     }
@@ -97,7 +109,8 @@ async fn serve(conn: &Connection, shared: &Shared, events: &mpsc::Sender<HostEve
 
     let bitrate_bps = shared.bitrate_mbps.load(Ordering::Relaxed).saturating_mul(1_000_000);
     let rate = RateControl::new(bitrate_bps);
-    let mut video = VideoStream::start(shared.video.clone(), rate.bitrate(), Box::new(rate.backlog_check(conn.clone())))?;
+    let mut video =
+        VideoStream::start(shared.video.clone(), codec, rate.bitrate(), Box::new(rate.backlog_check(conn.clone())))?;
     let (width, height) = match video.next().await {
         Some(Ok(VideoEvent::Format { width, height })) => (width, height),
         Some(Err(e)) => {
@@ -120,7 +133,8 @@ async fn serve(conn: &Connection, shared: &Shared, events: &mpsc::Sender<HostEve
         tokio::spawn(input::serve(conn.clone(), shared.permissions.subscribe(), shared.input.clone(), unavailable_tx));
 
     let desktop = shared.video == VideoSource::Screen;
-    let result = stream(conn, send, recv, video, rate, permissions, unavailable, desktop).await;
+    let codecs = Codecs { encoders, decoders, failed: Vec::new() };
+    let result = stream(conn, send, recv, video, codecs, rate, permissions, unavailable, desktop).await;
     let reason = end_reason(conn, &client_name, &result);
     info!(peer = %peer.fmt_short(), "session ended: {reason}");
     if conn.close_reason().is_none() {
@@ -175,6 +189,7 @@ async fn stream(
     mut send: SendStream,
     recv: RecvStream,
     mut video: VideoStream,
+    mut codecs: Codecs,
     mut rate: RateControl,
     mut permissions: watch::Receiver<Permissions>,
     mut unavailable: mpsc::UnboundedReceiver<Unavailable>,
@@ -219,7 +234,14 @@ async fn stream(
                     debug!("client asked for a keyframe");
                     video.request_keyframe();
                 }
-                Some(Ok(ClientMsg::Hello { .. })) => bail!("unexpected second hello"),
+                Some(Ok(ClientMsg::DecoderFailed { codec })) => {
+                    codecs.failed.push(codec);
+                    let next = codec::choose(&codecs.encoders, &codecs.decoders, &codecs.failed)
+                        .context("the viewer can't decode any codec this host can send")?;
+                    warn!(%codec, %next, "the viewer couldn't decode the video; switching codec");
+                    video.set_codec(next);
+                }
+                Some(Ok(ClientMsg::Hello { .. } | ClientMsg::Decoders(_))) => bail!("unexpected second hello"),
                 Some(Err(e)) => return Err(e),
                 None => return Ok(()), // the client finished its control stream: a clean hang-up
             },
@@ -307,8 +329,8 @@ async fn stream(
             }
             event = video.next() => match event {
                 Some(Ok(VideoEvent::Frame(frame))) => send_frame(conn, &frame, rate.loss())?,
-                Some(Ok(VideoEvent::Encoder { name })) => {
-                    net::write_msg(&mut send, &HostMsg::VideoEncoder { name }).await?;
+                Some(Ok(VideoEvent::Encoder { name, codec })) => {
+                    net::write_msg(&mut send, &HostMsg::VideoEncoder { name, codec }).await?;
                 }
                 Some(Ok(VideoEvent::Format { width, height })) => {
                     net::write_msg(&mut send, &HostMsg::VideoFormat { width, height }).await?;
@@ -319,6 +341,14 @@ async fn stream(
             _ = conn.closed() => return Ok(()),
         }
     }
+}
+
+/// What each end can do with video, for switching codec when one fails.
+struct Codecs {
+    encoders: Vec<CodecSupport>,
+    decoders: Vec<CodecSupport>,
+    /// Codecs the viewer reported it couldn't decode after all.
+    failed: Vec<Codec>,
 }
 
 async fn start_audio(conn: &Connection, send: &mut SendStream, enabled: bool) -> Result<Option<AudioStream>> {

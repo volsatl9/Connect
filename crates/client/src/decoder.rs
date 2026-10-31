@@ -2,8 +2,8 @@
 //! decode, for the host to choose from.
 //!
 //! H.264 decodes on the graphics card through Vulkan Video where the driver offers it, and
-//! always on the processor with OpenH264. Codecs without a software decoder (H.265 and AV1, from
-//! 0.7.0 on) are only offered where the graphics card decodes them.
+//! always on the processor with OpenH264. H.265 decodes only on the graphics card, so it's only
+//! offered where the card decodes it.
 
 use std::sync::{OnceLock, atomic::Ordering};
 
@@ -12,7 +12,7 @@ use connect_proto::{Codec, CodecSupport};
 use openh264::formats::YUVSource;
 use tracing::info;
 
-use crate::gpu_decode::GpuDecoder;
+use crate::gpu_decode::{Decoded, GpuDecoder};
 
 /// Turns one codec's frames into pictures.
 pub(crate) trait VideoDecoder {
@@ -24,9 +24,10 @@ pub(crate) trait VideoDecoder {
     /// What is decoding, for people to read: "Decoder: GPU · <card>", "Decoder: CPU (OpenH264)".
     fn label(&self) -> String;
 
-    /// Decodes one whole frame, writing the picture to `yuv` as tightly packed I420 if given
-    /// one. Returns the picture's size, or `None` if this frame finished no picture.
-    fn decode(&mut self, data: &[u8], yuv: Option<&mut Vec<u8>>) -> Result<Option<(usize, usize)>>;
+    /// Decodes one whole frame. A picture in memory goes to `yuv` as tightly packed I420 if
+    /// given one; a hardware decoder sharing the window's graphics card hands out a texture
+    /// instead. `None` if this frame finished no picture.
+    fn decode(&mut self, data: &[u8], yuv: Option<&mut Vec<u8>>) -> Result<Option<Decoded>>;
 }
 
 /// Opens a decoder for `codec`: on the graphics card if `hardware` and it can, otherwise on the
@@ -34,11 +35,11 @@ pub(crate) trait VideoDecoder {
 pub(crate) fn open(codec: Codec, hardware: bool) -> Result<Box<dyn VideoDecoder>> {
     if hardware {
         match codec {
-            Codec::H264 => match GpuDecoder::new() {
+            Codec::H264 | Codec::H265 => match GpuDecoder::new(codec) {
                 Ok(gpu) => return Ok(Box::new(gpu)),
-                Err(e) => info!("hardware {codec} decoding unavailable, using the processor: {e:#}"),
+                Err(e) => info!("hardware {codec} decoding unavailable: {e:#}"),
             },
-            Codec::H265 | Codec::Av1 => {}
+            Codec::Av1 => {}
         }
     }
     software(codec)
@@ -59,6 +60,9 @@ pub fn supported() -> Vec<CodecSupport> {
     if crate::HARDWARE_DECODING.load(Ordering::Relaxed) {
         let gpus = probe();
         // Only codecs Connect can drive on the graphics card; the card may list more.
+        if crate::ALLOW_H265.load(Ordering::Relaxed) && gpus.iter().any(|gpu| gpu.h265) {
+            list.push(CodecSupport::hardware(Codec::H265));
+        }
         if gpus.iter().any(|gpu| gpu.h264) {
             list.push(CodecSupport::hardware(Codec::H264));
         }
@@ -126,7 +130,7 @@ impl VideoDecoder for OpenH264 {
         "Decoder: CPU (OpenH264)".into()
     }
 
-    fn decode(&mut self, data: &[u8], yuv: Option<&mut Vec<u8>>) -> Result<Option<(usize, usize)>> {
+    fn decode(&mut self, data: &[u8], yuv: Option<&mut Vec<u8>>) -> Result<Option<Decoded>> {
         let Some(picture) = self.0.decode(data)? else { return Ok(None) };
         let (w, h) = picture.dimensions();
         if let Some(buf) = yuv {
@@ -143,13 +147,13 @@ impl VideoDecoder for OpenH264 {
                 }
             }
         }
-        Ok(Some((w, h)))
+        Ok(Some(Decoded { width: w, height: h, texture: None }))
     }
 }
 
 impl VideoDecoder for GpuDecoder {
     fn codec(&self) -> Codec {
-        Codec::H264
+        GpuDecoder::codec(self)
     }
 
     fn hardware(&self) -> bool {
@@ -157,10 +161,11 @@ impl VideoDecoder for GpuDecoder {
     }
 
     fn label(&self) -> String {
-        format!("Decoder: GPU · {}", self.name)
+        let place = if self.textures() { "drawn on the GPU" } else { "copied to memory" };
+        format!("Decoder: GPU · {} ({place})", self.name)
     }
 
-    fn decode(&mut self, data: &[u8], yuv: Option<&mut Vec<u8>>) -> Result<Option<(usize, usize)>> {
+    fn decode(&mut self, data: &[u8], yuv: Option<&mut Vec<u8>>) -> Result<Option<Decoded>> {
         GpuDecoder::decode(self, data, yuv)
     }
 }

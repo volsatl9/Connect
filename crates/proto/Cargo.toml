@@ -10,3 +10,4 @@ bytes.workspace = true
 postcard.workspace = true
 reed-solomon-simd = "3"
 serde.workspace = true
+connect-gpu-load.workspace = true

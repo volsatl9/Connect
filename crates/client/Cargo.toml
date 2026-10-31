@@ -9,9 +9,11 @@ anyhow.workspace = true
 cpal.workspace = true
 connect-net.workspace = true
 connect-proto.workspace = true
+connect-gpu-load.workspace = true
 iroh.workspace = true
 openh264.workspace = true
 opus.workspace = true
-gpu-video.workspace = true
+gpu-video = { workspace = true, features = ["wgpu"] }
+wgpu.workspace = true
 tokio.workspace = true
 tracing.workspace = true

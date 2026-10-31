@@ -17,6 +17,21 @@ H.264 decode on the GPU through Vulkan Video (OpenH264 on the CPU where that's u
 Y, U and V planes uploaded to the GPU → colour conversion in a
 shader → screen.
 
+## Version 0.7.0: frames straight to the screen, latency breakdown, pacing
+
+- **Hardware-decoded frames go straight to the screen.** When a graphics card decodes H.264
+  through Vulkan, the window now renders on the decoder's own device and draws the decoded NV12
+  texture. Before, each picture was copied back to memory (about 5.5 MB a frame at 1440p),
+  converted to I420 by the processor, and uploaded again.
+- **Every frame carries its host timings**: from the image reaching the host's screen (DXGI's
+  present time) to capture, the capture itself, encoding, and waiting to send. The viewer adds
+  network, reassembly, decode and draw, so the stats show where the latency goes.
+- **Smooth frame pacing** (Settings → Viewing) shows frames a steady delay after capture,
+  the 90th percentile of recent transit times plus 1 ms, so uneven network and decode times
+  don't show as uneven motion. Lowest latency stays the default.
+- **The hardware encoder's waits spin for the first 3 ms** instead of sleeping: a sleep can
+  overshoot by half a millisecond on Windows, about as long as a whole 1080p encode.
+
 ## Version 0.6.0: GPU-only capture to encoder, codec negotiation
 
 - **No more round trip through memory on the host.** Through 0.5.0 each frame was copied from
@@ -91,7 +106,19 @@ start there. It is now loaded when first needed, and hosting falls back to OpenH
 - **fps**: frames decoded per second on the viewer.
 - **Mb/s (target)**: received video rate; the host's current bitrate target follows the
   connection and stays at or below the Settings cap.
-- **latency**: host capture to decoded here, through an estimated clock offset.
+- **Latency to this window**: from the image appearing on the host's screen to it being drawn
+  here, on average, and the slowest frame of the last second, through an estimated clock
+  offset. The time until the display shows it (at most one refresh) comes on top. By stage:
+  - *host screen→capture*: Windows showing the image to capture picking it up
+  - *capture*: copying it and converting its colours
+  - *encode*
+  - *send wait*: waiting for the network and packetizing
+  - *network*
+  - *reassembly*: the rest of the frame's packets, rebuilding lost ones, the decoder's queue
+  - *decode*
+  - *draw*: decoded to drawn into the window
+- **GPU load**: the busiest engine of each kind (graphics, video encoder, video decoder) on
+  each PC, where Windows reports it (any vendor), or AMD's driver on Linux.
 - **frames lost / repaired / skipped**: lost is frames that couldn't be rebuilt (each costs a
   short freeze); repaired is frames rebuilt from recovery packets; skipped is frames decoded
   but replaced by a newer one before the screen showed them.

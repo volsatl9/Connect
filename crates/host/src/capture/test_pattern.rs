@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
-use super::{Capturer, Frame};
+use super::{CaptureTiming, Capturer, Frame};
 
 /// BGRA colour bars.
 const BARS: [[u8; 4]; 8] = [
@@ -24,6 +24,7 @@ pub(crate) struct TestPattern {
     next_at: Instant,
     frame: u64,
     buf: Vec<u8>,
+    acquired: Instant,
 }
 
 impl TestPattern {
@@ -35,6 +36,7 @@ impl TestPattern {
             next_at: Instant::now(),
             frame: 0,
             buf: vec![0; width.max(16) as usize * height.max(16) as usize * 4],
+            acquired: Instant::now(),
         }
     }
 
@@ -66,6 +68,10 @@ impl TestPattern {
 }
 
 impl Capturer for TestPattern {
+    fn timing(&self) -> CaptureTiming {
+        CaptureTiming { acquired: self.acquired, present_to_capture: None }
+    }
+
     fn refresh_hz(&self) -> Option<u32> {
         Some((Duration::from_secs(1).as_secs_f64() / self.interval.as_secs_f64()).round() as u32)
     }
@@ -83,6 +89,7 @@ impl Capturer for TestPattern {
         // Don't try to catch up after a stall; just carry on from now.
         self.next_at = (self.next_at + self.interval).max(Instant::now());
 
+        self.acquired = Instant::now();
         self.draw();
         self.frame += 1;
         Ok(Some(Frame { width: self.width, height: self.height, stride: self.width as usize * 4, bgra: &self.buf }))

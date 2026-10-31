@@ -393,6 +393,12 @@ impl VulkanDevice {
             transfer: transfer_queue,
             compute: compute_queue,
             h264_decode: VideoQueues::new(h264_decode_queues.into_boxed_slice()).map(Arc::new),
+            decode_h265: queue_indices.h264_decode.as_ref().is_some_and(|queue| {
+                queue
+                    .video_properties
+                    .video_codec_operations
+                    .contains(vk::VideoCodecOperationFlagsKHR::DECODE_H265)
+            }),
             encode: VideoQueues::new(h264_encode_queues.into_boxed_slice()).map(Arc::new),
             wgpu: wgpu_queue,
         };
@@ -451,6 +457,55 @@ impl VulkanDevice {
                 .cloned()
                 .ok_or(VulkanDecoderError::VulkanDecoderUnsupported)?,
         })
+    }
+
+    /// A decoding device for H.265 (Connect addition): the decode queues, if they also take
+    /// H.265, with the card's Main profile capabilities standing in for H.264's, as the shared
+    /// session, image and buffer code only reads their formats and limits.
+    pub(crate) fn decoding_device_h265(
+        self: &Arc<Self>,
+    ) -> Result<(DecodingDevice, NativeDecodeProfileCapabilities<crate::codec::h265::H265Codec>), VulkanDecoderError>
+    {
+        let caps = self
+            .native_decode_capabilities
+            .as_ref()
+            .and_then(|caps| caps.h265.as_ref())
+            .and_then(|caps| caps.main.clone())
+            .ok_or(VulkanDecoderError::VulkanDecoderUnsupported)?;
+        if !self.queues.decode_h265 {
+            return Err(VulkanDecoderError::VulkanDecoderUnsupported);
+        }
+        let device = DecodingDevice {
+            vulkan_device: self.clone(),
+            h264_decode_queues: self.queues.h264_decode.clone().ok_or(VulkanDecoderError::VulkanDecoderUnsupported)?,
+            profile_capabilities: NativeDecodeProfileCapabilities {
+                video_capabilities: caps.video_capabilities,
+                decode_capabilities: caps.decode_capabilities,
+                codec_decode_capabilities: Default::default(),
+                dpb_format_properties: caps.dpb_format_properties,
+                dst_format_properties: caps.dst_format_properties,
+            },
+        };
+        Ok((device, caps))
+    }
+
+    /// An H.265 decoder handing out pictures in memory (Connect addition).
+    pub fn create_bytes_decoder_h265(
+        self: &Arc<Self>,
+        parameters: DecoderParameters,
+    ) -> Result<crate::BytesDecoderH265, DecoderError> {
+        let (device, caps) = self.decoding_device_h265()?;
+        let vulkan_decoder = VulkanDecoder::new_h265(
+            Arc::new(device),
+            caps,
+            parameters.usage_flags,
+            ImageModifiers {
+                additional_queue_index: self.queues.transfer.family_index,
+                create_flags: Default::default(),
+                usage_flags: Default::default(),
+            },
+        )?;
+        Ok(crate::BytesDecoderH265 { vulkan_decoder, parser: Default::default(), frame_sorter: FrameSorter::new() })
     }
 
     pub fn create_bytes_decoder_h264(

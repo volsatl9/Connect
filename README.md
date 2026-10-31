@@ -2,8 +2,8 @@
 
 Version 0.7.0 draws hardware-decoded video straight from the graphics card, shows where every
 millisecond of latency goes and how busy each graphics card is (Ctrl+Alt+S), and adds a
-**Smooth** frame pacing option. Windows hosts can encode H.265 in hardware, which is used once
-viewers can decode it. Since 0.6.0 the host keeps the screen on its graphics card from capture to
+**Smooth** frame pacing option. Video uses H.265 in hardware when both PCs' graphics cards handle
+it (sharper at the same bandwidth), and H.264 otherwise. Since 0.6.0 the host keeps the screen on its graphics card from capture to
 encoder, and the two PCs agree on a codec from what each one's hardware can do. Its protocol is
 7, so both PCs need 0.7.0; older peers receive a version mismatch message. See [CODECS.md](CODECS.md) for how codecs are chosen and the plans for
 H.265 and AV1. See [performance notes](PERFORMANCE.md) for measurements
@@ -19,8 +19,8 @@ each permission on or off at any time.
 
 | | |
 |---|---|
-| Works | Generate Account, connect by User-ID across networks, Allow / Deny with per-device permissions, "Always allow" list, desktop audio (Opus) with viewer mute, automatic hardware H.264 encoding and decoding with CPU fallback, a GPU-only capture → encode path on the host, codec negotiation, host cursor in the viewer, a distinct viewer pointer on the host, remote mouse (normal or captured for games), keyboard by scancode, up to 4 gamepads as virtual Xbox controllers |
-| Not yet | Monitor selection, microphone sharing, H.265 and AV1 (planned, see [CODECS.md](CODECS.md)) |
+| Works | Generate Account, connect by User-ID across networks, Allow / Deny with per-device permissions, "Always allow" list, desktop audio (Opus) with viewer mute, automatic hardware H.264 and H.265 encoding and decoding with CPU fallback, a GPU-only capture → encode path on the host, codec negotiation, host cursor in the viewer, a distinct viewer pointer on the host, remote mouse (normal or captured for games), keyboard by scancode, up to 4 gamepads as virtual Xbox controllers |
+| Not yet | Monitor selection, microphone sharing, AV1 (planned, see [CODECS.md](CODECS.md)) |
 | Platforms | Windows can host and connect. Linux can connect only |
 
 ## Download

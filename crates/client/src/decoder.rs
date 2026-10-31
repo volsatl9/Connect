@@ -2,8 +2,8 @@
 //! decode, for the host to choose from.
 //!
 //! H.264 decodes on the graphics card through Vulkan Video where the driver offers it, and
-//! always on the processor with OpenH264. Codecs without a software decoder (H.265 and AV1, from
-//! 0.7.0 on) are only offered where the graphics card decodes them.
+//! always on the processor with OpenH264. H.265 decodes only on the graphics card, so it's only
+//! offered where the card decodes it.
 
 use std::sync::{OnceLock, atomic::Ordering};
 
@@ -35,11 +35,11 @@ pub(crate) trait VideoDecoder {
 pub(crate) fn open(codec: Codec, hardware: bool) -> Result<Box<dyn VideoDecoder>> {
     if hardware {
         match codec {
-            Codec::H264 => match GpuDecoder::new() {
+            Codec::H264 | Codec::H265 => match GpuDecoder::new(codec) {
                 Ok(gpu) => return Ok(Box::new(gpu)),
-                Err(e) => info!("hardware {codec} decoding unavailable, using the processor: {e:#}"),
+                Err(e) => info!("hardware {codec} decoding unavailable: {e:#}"),
             },
-            Codec::H265 | Codec::Av1 => {}
+            Codec::Av1 => {}
         }
     }
     software(codec)
@@ -60,6 +60,9 @@ pub fn supported() -> Vec<CodecSupport> {
     if crate::HARDWARE_DECODING.load(Ordering::Relaxed) {
         let gpus = probe();
         // Only codecs Connect can drive on the graphics card; the card may list more.
+        if crate::ALLOW_H265.load(Ordering::Relaxed) && gpus.iter().any(|gpu| gpu.h265) {
+            list.push(CodecSupport::hardware(Codec::H265));
+        }
         if gpus.iter().any(|gpu| gpu.h264) {
             list.push(CodecSupport::hardware(Codec::H264));
         }
@@ -150,7 +153,7 @@ impl VideoDecoder for OpenH264 {
 
 impl VideoDecoder for GpuDecoder {
     fn codec(&self) -> Codec {
-        Codec::H264
+        GpuDecoder::codec(self)
     }
 
     fn hardware(&self) -> bool {

@@ -66,6 +66,8 @@ pub(crate) struct Queues {
     #[cfg_attr(not(feature = "transcoder"), allow(dead_code))]
     pub(crate) compute: Queue,
     pub(crate) h264_decode: Option<Arc<VideoQueues>>,
+    /// Whether the decode queues above also decode H.265 (Connect addition).
+    pub(crate) decode_h265: bool,
     pub(crate) encode: Option<Arc<VideoQueues>>,
     pub(crate) wgpu: Queue,
 }

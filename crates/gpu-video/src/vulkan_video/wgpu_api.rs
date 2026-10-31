@@ -14,6 +14,33 @@ use crate::{
     vulkan_encoder::VulkanEncoder,
 };
 
+/// An H.265 decoder that outputs NV12 [`wgpu::Texture`]s (Connect addition).
+pub struct WgpuTexturesDecoderH265 {
+    pub(crate) vulkan_decoder: VulkanDecoder<'static>,
+    pub(crate) parser: crate::parser::h265::H265Parser,
+    pub(crate) frame_sorter: FrameSorter<wgpu::Texture>,
+}
+
+impl WgpuTexturesDecoderH265 {
+    pub fn decode(&mut self, frame: EncodedInputChunk<'_>) -> Result<Vec<OutputFrame<wgpu::Texture>>, DecoderError> {
+        let instructions = self.parser.parse(frame.data, frame.pts)?;
+        let frames = self.vulkan_decoder.decode_h265_to_wgpu_textures(&instructions)?;
+        Ok(self.frame_sorter.put_frames(frames))
+    }
+
+    pub fn flush(&mut self) -> Result<Vec<OutputFrame<wgpu::Texture>>, DecoderError> {
+        let instructions = self.parser.flush()?;
+        let frames = self.vulkan_decoder.decode_h265_to_wgpu_textures(&instructions)?;
+        let mut out = self.frame_sorter.put_frames(frames);
+        out.append(&mut self.frame_sorter.flush());
+        Ok(out)
+    }
+
+    pub fn signal_data_loss(&mut self) {
+        self.parser.mark_missed();
+    }
+}
+
 /// A decoder that outputs frames stored as [`wgpu::Texture`]s
 pub struct WgpuTexturesDecoder {
     pub(crate) vulkan_decoder: VulkanDecoder<'static>,

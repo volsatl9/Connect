@@ -618,6 +618,21 @@ pub fn settings(app: &mut App, ui: &mut Ui) {
              off if the picture shows glitches. Applies from the next connection.",
         ));
         ui.add_space(8.0);
+        ui.label(RichText::new("Video format").font(theme::medium(14.0)));
+        ui.label(theme::caption(
+            "Automatic uses H.265 when both PCs' graphics cards handle it: sharper at the same bandwidth. Choose \
+             H.264 only if the picture shows glitches. Applies from the next connection.",
+        ));
+        ui.add_space(4.0);
+        ui.horizontal_wrapped(|ui| {
+            for (allow, label) in [(true, "Automatic"), (false, "H.264 only")] {
+                if theme::chip(ui, None, label, app.settings.allow_h265 == allow).clicked() {
+                    app.settings.allow_h265 = allow;
+                    connect_client::set_allow_h265(allow);
+                }
+            }
+        });
+        ui.add_space(8.0);
         ui.label(RichText::new("Frame pacing").font(theme::medium(14.0)));
         ui.label(theme::caption(
             "Lowest latency shows each frame the moment it arrives. Smooth evens out motion when frames arrive \

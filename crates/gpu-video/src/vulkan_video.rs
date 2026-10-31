@@ -132,6 +132,15 @@ pub enum DecoderError {
 
     #[error("Reference management error: {0}")]
     ReferenceManagementError(#[from] ReferenceManagementError),
+
+    #[error("H.265: {0}")]
+    H265(String),
+}
+
+impl From<crate::parser::h265::H265ParseError> for DecoderError {
+    fn from(error: crate::parser::h265::H265ParseError) -> Self {
+        Self::H265(error.to_string())
+    }
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -269,6 +278,36 @@ pub struct RawFrameData {
     pub frame: Vec<u8>,
     pub width: u32,
     pub height: u32,
+}
+
+/// An H.265 decoder that outputs NV12 frames as [`Vec<u8>`] (Connect addition).
+pub struct BytesDecoderH265 {
+    pub(crate) vulkan_decoder: VulkanDecoder<'static>,
+    pub(crate) parser: crate::parser::h265::H265Parser,
+    pub(crate) frame_sorter: FrameSorter<RawFrameData>,
+}
+
+impl BytesDecoderH265 {
+    /// Decodes Annex B data; whole pictures come out once their data is known to be complete.
+    pub fn decode(&mut self, frame: EncodedInputChunk<'_>) -> Result<Vec<OutputFrame<RawFrameData>>, DecoderError> {
+        let instructions = self.parser.parse(frame.data, frame.pts)?;
+        let frames = self.vulkan_decoder.decode_h265_to_bytes(&instructions)?;
+        Ok(self.frame_sorter.put_frames(frames))
+    }
+
+    /// Treats the data so far as complete and hands out every picture waiting.
+    pub fn flush(&mut self) -> Result<Vec<OutputFrame<RawFrameData>>, DecoderError> {
+        let instructions = self.parser.flush()?;
+        let frames = self.vulkan_decoder.decode_h265_to_bytes(&instructions)?;
+        let mut out = self.frame_sorter.put_frames(frames);
+        out.append(&mut self.frame_sorter.flush());
+        Ok(out)
+    }
+
+    /// Data went missing: nothing decodes until the next random access point.
+    pub fn signal_data_loss(&mut self) {
+        self.parser.mark_missed();
+    }
 }
 
 /// A decoder that outputs frames stored as [`Vec<u8>`] with the raw pixel data.

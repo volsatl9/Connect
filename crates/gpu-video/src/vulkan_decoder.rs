@@ -18,6 +18,7 @@ use crate::{
 use crate::{VulkanCommonError, wrappers::*};
 
 mod frame_sorter;
+mod h265;
 mod session_resources;
 
 pub(crate) use frame_sorter::FrameSorter;
@@ -29,6 +30,8 @@ pub struct VulkanDecoder<'a> {
     decoding_device: Arc<DecodingDevice>,
     usage_info: vk::VideoDecodeUsageInfoKHR<'a>,
     image_modifiers: ImageModifiers,
+    /// Set for an H.265 decoder (Connect addition).
+    h265: Option<Box<h265::H265State<'a>>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -205,6 +208,7 @@ impl VulkanDecoder<'_> {
             reference_id_to_dpb_slot_index: Default::default(),
             usage_info,
             image_modifiers,
+            h265: None,
         })
     }
 }

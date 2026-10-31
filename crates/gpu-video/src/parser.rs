@@ -1,4 +1,6 @@
 mod au_splitter;
+#[cfg(vulkan)]
+pub(crate) mod h265;
 mod nalu_parser;
 mod nalu_splitter;
 

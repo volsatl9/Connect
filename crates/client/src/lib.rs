@@ -53,6 +53,15 @@ pub fn set_hardware_decoding(enabled: bool) {
     HARDWARE_DECODING.store(enabled, Ordering::Relaxed);
 }
 
+/// Whether H.265 may be offered to hosts; see [`set_allow_h265`].
+static ALLOW_H265: AtomicBool = AtomicBool::new(true);
+
+/// Offers H.265 to hosts where the graphics card decodes it (the default), or (`false`) keeps
+/// sessions on H.264. Applies from the next connection.
+pub fn set_allow_h265(allow: bool) {
+    ALLOW_H265.store(allow, Ordering::Relaxed);
+}
+
 /// Whether frames are shown evenly paced rather than as soon as they're decoded; see
 /// [`set_smooth_pacing`].
 static SMOOTH_PACING: AtomicBool = AtomicBool::new(false);

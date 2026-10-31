@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::{
     DecoderError, VulkanAdapter, VulkanDevice, VulkanEncoderError, VulkanInstance, WgpuInitError,
-    WgpuTexturesDecoder, WgpuTexturesEncoderH264, WgpuTexturesEncoderH265,
+    WgpuTexturesDecoder, WgpuTexturesDecoderH265, WgpuTexturesEncoderH264, WgpuTexturesEncoderH265,
     device::{
         DecoderParameters, EncoderParametersH264, EncoderParametersH265, VulkanDeviceDescriptor,
     },
@@ -36,6 +36,29 @@ impl VulkanDevice {
             reference_ctx,
             vulkan_decoder,
             frame_sorter,
+        })
+    }
+
+    /// An H.265 decoder handing out textures (Connect addition).
+    pub fn create_wgpu_textures_decoder_h265(
+        self: &Arc<Self>,
+        parameters: DecoderParameters,
+    ) -> Result<WgpuTexturesDecoderH265, DecoderError> {
+        let (device, caps) = self.decoding_device_h265()?;
+        let vulkan_decoder = VulkanDecoder::new_h265(
+            Arc::new(device),
+            caps,
+            parameters.usage_flags,
+            ImageModifiers {
+                additional_queue_index: self.queues.transfer.family_index,
+                create_flags: Default::default(),
+                usage_flags: Default::default(),
+            },
+        )?;
+        Ok(WgpuTexturesDecoderH265 {
+            vulkan_decoder,
+            parser: Default::default(),
+            frame_sorter: FrameSorter::new(),
         })
     }
 

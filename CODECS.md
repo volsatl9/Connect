@@ -63,31 +63,43 @@ What makes this work:
   - `connect gpu-check` runs the path for 3 seconds and compares the GPU conversion with the
     CPU one.
 
-## H.265 (0.7.0)
+## H.265 (built in 0.7.0)
 
-**Status:** encoding is built (0.7.0); decoding isn't yet. Hosts list hardware H.265
-encoders, but no viewer offers H.265, so sessions stay on H.264.
+When both PCs' graphics cards handle H.265, sessions use it; otherwise H.264. Settings →
+Viewing → **Video format: H.264 only** keeps a viewer on H.264.
 
 **Encoding (Windows):**
-- **Encoder MFTs:** NVIDIA, AMD and Intel all register hardware HEVC encoder MFTs.
-  `mf::encoder_names` and `gpu-check` already list them. `HardwareEncoder` needs the
-  `MFVideoFormat_HEVC` subtype, Main profile (`eAVEncH265VProfile_Main_420_8`), low-latency and
-  no-B-frame settings, as for H.264.
-- **Bitstream handling:** an HEVC version of `H264Bitstream` must recover VPS/SPS/PPS (NAL types
-  32–34) and put them in front of each IDR (types 19/20).
+- **Encoders:** `mf::HardwareEncoder` takes a codec. For H.265 it uses the hardware HEVC encoder
+  MFTs (NVIDIA, AMD, Intel) in Main profile. It requires the encoder to accept "no B frames",
+  since unlike H.264 Baseline, Main allows them.
+- **Keyframes:** `encode::hevc::HevcBitstream` puts the VPS, SPS and PPS (from Annex B or an
+  `hvcC` record) in front of every keyframe, so a viewer can start at any of them.
 
-**Decoding:**
-- **Vulkan Video is the only practical route.** `gpu-video` 0.4 decodes only H.264; it reports
-  H.265 support but has no H.265 parser or decoder.
-- **Plan:** fork it (MIT) and add H.265 decoding: VPS/SPS/PPS and slice-header parsing,
-  reference picture sets, and `VkVideoDecodeH265PictureInfoKHR`. This is the biggest single job
-  in 0.7.0.
+**Decoding (Vulkan Video, NVIDIA, AMD and Intel, Windows and Linux):**
+- **Parsing** (`crates/gpu-video/src/parser/h265`):
+  - VPS, SPS (with VUI and HRD read past), PPS
+  - short-term reference picture sets, including inter-RPS prediction (7-61/7-62)
+  - long-term references
+  - slice segment headers up to the RPS, measuring `NumBitsForSTRefPicSetInSlice`
+  - picture order counts (8.3.1), including MSB wrap and CRA/BLA/RASL handling
+  - RPS derivation and marking (8.3.2)
+- **Tests:** the parser is checked against x265 streams (`crates/gpu-video/tests/h265`): every
+  picture's POC and RPS bit count equal ffmpeg's `trace_headers` output, across a POC wrap,
+  B-frame reordering, open GOPs and multi-slice pictures.
+- **Vulkan side** (`crates/gpu-video/src/vulkan_decoder/h265.rs`):
+  - an H.265 session sized from the SPS, rebuilt only at random access points
+  - parameter sets as `StdVideoH265*` structures
+  - the H.264 path's images, buffers, queries, synchronisation and output (memory or wgpu
+    textures), so H.265 frames are drawn straight from the GPU too
+- **`connect gpu-check`** decodes two of those streams on the GPU and compares every frame's
+  luma with ffmpeg's decode, bit for bit.
+- **Not supported:** custom scaling lists, range extensions (10-bit, 4:4:4) and more than one
+  layer are refused with a clear error. The viewer then reports the codec failed and the host
+  switches to H.264. Hardware encoders don't use these in low-latency mode.
+- **No software H.265 decoder.** A viewer only offers H.265 where its graphics card decodes it.
 - **Rejected alternatives:**
-  - Media Foundation's HEVC decoder on Windows needs the paid "HEVC Video Extensions" from the
-    Store.
+  - Media Foundation's HEVC decoder on Windows needs the paid "HEVC Video Extensions".
   - FFmpeg, and libde265 for software decoding, would bring LGPL code and system libraries.
-- **No software H.265 decoder.** A viewer only offers H.265 where its graphics card decodes it,
-  and negotiation keeps H.264 as the fallback.
 
 ## AV1 (after 0.7.0)
 

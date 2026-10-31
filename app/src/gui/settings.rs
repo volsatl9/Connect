@@ -32,6 +32,8 @@ pub struct Settings {
     pub hardware_decoding: bool,
     /// Show frames evenly paced rather than as soon as they arrive.
     pub smooth_pacing: bool,
+    /// Let hosts send H.265 where this PC's graphics card decodes it.
+    pub allow_h265: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -66,6 +68,7 @@ impl Default for Settings {
             sidebar_collapsed: false,
             hardware_decoding: true,
             smooth_pacing: false,
+            allow_h265: true,
         }
     }
 }

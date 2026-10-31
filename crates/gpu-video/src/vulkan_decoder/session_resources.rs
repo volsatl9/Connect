@@ -20,7 +20,7 @@ use crate::{
     wrappers::{DecodeInputBufferPool, DecodingQueryPool, OpenCommandBuffer, VideoSession},
 };
 
-mod images;
+pub(super) mod images;
 mod parameters;
 
 pub(super) struct VideoSessionResources<'a> {

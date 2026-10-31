@@ -28,6 +28,8 @@ pub struct Settings {
     #[serde(alias = "recent")]
     pub computers: Vec<KnownDevice>,
     pub sidebar_collapsed: bool,
+    /// Decode video on the graphics card where it can, rather than the processor.
+    pub hardware_decoding: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -60,6 +62,7 @@ impl Default for Settings {
             trusted: Vec::new(),
             computers: Vec::new(),
             sidebar_collapsed: false,
+            hardware_decoding: true,
         }
     }
 }
@@ -115,6 +118,7 @@ mod tests {
         assert_eq!(settings.computers[0].name, "Living room");
         assert_eq!(settings.computers[0].last_used, None);
         assert!(!settings.sidebar_collapsed);
+        assert!(settings.hardware_decoding, "on for people upgrading");
     }
 
     #[test]

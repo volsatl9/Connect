@@ -99,13 +99,14 @@ pub(crate) fn stats_line(s: &Stats) -> String {
     let target = s.host_mbps.map_or(String::new(), |m| format!(" (target {m:.1})"));
     let loss = s.loss.map_or(String::new(), |l| format!(" · packet loss {:.1}%", l * 100.0));
     format!(
-        "{} · RTT {rtt} · {:.0} fps · {:.1} Mb/s{target} · latency {latency} (encode {:.1} / decode {:.1} ms) · \
-         frames lost {} / repaired {} / skipped {}{loss}",
+        "{} · RTT {rtt} · {:.0} fps · {:.1} Mb/s{target} · latency {latency} (encode {:.1} / decode {:.1} ms on \
+         {}) · frames lost {} / repaired {} / skipped {}{loss}",
         s.path.label(),
         s.fps,
         s.mbps,
         s.encode_ms,
         s.decode_ms,
+        if s.gpu_decode { "GPU" } else { "CPU" },
         s.frames_lost,
         s.frames_recovered,
         s.frames_superseded,

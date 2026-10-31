@@ -1,8 +1,8 @@
 # Connect
 
-Version 0.4.0 has a new look: glass panels, a sidebar that collapses to icons, and your computers
-as cards. It uses the same protocol as 0.3.1 (protocol 4), so the two connect to each other; older
-peers receive a version mismatch message. See [performance notes](PERFORMANCE.md) for measurements
+Version 0.5.0 decodes video on the graphics card (Vulkan Video, on NVIDIA, AMD and Intel, Windows
+and Linux) and sends desktop audio as Opus instead of uncompressed PCM. Its protocol is 5, so
+both PCs need 0.5.0; older peers receive a version mismatch message. See [performance notes](PERFORMANCE.md) for measurements
 and remaining stutter risks.
 
 Peer-to-peer remote desktop for gaming, built on [iroh](https://iroh.computer). Click **Generate
@@ -15,8 +15,8 @@ each permission on or off at any time.
 
 | | |
 |---|---|
-| Works | Generate Account, connect by User-ID across networks, Allow / Deny with per-device permissions, "Always allow" list, desktop audio with viewer mute, automatic hardware H.264 with CPU fallback, host cursor in the viewer, a distinct viewer pointer on the host, remote mouse (normal or captured for games), keyboard by scancode, up to 4 gamepads as virtual Xbox controllers |
-| Not yet | Monitor selection, microphone sharing, GPU-only capture/conversion, hardware video decoding |
+| Works | Generate Account, connect by User-ID across networks, Allow / Deny with per-device permissions, "Always allow" list, desktop audio (Opus) with viewer mute, automatic hardware H.264 encoding and decoding with CPU fallback, host cursor in the viewer, a distinct viewer pointer on the host, remote mouse (normal or captured for games), keyboard by scancode, up to 4 gamepads as virtual Xbox controllers |
+| Not yet | Monitor selection, microphone sharing, GPU-only capture/conversion |
 | Platforms | Windows can host and connect. Linux can connect only |
 
 ## Download
@@ -69,7 +69,11 @@ is captured. The shelf's clicks stay local.
 
 Windows hosts automatically try a Media Foundation hardware H.264 encoder and fall back to
 parallel OpenH264 if initialization or encoding fails (or if Media Foundation is missing, as on
-Windows "N" editions). The shelf reports the actual encoder. The stream follows the host
+Windows "N" editions). The viewer decodes on its graphics card through Vulkan Video where the
+driver supports H.264 decoding (current NVIDIA, AMD and Intel drivers on Windows, and NVIDIA's
+driver or a recent Mesa on Linux), and on the processor with OpenH264 otherwise, or if Settings → Viewing →
+**Hardware video decoding** is off. The shelf shows the actual encoder and decoder, and the stats
+say whether decoding runs on the GPU or CPU. The stream follows the host
 monitor's refresh rate, up to 240 Hz, subject to capture, encoder, network, decoder and display
 throughput.
 
@@ -84,9 +88,11 @@ Video is built to keep moving on real internet connections:
 - The viewer decodes every frame but only displays the newest, and converts it to colour on the
   graphics card, so a busy moment doesn't make it fall behind.
 
-Desktop audio uses uncompressed floating-point PCM, preferably the Windows engine's 48 kHz
-stereo mix (about 3.1 Mbps before transport). There is no lossy audio codec; Windows may downmix
-or resample the output device. No microphone is recorded. The host must allow **Desktop audio**;
+Desktop audio is the Windows engine's 48 kHz stereo mix, compressed with Opus in 5 ms packets
+at 128 kb/s (uncompressed PCM was about 3.1 Mb/s). Opus's low-delay mode adds 2.5 ms, and the
+viewer fills a short run of lost packets (up to 20 ms) with Opus's concealment, not silence. If the
+output device can't give a 48 kHz stereo mix, audio is sent in its own format: Opus where that
+format allows, otherwise PCM. Windows may downmix or resample the output device. No microphone is recorded. The host must allow **Desktop audio**;
 existing saved permission sets leave it off until enabled. Missing audio devices leave video
 and input working. The viewer can mute playback independently.
 
@@ -154,3 +160,7 @@ copies on one PC.
 The app's text is set in [Inter](https://rsms.me/inter/) (SIL Open Font License 1.1) and its icons
 are a subset of [Phosphor](https://phosphoricons.com/) (MIT); both are in `app/assets/fonts/` with
 their licenses.
+
+Audio is compressed with [libopus](https://opus-codec.org/) (BSD-3-Clause). Hardware decoding uses
+[gpu-video](https://github.com/software-mansion/smelter) (MIT) and AMD's
+[Vulkan Memory Allocator](https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator) (MIT).

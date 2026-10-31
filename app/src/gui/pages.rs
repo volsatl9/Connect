@@ -605,6 +605,21 @@ pub fn settings(app: &mut App, ui: &mut Ui) {
     });
     ui.add_space(gap);
 
+    theme::card(ui, |ui| {
+        theme::section_title(ui, "Viewing");
+        let mut hardware = app.settings.hardware_decoding;
+        if theme::switch_row(ui, "Hardware video decoding", &mut hardware).changed() {
+            app.settings.hardware_decoding = hardware;
+            connect_client::set_hardware_decoding(hardware);
+        }
+        ui.label(theme::caption(
+            "Decodes the other PC's screen on your graphics card, which leaves the processor free and keeps up at \
+             high resolutions and frame rates. Connect uses the processor instead where the card can't. Turn this \
+             off if the picture shows glitches. Applies from the next connection.",
+        ));
+    });
+    ui.add_space(gap);
+
     if VideoSource::SCREEN_SUPPORTED {
         sharing_card(app, ui);
         ui.add_space(gap);

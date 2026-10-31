@@ -12,6 +12,7 @@ connect-net.workspace = true
 connect-proto.workspace = true
 iroh.workspace = true
 openh264.workspace = true
+opus.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 openh264-sys2 = { version = "0.9", default-features = false }

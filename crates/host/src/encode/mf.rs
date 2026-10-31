@@ -251,12 +251,12 @@ impl HardwareEncoder {
                 bool::try_from(&codec.GetValue(&CODECAPI_AVLowLatencyMode)?)?,
                 "hardware encoder did not enable low latency"
             );
-            // H.264 Baseline independently excludes B slices; H.265 Main doesn't, so there the
-            // control is required. Where it's exposed, require the driver to accept and report
-            // zero instead of ignoring a failed setting.
-            let b_control = supports(&codec, &CODECAPI_AVEncMPVDefaultBPictureCount)?;
-            ensure!(b_control || video_codec == Codec::H264, "hardware {video_codec} encoder can't turn off B frames");
-            if b_control {
+            // Where the B-frame control is exposed, require the driver to accept and report zero
+            // instead of ignoring a failed setting. Without it (NVIDIA's HEVC encoder), H.264
+            // Baseline rules B frames out anyway, and for H.265 low-latency mode should; an
+            // encoder that reorders all the same fails `encode_frame`'s one-frame-in-flight
+            // check on its first B frame, and the stream falls back to H.264.
+            if supports(&codec, &CODECAPI_AVEncMPVDefaultBPictureCount)? {
                 set_u32(&codec, &CODECAPI_AVEncMPVDefaultBPictureCount, 0)?;
                 ensure!(
                     u32::try_from(&codec.GetValue(&CODECAPI_AVEncMPVDefaultBPictureCount)?)? == 0,

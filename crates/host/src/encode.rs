@@ -313,6 +313,10 @@ fn run(source: &VideoSource, tx: &mpsc::Sender<Result<VideoEvent>>, control: &Co
     // How long the staged picture took to capture, and how long it was on screen before that.
     let (mut picture_capture_us, mut picture_present_us) = (0, 0);
     let mut sent_time_us = 0;
+    // At most one picture per refresh of the host's screen (with a little slack for jitter): a
+    // game presenting faster than that would spend bitrate on pictures the viewer never shows.
+    let frame_interval = Duration::from_secs(1) * 19 / (20 * fps);
+    let mut last_sent: Option<Instant> = None;
     let mut seq = 0u32;
     let clock_start = now_micros();
     let stream_start = Instant::now();
@@ -323,7 +327,13 @@ fn run(source: &VideoSource, tx: &mpsc::Sender<Result<VideoEvent>>, control: &Co
     };
 
     while !control.stop.load(Ordering::Relaxed) {
-        let timeout = if unsent { HELD_POLL } else { POLL };
+        // Until the next picture may go: the wait for a held picture's turn.
+        let slot = last_sent.map_or(Duration::ZERO, |sent| frame_interval.saturating_sub(sent.elapsed()));
+        let timeout = match (unsent, slot.is_zero()) {
+            (false, _) => POLL,
+            (true, true) => HELD_POLL,
+            (true, false) => slot.min(HELD_POLL),
+        };
         let codec = wanted_codec(&failed);
         let fresh = capture(
             &mut *capturer,
@@ -364,10 +374,13 @@ fn run(source: &VideoSource, tx: &mpsc::Sender<Result<VideoEvent>>, control: &Co
             force_keyframe = true;
         }
         // Hold the picture while the network catches up: sent now, it would only queue behind
-        // the rest. A requested keyframe goes regardless, as the viewer is stuck without one.
-        if !(unsent || force_keyframe) || ((control.backlogged)() && !force_keyframe) {
+        // the rest. Likewise until its turn comes, a newer picture replacing it meanwhile. A
+        // requested keyframe goes regardless, as the viewer is stuck without one.
+        let too_soon = last_sent.is_some_and(|sent| sent.elapsed() < frame_interval);
+        if !(unsent || force_keyframe) || (((control.backlogged)() || too_soon) && !force_keyframe) {
             continue;
         }
+        last_sent = Some(Instant::now());
         control.keyframe.store(false, Ordering::Relaxed);
         unsent = false;
         // Stamped when captured; a static picture sent again as a keyframe is stamped anew, as
@@ -383,15 +396,24 @@ fn run(source: &VideoSource, tx: &mpsc::Sender<Result<VideoEvent>>, control: &Co
         let started = Instant::now();
         let encoded = match active.encoder.encode(active.stage.input(), capture_time_us, force_keyframe) {
             Ok(encoded) => encoded,
-            Err(error) if active.encoder.hardware() || !matches!(active.stage, Stage::Memory(_)) => {
-                // Carry on on the processor: OpenH264, reading the picture from memory. A
-                // codec only the graphics card can do is given up for H.264.
+            Err(error) if active.encoder.codec() != Codec::H264 => {
+                // A codec only the graphics card does: H.264 instead, on the graphics card if it
+                // will, where the picture already is.
                 let codec = active.encoder.codec();
+                tracing::warn!("{} failed; switching to H.264: {error:#}", active.encoder.name());
+                failed.push(codec);
+                let (w, h) = active.stage.size();
+                let stage = std::mem::replace(&mut active.stage, Stage::Memory(Picture::new(Layout::I420, 2, 2)));
+                *active = rebuild(stage, source, Codec::H264, w, h, bitrate, fps)?;
+                if !send(VideoEvent::Encoder { name: active.encoder.name().to_owned(), codec: Codec::H264 }) {
+                    return Ok(());
+                }
+                active.encoder.encode(active.stage.input(), capture_time_us, true)?
+            }
+            Err(error) if active.encoder.hardware() || !matches!(active.stage, Stage::Memory(_)) => {
+                // Carry on on the processor: OpenH264, reading the picture from memory.
                 tracing::warn!("{} failed; recovering on the processor: {error:#}", active.encoder.name());
                 gpu = false;
-                if codec != Codec::H264 {
-                    failed.push(codec);
-                }
                 let stage = std::mem::replace(&mut active.stage, Stage::Memory(Picture::new(Layout::I420, 2, 2)));
                 let encoder = open_software_encoder(Codec::H264, bitrate, fps)?;
                 active.stage = Stage::Memory(stage.into_memory(Layout::I420)?);

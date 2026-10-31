@@ -6,7 +6,7 @@ use connect_net as net;
 use connect_proto::{DeviceClass, Permissions};
 use eframe::egui::{self, Align, Layout, RichText};
 
-use super::{App, theme};
+use super::{App, icons, theme};
 
 pub fn show(app: &mut App, ctx: &egui::Context) {
     let timeout = connect_proto::APPROVAL_TIMEOUT;
@@ -14,49 +14,49 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
     let Some(request) = app.requests.front_mut() else { return };
     let remaining = timeout.saturating_sub(request.arrived.elapsed()).as_secs();
 
-    let mut decision = None;
-    egui::Modal::new(egui::Id::unique("connection-request")).frame(theme::card()).show(ctx, |ui| {
-        ui.set_width(460.0);
-        ui.label(RichText::new("Connection request").size(20.0).strong());
-        ui.add_space(4.0);
+    let (decision, _) = theme::dialog(ctx, "connection-request", 460.0, |ui| {
+        ui.label(RichText::new("Connection request").font(theme::semibold(20.0)));
+        ui.add_space(2.0);
         ui.label(
-            RichText::new(format!(
-                "{} wants to connect to this PC and see your screen. Desktop sound is shared only when enabled below.",
-                request.inner.client_name
-            ))
-            .size(15.0),
+            RichText::new(format!("{} wants to connect to this PC and see your screen.", request.inner.client_name))
+                .size(15.0),
         );
-        ui.add_space(4.0);
-        ui.label(RichText::new("User-ID").weak().small());
-        ui.label(RichText::new(net::format_user_id(&request.inner.peer)).monospace());
+        ui.add_space(6.0);
+        theme::glass(ui, theme::Glass::PANEL, 12.0, egui::Margin::symmetric(12, 8), |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(theme::caption("Their User-ID").size(11.5));
+            ui.label(RichText::new(net::format_user_id(&request.inner.peer)).monospace().color(theme::TEXT));
+        });
         ui.label(
-            RichText::new("The User-ID is verified. The name is whatever they chose, so check the ID if unsure.")
-                .weak()
-                .small(),
+            theme::caption("The User-ID is verified. The name is whatever they chose, so check the ID if unsure.")
+                .size(11.5),
         );
 
-        ui.add_space(8.0);
-        ui.label(RichText::new("Share and allow").strong());
+        ui.add_space(10.0);
+        theme::section_title(ui, "Let them use");
         permission_toggles(ui, &mut request.permissions);
         if request.permissions.allows(DeviceClass::Gamepad) {
             driver.setup_row(ui);
         }
-        ui.label(RichText::new("You can change these at any time during the session.").weak().small());
+        ui.label(
+            theme::caption("Desktop audio is shared only if selected. You can change all of these during the session.")
+                .size(11.5),
+        );
 
         ui.add_space(6.0);
-        ui.checkbox(&mut request.always_allow, "Always allow this device");
-        ui.add_space(6.0);
+        theme::switch_row(ui, "Always allow this device", &mut request.always_allow);
+        ui.add_space(10.0);
         ui.horizontal(|ui| {
-            ui.label(RichText::new(format!("Denying automatically in {remaining} s")).weak());
+            ui.label(theme::caption(format!("Denying automatically in {remaining} s")));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui.add(theme::primary("Allow")).clicked() {
-                    decision = Some(Decision::Allow(request.permissions));
+                    return Some(Decision::Allow(request.permissions));
                 }
-                if ui.button("Deny").clicked() {
-                    decision = Some(Decision::Deny);
-                }
-            });
-        });
+                ui.add(theme::secondary("Deny")).clicked().then_some(Decision::Deny)
+            })
+            .inner
+        })
+        .inner
     });
 
     if let Some(decision) = decision {
@@ -69,20 +69,29 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
     }
 }
 
-/// A checkbox per input device, plus a "View only" shortcut. True if anything changed.
+/// A chip per input device, plus a "View only" shortcut. True if anything changed.
 pub fn permission_toggles(ui: &mut egui::Ui, permissions: &mut Permissions) -> bool {
     let before = *permissions;
     ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
         for device in DeviceClass::ALL {
-            let mut allowed = permissions.allows(device);
-            if ui.checkbox(&mut allowed, device.label()).changed() {
-                *permissions = permissions.with(device, allowed);
+            let allowed = permissions.allows(device);
+            if theme::chip(ui, Some(icon(device)), device.label(), allowed).clicked() {
+                *permissions = permissions.with(device, !allowed);
             }
         }
-        ui.add_space(12.0);
-        if ui.add_enabled(!permissions.is_view_only(), egui::Button::new("View only")).clicked() {
+        if ui.add_enabled(!permissions.is_view_only(), theme::secondary("View only").small()).clicked() {
             *permissions = Permissions::VIEW_ONLY;
         }
     });
     *permissions != before
+}
+
+fn icon(device: DeviceClass) -> &'static str {
+    match device {
+        DeviceClass::Mouse => icons::MOUSE,
+        DeviceClass::Keyboard => icons::KEYBOARD,
+        DeviceClass::Gamepad => icons::GAME_CONTROLLER,
+        DeviceClass::Audio => icons::SPEAKER_HIGH,
+    }
 }

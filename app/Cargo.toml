@@ -27,4 +27,5 @@ windows = { version = "0.62", features = ["Win32_System_Console"] }
 [dev-dependencies]
 winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
+ron = "0.12"
 naga = { version = "30.0.1", features = ["wgsl-in"] }

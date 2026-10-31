@@ -7,13 +7,13 @@ use connect_net::{self as net, iroh::Endpoint};
 use eframe::egui::{self, RichText, TextEdit};
 use tokio::runtime::Handle;
 
-use super::{settings::Settings, theme};
+use super::{icons, settings::Settings, theme};
 
 pub struct Welcome {
     runtime: Handle,
     config_dir: PathBuf,
     pub settings: Settings,
-    /// Set once the account exists; the next screen shows its User-ID.
+    /// Set once the account exists, for the screen that says so.
     created: Option<Endpoint>,
     /// Install the built-in gamepad driver along with the account (Windows only).
     setup_gamepads: bool,
@@ -36,14 +36,16 @@ impl Welcome {
     /// whether to set up gamepad support.
     pub fn show(&mut self, ui: &mut egui::Ui) -> Option<(Endpoint, Settings, bool)> {
         let mut done = false;
-        egui::CentralPanel::default().frame(theme::content()).show(ui, |ui| {
+        theme::backdrop(ui.painter(), ui.max_rect());
+        egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
             ui.vertical_centered(|ui| {
-                ui.add_space((ui.available_height() * 0.12).min(80.0));
+                ui.add_space((ui.available_height() * 0.1).clamp(24.0, 72.0));
                 ui.set_max_width(540.0);
                 match &self.created {
                     None => self.ask(ui),
                     Some(endpoint) => done = created(ui, endpoint),
                 }
+                ui.add_space(24.0);
             });
         });
         if done {
@@ -54,53 +56,54 @@ impl Welcome {
     }
 
     fn ask(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new("Welcome to Connect").size(28.0).strong().color(theme::ACCENT));
-        ui.add_space(4.0);
-        ui.label(RichText::new("Play on another PC as if you were sitting at it, or let a friend play on yours.").size(15.0));
-        ui.add_space(18.0);
+        ui.label(RichText::new("Welcome to Connect").font(theme::semibold(32.0)).extra_letter_spacing(-0.5));
+        ui.add_space(2.0);
+        ui.label(
+            RichText::new("Play on another PC as if you were sitting at it, or let a friend play on yours.")
+                .size(15.0)
+                .color(theme::DIM),
+        );
+        ui.add_space(20.0);
 
-        theme::card().show(ui, |ui| {
-            ui.set_width(ui.available_width());
+        theme::card(ui, |ui| {
             theme::section_title(ui, "Name this PC");
-            ui.label(RichText::new("Shown to the people you connect with.").weak());
-            ui.add(TextEdit::singleline(&mut self.settings.device_name).desired_width(f32::INFINITY));
+            ui.label(theme::caption("Shown to the people you connect with, and on their Connect page."));
+            ui.add(
+                TextEdit::singleline(&mut self.settings.device_name)
+                    .desired_width(f32::INFINITY)
+                    .margin(egui::vec2(12.0, 8.0)),
+            );
         });
-        ui.add_space(6.0);
-        theme::card().show(ui, |ui| {
-            ui.set_width(ui.available_width());
+        ui.add_space(10.0);
+        theme::card(ui, |ui| {
             theme::section_title(ui, "Your account");
             ui.label(
                 "Generating an account creates your User-ID: a key that lives only on this PC. \
                  There's no email or password.",
             );
             ui.add_space(4.0);
-            ui.label(
-                RichText::new(
-                    "Nobody can connect without your approval, and you choose what they may use: \
-                     mouse, keyboard, gamepad.",
-                )
-                .weak(),
-            );
+            ui.label(theme::caption(
+                "Nobody can connect without your approval, and you choose what they may use: mouse, keyboard, \
+                 gamepad.",
+            ));
         });
         if VideoSource::SCREEN_SUPPORTED && connect_host::gamepad_support().is_err() {
-            ui.add_space(6.0);
-            theme::card().show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.checkbox(&mut self.setup_gamepads, "Set up gamepad support");
+            ui.add_space(10.0);
+            theme::card(ui, |ui| {
+                theme::switch_row(ui, "Set up gamepad support", &mut self.setup_gamepads);
                 ui.label(
-                    RichText::new(
-                        "Lets people who connect use their controller in your games. It's built in; \
-                         Windows asks for permission once.",
+                    theme::caption(
+                        "Lets people who connect use their controller in your games. It's built in; Windows asks \
+                         for permission once.",
                     )
-                    .weak()
-                    .small(),
+                    .size(11.5),
                 );
             });
         }
-        ui.add_space(14.0);
+        ui.add_space(18.0);
 
         let named = !self.settings.device_name.trim().is_empty();
-        let button = theme::primary("Generate Account").min_size(egui::vec2(220.0, 40.0));
+        let button = theme::primary("Generate Account").width(240.0);
         if ui.add_enabled(named, button).clicked() {
             self.settings.device_name = self.settings.device_name.trim().to_owned();
             match self.generate() {
@@ -120,30 +123,26 @@ impl Welcome {
     }
 }
 
-/// The new User-ID, with a way to copy it. True when the user continues.
+/// Says the account is ready and where its User-ID lives. True when the user continues.
 fn created(ui: &mut egui::Ui, endpoint: &Endpoint) -> bool {
-    ui.label(RichText::new("Your account is ready").size(28.0).strong().color(theme::ACCENT));
-    ui.add_space(18.0);
-    theme::card().show(ui, |ui| {
-        ui.set_width(ui.available_width());
+    ui.label(RichText::new("Your account is ready").font(theme::semibold(32.0)).extra_letter_spacing(-0.5));
+    ui.add_space(20.0);
+    theme::card(ui, |ui| {
         theme::section_title(ui, "Your User-ID");
-        let id = net::format_user_id(&endpoint.id());
-        let groups: Vec<&str> = id.split(' ').collect();
-        for row in groups.chunks(4) {
-            ui.label(RichText::new(row.join(" ")).monospace().size(20.0));
-        }
+        ui.label("It's in Settings, hidden until you click Show, so it doesn't end up on stream or in a screenshot.");
+        let how = if VideoSource::SCREEN_SUPPORTED {
+            "Give it to whoever should connect to this PC. To play on someone else's PC, click + Connect and paste \
+             their User-ID."
+        } else {
+            "To play on someone else's PC, click + Connect and paste their User-ID. (This PC can connect to others; \
+             hosting needs Windows.)"
+        };
+        ui.label(theme::caption(how));
         ui.add_space(6.0);
-        if ui.add(theme::primary("Copy User-ID")).clicked() {
+        if ui.add(theme::secondary("Copy User-ID").icon(icons::COPY)).clicked() {
             ui.ctx().copy_text(endpoint.id().to_string());
         }
-        ui.add_space(6.0);
-        let how = if VideoSource::SCREEN_SUPPORTED {
-            "Give it to whoever should connect to this PC. To play on someone else's PC, use their User-ID."
-        } else {
-            "To play on someone else's PC, use their User-ID. (This PC can connect to others; hosting needs Windows.)"
-        };
-        ui.label(RichText::new(how).weak());
     });
-    ui.add_space(14.0);
-    ui.add(theme::primary("Continue").min_size(egui::vec2(220.0, 40.0))).clicked()
+    ui.add_space(18.0);
+    ui.add(theme::primary("Continue").width(240.0)).clicked()
 }

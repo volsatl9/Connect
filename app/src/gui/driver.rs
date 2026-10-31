@@ -65,7 +65,7 @@ impl GamepadDriver {
                 ui.label(RichText::new("Setting up gamepad support… approve Windows' prompt if it asks.").small());
             } else {
                 ui.label(RichText::new("Gamepads need a one-time setup on this PC.").color(theme::BAD).small());
-                install = ui.small_button("Set up gamepad support").clicked();
+                install = ui.add(theme::secondary("Set up gamepad support").small()).clicked();
             }
         });
         if let Some(error) = &self.error {

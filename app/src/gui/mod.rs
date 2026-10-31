@@ -1,8 +1,9 @@
-//! The desktop app: first-run account setup, the Share / Connect / Settings pages, the
-//! Allow/Deny prompt, and the session view.
+//! The desktop app: first-run account setup, the Connect and Settings pages, the Allow/Deny
+//! prompt, and the session view.
 
 mod driver;
 mod gamepad;
+mod icons;
 mod input;
 mod pages;
 mod prompt;
@@ -25,7 +26,7 @@ use std::{
 
 use anyhow::Result;
 use connect_client::{ClientEvent, ClientHandle, Stage};
-use connect_host::{ConnectionRequest, HostConfig, HostEvent, HostHandle, VideoSource};
+use connect_host::{ConnectionRequest, HostConfig, HostEvent, HostHandle};
 use connect_net::{
     self as net,
     iroh::{Endpoint, EndpointId},
@@ -163,9 +164,18 @@ impl eframe::App for Root {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
-    Share,
+    /// This PC and the computers it can connect to.
     Connect,
     Settings,
+}
+
+/// A dialog over the pages.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Dialog {
+    /// Typing in a new computer's User-ID.
+    AddComputer,
+    /// Who is using this PC, and what they may use.
+    Hosting,
 }
 
 pub struct App {
@@ -181,7 +191,17 @@ pub struct App {
     /// Who is using this PC right now.
     hosting: Option<Hosting>,
     page: Page,
+    /// When the current page was opened, for fading it in.
+    page_since: Instant,
+    dialog: Option<Dialog>,
+    /// The User-ID being typed into the Connect dialog.
     connect_input: String,
+    /// Put the cursor in that field on the next frame.
+    focus_input: bool,
+    /// The saved computer (by User-ID) whose card asks "Remove?".
+    confirm_remove: Option<String>,
+    /// Whether Settings shows this PC's User-ID rather than dots.
+    show_user_id: bool,
     client: Option<ClientSession>,
     /// The latest thing worth telling the user, such as why a session ended.
     notice: Option<Notice>,
@@ -206,7 +226,10 @@ struct Hosting {
 
 struct Notice {
     text: String,
+    /// The technical side of an error, shown only on request.
+    detail: Option<String>,
     is_error: bool,
+    shown: Instant,
 }
 
 /// This PC connecting to another one.
@@ -275,9 +298,13 @@ impl App {
             gamepad_driver: driver::GamepadDriver::new(),
             requests: VecDeque::new(),
             hosting: None,
-            // Only Windows can host; elsewhere the host just turns callers away with the reason.
-            page: if VideoSource::SCREEN_SUPPORTED { Page::Share } else { Page::Connect },
+            page: Page::Connect,
+            page_since: Instant::now(),
+            dialog: None,
             connect_input: String::new(),
+            focus_input: false,
+            confirm_remove: None,
+            show_user_id: false,
             client: None,
             notice: None,
             updater: updates::Updater::new(ctx),
@@ -299,7 +326,7 @@ impl App {
     }
 
     fn notify(&mut self, text: impl Into<String>, is_error: bool) {
-        self.notice = Some(Notice { text: text.into(), is_error });
+        self.notice = Some(Notice { text: text.into(), detail: None, is_error, shown: Instant::now() });
     }
 
     fn on_host_event(&mut self, event: HostEvent) {
@@ -358,7 +385,9 @@ impl App {
                 ClientEvent::Stage(Stage::Connecting) => client.state = ClientState::Connecting,
                 ClientEvent::Stage(Stage::WaitingForApproval) => client.state = ClientState::WaitingForApproval,
                 ClientEvent::Accepted { host_name, permissions, .. } => {
-                    self.settings.add_recent(client.host_id, &host_name);
+                    self.settings.remember_computer(client.host_id, &host_name);
+                    self.dialog = None;
+                    self.connect_input.clear();
                     client.note(format!("Connected. You can use: {}.", describe(permissions)), 5);
                     client.state = ClientState::Connected { host_name, permissions };
                     client.gamepads = Some(gamepad::Forwarder::start(client.handle.clone()));
@@ -392,7 +421,8 @@ impl App {
             let is_error = !matches!(reason, connect_client::EndReason::Disconnected);
             self.client = None;
             self.page = Page::Connect;
-            self.notify(reason.to_string(), is_error);
+            let (text, detail) = explain(&reason);
+            self.notice = Some(Notice { text, detail, is_error, shown: Instant::now() });
             if ctx.input(|i| i.viewport().fullscreen.unwrap_or(false)) {
                 ctx.send_viewport_cmd(ViewportCommand::Fullscreen(false));
             }
@@ -431,21 +461,44 @@ impl App {
         if self.client.as_ref().is_some_and(|c| matches!(c.state, ClientState::Connected { .. })) {
             session::show(self, ui);
         } else {
-            egui::Panel::left("nav").exact_size(210.0).resizable(false).frame(theme::sidebar()).show(ui, |ui| {
-                pages::nav(self, ui);
-            });
+            let area = ui.max_rect();
+            theme::backdrop(ui.painter(), area);
+            let content = pages::sidebar(self, ui, area);
+            let mut ui = ui.new_child(egui::UiBuilder::new().max_rect(content));
             let in_session = self.hosting.is_some() || self.client.is_some();
-            egui::CentralPanel::default().frame(theme::content()).show(ui, |ui| {
-                self.updater.banner(ui, in_session);
-                egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| match self.page {
-                    Page::Share => pages::share(self, ui),
-                    Page::Connect => pages::connect(self, ui),
-                    Page::Settings => pages::settings(self, ui),
-                });
+            self.updater.banner(&mut ui, in_session);
+            egui::ScrollArea::vertical().auto_shrink(false).show(&mut ui, |ui| {
+                // Room on the right for the scroll bar, which floats over the content.
+                egui::Frame::new().inner_margin(egui::Margin { right: 14, bottom: 24, ..Default::default() }).show(
+                    ui,
+                    |ui| {
+                        theme::fade_in(ui, self.page_since);
+                        match self.page {
+                            Page::Connect => pages::computers(self, ui),
+                            Page::Settings => pages::settings(self, ui),
+                        }
+                    },
+                );
             });
+            pages::dialogs(self, ui.ctx());
         }
         prompt::show(self, ui.ctx());
     }
+}
+
+/// Why a connection ended, in words for people: for a failure, its outermost reason up front and
+/// the error chain beneath it as detail.
+fn explain(reason: &connect_client::EndReason) -> (String, Option<String>) {
+    let connect_client::EndReason::Failed(error) = reason else { return (reason.to_string(), None) };
+    let (head, detail) = match error.split_once(": ") {
+        Some((head, rest)) => (head, Some(rest.to_owned())),
+        None => (error.as_str(), None),
+    };
+    let mut text: String = head.chars().take(1).flat_map(char::to_uppercase).chain(head.chars().skip(1)).collect();
+    if !text.ends_with(['.', '?', '!']) {
+        text.push('.');
+    }
+    (text, detail)
 }
 
 /// "mouse, keyboard and gamepad", or "only the screen (view only)".
@@ -489,4 +542,29 @@ fn forward_host_events(
         }
     });
     rx
+}
+
+#[cfg(test)]
+mod tests {
+    use connect_client::EndReason;
+
+    use super::explain;
+
+    #[test]
+    fn failures_lead_with_the_reason_and_keep_the_chain_as_detail() {
+        let failed = EndReason::Failed(
+            "couldn't reach that User-ID. Is Connect running on the host?: No addressing information available: \
+             lookup failed"
+                .into(),
+        );
+        let (text, detail) = explain(&failed);
+        assert_eq!(text, "Couldn't reach that User-ID. Is Connect running on the host?");
+        assert_eq!(detail.as_deref(), Some("No addressing information available: lookup failed"));
+
+        let (text, detail) = explain(&EndReason::Failed("the host didn't answer".into()));
+        assert_eq!((text.as_str(), detail), ("The host didn't answer.", None));
+
+        let (text, detail) = explain(&EndReason::Rejected("The host denied the connection.".into()));
+        assert_eq!((text.as_str(), detail), ("The host denied the connection.", None));
+    }
 }

@@ -1,9 +1,11 @@
 # Connect
 
-Version 0.6.0 keeps the shared screen on the host's graphics card from capture to encoder, and
-the two PCs now agree on a video codec from what each one's hardware can do. It builds on 0.5.0's
-GPU decoding and Opus audio. Its protocol is 6, so both PCs need 0.6.0; older peers receive a
-version mismatch message. See [CODECS.md](CODECS.md) for how codecs are chosen and the plans for
+Version 0.7.0 draws hardware-decoded video straight from the graphics card, shows where every
+millisecond of latency goes and how busy each graphics card is (Ctrl+Alt+S), and adds a
+**Smooth** frame pacing option. Windows hosts can encode H.265 in hardware, which is used once
+viewers can decode it. Since 0.6.0 the host keeps the screen on its graphics card from capture to
+encoder, and the two PCs agree on a codec from what each one's hardware can do. Its protocol is
+7, so both PCs need 0.7.0; older peers receive a version mismatch message. See [CODECS.md](CODECS.md) for how codecs are chosen and the plans for
 H.265 and AV1. See [performance notes](PERFORMANCE.md) for measurements
 and remaining stutter risks.
 
@@ -111,7 +113,7 @@ from capture, the overlay is hidden to prevent duplicate pointers.
 |---|---|
 | Ctrl+Alt+M | Capture the mouse for games (raw movement, hidden pointer), and release it again |
 | Ctrl+Alt+F | Full screen |
-| Ctrl+Alt+S | Stats: connection path, round trip, fps, bitrate (and the host's current target), latency, frames lost / repaired / skipped, packet loss |
+| Ctrl+Alt+S | Stats: connection path, round trip, fps, bitrate (and the host's current target), frames lost / repaired / skipped, packet loss; latency stage by stage, from the host's screen to this window; how busy each PC's graphics card is |
 
 All other keys, including F-keys and Esc, go to the host.
 

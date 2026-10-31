@@ -9,6 +9,10 @@ authors = ["Software Mansion <contact@swmansion.com>"]
 license = "MIT"
 description = "Hardware video coding using Vulkan Video, with wgpu integration (vendored into Connect)."
 
+[lib]
+# The README's examples are upstream's, written against its own workspace.
+doctest = false
+
 [features]
 expose-parsers = []
 vk-api-dump = []

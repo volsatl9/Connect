@@ -13,9 +13,9 @@ mod latency;
 mod pacing;
 mod video;
 
+pub use connect_gpu_load::GpuLoad;
 pub use decoder::{GpuDecodeSupport, gpu_decode_support};
 pub use gpu_decode::SharedGpu;
-pub use connect_gpu_load::GpuLoad;
 pub use latency::{FrameTiming, Latency};
 
 use std::{

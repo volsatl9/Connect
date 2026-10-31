@@ -33,7 +33,6 @@ impl Monitor {
     }
 }
 
-
 #[cfg_attr(not(windows), allow(dead_code))]
 /// Engine kind from a Windows "GPU Engine" counter instance, e.g.
 /// `pid_1234_luid_0x0000_0x0001_phys_0_eng_3_engtype_VideoEncode`, and the engine it names
@@ -55,9 +54,11 @@ fn fold<'a>(readings: impl IntoIterator<Item = (&'a str, f64)>) -> GpuLoad {
         }
     }
     let busiest = |pick: &dyn Fn(&str) -> bool| {
-        engines.iter().filter(|((_, kind), _)| pick(kind)).map(|(_, &v)| v).fold(None, |max: Option<f64>, v| {
-            Some(max.map_or(v, |max| max.max(v)))
-        })
+        engines
+            .iter()
+            .filter(|((_, kind), _)| pick(kind))
+            .map(|(_, &v)| v)
+            .fold(None, |max: Option<f64>, v| Some(max.map_or(v, |max| max.max(v))))
     };
     let percent = |v: f64| v.round().clamp(0.0, 100.0) as u8;
     GpuLoad {
@@ -121,7 +122,8 @@ mod imp {
                 // The items, then the instance names they point into, in one buffer.
                 let mut buffer = vec![0u64; (bytes as usize).div_ceil(8)];
                 let items = buffer.as_mut_ptr().cast::<PDH_FMT_COUNTERVALUE_ITEM_W>();
-                if PdhGetFormattedCounterArrayW(self.counter, PDH_FMT_DOUBLE, &mut bytes, &mut count, Some(items)) != 0 {
+                if PdhGetFormattedCounterArrayW(self.counter, PDH_FMT_DOUBLE, &mut bytes, &mut count, Some(items)) != 0
+                {
                     return None;
                 }
                 let items = std::slice::from_raw_parts(items, count as usize);
@@ -163,11 +165,8 @@ mod imp {
         }
 
         pub fn sample(&mut self) -> Option<GpuLoad> {
-            let busiest = self
-                .0
-                .iter()
-                .filter_map(|path| std::fs::read_to_string(path).ok()?.trim().parse::<u8>().ok())
-                .max()?;
+            let busiest =
+                self.0.iter().filter_map(|path| std::fs::read_to_string(path).ok()?.trim().parse::<u8>().ok()).max()?;
             Some(GpuLoad { graphics: busiest.min(100), encode: None, decode: None })
         }
     }

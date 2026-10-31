@@ -12,7 +12,6 @@ use anyhow::{Context, Result};
 use windows::{
     Win32::{
         Foundation::HMODULE,
-        System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency},
         Graphics::{
             Direct3D::D3D_DRIVER_TYPE_HARDWARE,
             Direct3D11::{
@@ -27,6 +26,7 @@ use windows::{
                 IDXGIOutputDuplication, IDXGIResource,
             },
         },
+        System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency},
     },
     core::Interface,
 };
@@ -239,12 +239,11 @@ impl DxgiCapturer {
         }
         // LastPresentTime is the performance counter when the image went to the screen.
         let (mut now, mut frequency) = (0, 0);
-        let present_to_capture = unsafe {
-            QueryPerformanceCounter(&mut now).is_ok() && QueryPerformanceFrequency(&mut frequency).is_ok()
-        }
-        .then(|| now.saturating_sub(info.LastPresentTime))
-        .filter(|&ticks| frequency > 0 && ticks >= 0)
-        .map(|ticks| Duration::from_secs_f64(ticks as f64 / frequency as f64));
+        let present_to_capture =
+            unsafe { QueryPerformanceCounter(&mut now).is_ok() && QueryPerformanceFrequency(&mut frequency).is_ok() }
+                .then(|| now.saturating_sub(info.LastPresentTime))
+                .filter(|&ticks| frequency > 0 && ticks >= 0)
+                .map(|ticks| Duration::from_secs_f64(ticks as f64 / frequency as f64));
         self.timing = CaptureTiming { acquired: std::time::Instant::now(), present_to_capture };
         let texture = match resource.context("no desktop image").and_then(|r| Ok(r.cast::<ID3D11Texture2D>()?)) {
             Ok(texture) => texture,

@@ -675,7 +675,8 @@ mod tests {
 
     #[test]
     fn codec_travels_in_the_flags() {
-        let meta = |codec| FrameMeta { keyframe: true, codec, capture_time_us: 5, encode_time_us: 1, ..Default::default() };
+        let meta =
+            |codec| FrameMeta { keyframe: true, codec, capture_time_us: 5, encode_time_us: 1, ..Default::default() };
         for codec in Codec::BY_EFFICIENCY {
             let mut asm = FrameAssembler::new();
             for datagram in packetize(meta(codec), &[1, 2, 3, 4], 1200, 0).unwrap() {

@@ -65,6 +65,9 @@ What makes this work:
 
 ## H.265 (0.7.0)
 
+**Status:** encoding is built (0.7.0); decoding isn't yet. Hosts list hardware H.265
+encoders, but no viewer offers H.265, so sessions stay on H.264.
+
 **Encoding (Windows):**
 - **Encoder MFTs:** NVIDIA, AMD and Intel all register hardware HEVC encoder MFTs.
   `mf::encoder_names` and `gpu-check` already list them. `HardwareEncoder` needs the
@@ -121,7 +124,12 @@ tools (palette mode and intra block copy) that suit desktop and UI-heavy games.
 2. The `HardwareEncoder` AV1 subtype.
 3. Optionally, `rav1d` as a software decoder.
 
-## Decoded pictures straight to the screen (0.7.0)
+## Decoded pictures straight to the screen (built in 0.7.0)
+
+The plan below is what 0.7.0 does: `gpu-video` is vendored in `crates/gpu-video` and moved to
+wgpu 30 (see its `VENDORED.md`), the window opens on its device when a card decodes H.264
+through Vulkan, and decoded NV12 textures are drawn with the same shader as uploaded planes.
+`CONNECT_RENDERER=separate` keeps the window on its own device.
 
 **Today:** Vulkan Video decodes on the GPU, then each picture is copied back to memory as NV12
 (about 5.5 MB a frame at 1440p), converted to I420, and uploaded again for the YUV shader.

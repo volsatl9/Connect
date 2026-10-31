@@ -75,6 +75,8 @@ impl VideoEncoder for OpenH264 {
     }
 
     fn encode(&mut self, input: Input<'_>, capture_time_us: u64, force_keyframe: bool) -> Result<Vec<Encoded>> {
+        // Only one way in off Windows.
+        #[cfg_attr(not(windows), expect(clippy::infallible_destructuring_match))]
         let picture = match input {
             Input::Picture(picture) => picture,
             #[cfg(windows)]

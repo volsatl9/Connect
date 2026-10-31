@@ -185,3 +185,26 @@ fn stdin_lines() -> mpsc::UnboundedReceiver<String> {
     });
     rx
 }
+
+/// Checks what this PC's graphics hardware offers for sharing and viewing, runs the GPU paths
+/// briefly, and saves the report for pasting.
+pub fn gpu_check() -> Result<()> {
+    let mut report = Vec::new();
+    let mut out = |line: String| {
+        println!("{line}");
+        report.push(line);
+    };
+    out(format!(
+        "Connect {} GPU check on {} ({})",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        device_name()
+    ));
+    out("Testing for a few seconds; a video playing on the screen gives more realistic timings.".into());
+    connect_client::diagnostics::run(&mut out);
+    connect_host::diagnostics::run(&mut out);
+    let path = std::env::current_dir().unwrap_or_default().join("connect-gpu-check.txt");
+    std::fs::write(&path, report.join("\n") + "\n").with_context(|| format!("saving {}", path.display()))?;
+    println!("\nSaved to {}", path.display());
+    Ok(())
+}

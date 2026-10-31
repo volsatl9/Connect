@@ -335,8 +335,8 @@ async fn native_desktop_gpu_cursor_audio_and_revocation() {
         while !(gpu && frames >= 5 && client.cursor().shape.is_some()) {
             while let Ok(event) = client_events.try_recv() {
                 match event {
-                    ClientEvent::VideoEncoder { name } => {
-                        println!("Native session encoder: {name}");
+                    ClientEvent::VideoEncoder { name, codec } => {
+                        println!("Native session encoder: {codec} · {name}");
                         gpu = name.starts_with("GPU:");
                     }
                     ClientEvent::Ended(reason) => panic!("native session ended: {reason}"),

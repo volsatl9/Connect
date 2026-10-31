@@ -7,6 +7,7 @@
 
 mod audio;
 mod decoder;
+pub mod diagnostics;
 mod gpu_decode;
 mod video;
 

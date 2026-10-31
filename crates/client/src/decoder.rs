@@ -56,7 +56,7 @@ pub(crate) fn software(codec: Codec) -> Result<Box<dyn VideoDecoder>> {
 
 /// The codecs this PC can decode, as offered to hosts. Hardware decoding counts only while the
 /// user allows it.
-pub(crate) fn supported() -> Vec<CodecSupport> {
+pub fn supported() -> Vec<CodecSupport> {
     let mut list = Vec::new();
     if crate::HARDWARE_DECODING.load(Ordering::Relaxed) {
         let gpus = probe();

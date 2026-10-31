@@ -1,8 +1,9 @@
-//! Direct hardware-only Media Foundation H.264 encoding.
+//! Direct hardware-only Media Foundation encoding.
 //!
 //! The object, COM apartment and MF startup all belong to the capture thread. Pictures arrive
-//! as NV12 in CPU memory, converted straight from the captured image; the selected encoder
-//! itself must be a hardware MFT.
+//! as NV12, either in CPU memory (converted straight from the captured image) or, opened with
+//! the capture's Direct3D device, as textures on the graphics card that never leave it. The
+//! selected encoder itself must be a hardware MFT.
 
 use std::{
     marker::PhantomData,
@@ -13,10 +14,13 @@ use std::{
 
 use anyhow::{Context, Result, bail, ensure};
 
-use crate::yuv::{Layout, Picture};
+use super::{Encoded, Input, InputKind, VideoEncoder};
+use crate::yuv::Layout;
+use connect_proto::Codec;
 use windows::{
     Win32::{
         Foundation::{E_NOTIMPL, S_FALSE, S_OK},
+        Graphics::Direct3D11::{ID3D11Device, ID3D11Texture2D},
         Media::MediaFoundation::*,
         System::{
             Com::{COINIT_MULTITHREADED, CoInitializeEx, CoTaskMemFree, CoUninitialize},
@@ -43,6 +47,8 @@ pub(crate) struct HardwareFrame {
 
 pub(crate) struct HardwareEncoder {
     transform: IMFTransform,
+    /// Shares the capture's Direct3D device with the encoder, when it reads textures.
+    manager: Option<IMFDXGIDeviceManager>,
     codec: ICodecAPI,
     events: Option<IMFMediaEventGenerator>,
     _activation: Activation,
@@ -97,8 +103,48 @@ impl Drop for Activation {
     }
 }
 
+/// The codecs a hardware encoder here can produce, as far as Connect can drive them.
+pub(crate) fn hardware_codecs() -> Vec<Codec> {
+    let Ok(_runtime) = Runtime::new() else { return Vec::new() };
+    // H.265 and AV1 hardware encoders are listed by `encoder_names` but not used until the
+    // viewer can decode them.
+    match hardware_encoders(&MFVideoFormat_H264) {
+        Ok(list) if !list.is_empty() => vec![Codec::H264],
+        _ => Vec::new(),
+    }
+}
+
+/// The names of the hardware encoders registered for `codec`, for diagnostics.
+pub(crate) fn encoder_names(codec: Codec) -> Result<Vec<String>> {
+    let _runtime = Runtime::new()?;
+    Ok(hardware_encoders(subtype(codec))?
+        .iter()
+        .map(|activation| {
+            attribute_string(&activation.0, &MFT_FRIENDLY_NAME_Attribute).unwrap_or_else(|_| "unnamed".into())
+        })
+        .collect())
+}
+
+fn subtype(codec: Codec) -> &'static GUID {
+    match codec {
+        Codec::H264 => &MFVideoFormat_H264,
+        Codec::H265 => &MFVideoFormat_HEVC,
+        Codec::Av1 => &MFVideoFormat_AV1,
+    }
+}
+
 impl HardwareEncoder {
-    pub fn new(width: u32, height: u32, bitrate_bps: u32, fps: u32) -> Result<Self> {
+    /// Opens a hardware `codec` encoder. Given `device`, it reads NV12 textures on that device
+    /// (see [`Input::Texture`]); otherwise NV12 pictures in memory.
+    pub fn new(
+        codec: Codec,
+        width: u32,
+        height: u32,
+        bitrate_bps: u32,
+        fps: u32,
+        device: Option<&ID3D11Device>,
+    ) -> Result<Self> {
+        ensure!(codec == Codec::H264, "Connect doesn't drive hardware {codec} encoders yet");
         ensure!(
             width > 0 && height > 0 && width.is_multiple_of(2) && height.is_multiple_of(2),
             "hardware H.264 requires nonempty even dimensions"
@@ -107,15 +153,17 @@ impl HardwareEncoder {
         let bytes = u64::from(width) * u64::from(height) * 3 / 2;
         ensure!(bytes <= MAX_RAW_BYTES as u64, "hardware H.264 image exceeds input limit");
         let runtime = Runtime::new()?;
-        let activations = hardware_encoders()?;
+        let manager = device.map(device_manager).transpose()?;
+        let activations = hardware_encoders(&MFVideoFormat_H264)?;
         let mut failures = Vec::new();
         for activation in activations {
             let name = attribute_string(&activation.0, &MFT_FRIENDLY_NAME_Attribute)
                 .unwrap_or_else(|_| "unnamed hardware H.264 MFT".into());
-            match Self::configure(&activation, width, height, bitrate_bps, fps) {
+            match Self::configure(&activation, width, height, bitrate_bps, fps, manager.as_ref()) {
                 Ok((transform, codec, events, input_id, output_id)) => {
                     return Ok(Self {
                         transform,
+                        manager,
                         codec,
                         events,
                         _activation: activation,
@@ -153,6 +201,7 @@ impl HardwareEncoder {
         height: u32,
         bitrate: u32,
         fps: u32,
+        manager: Option<&IMFDXGIDeviceManager>,
     ) -> Result<(IMFTransform, ICodecAPI, Option<IMFMediaEventGenerator>, u32, u32)> {
         unsafe {
             // Both the enumeration flag and hardware registration are required. Never instantiate
@@ -170,6 +219,16 @@ impl HardwareEncoder {
             } else {
                 None
             };
+            if let Some(manager) = manager {
+                // Before any media type: the encoder picks its texture handling from the device.
+                ensure!(
+                    attributes.GetUINT32(&MF_SA_D3D11_AWARE).unwrap_or(0) != 0,
+                    "hardware encoder can't read Direct3D 11 textures"
+                );
+                transform
+                    .ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, manager.as_raw() as usize)
+                    .context("handing the capture device to the encoder")?;
+            }
             let codec: ICodecAPI = transform.cast().context("hardware MFT has no codec controls")?;
             set_value(&codec, &CODECAPI_AVLowLatencyMode, &VARIANT::from(true))
                 .context("hardware encoder does not accept low-latency mode")?;
@@ -226,29 +285,20 @@ impl HardwareEncoder {
         }
     }
 
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    /// Changes the target bitrate for the frames that follow, if the driver allows it mid-stream.
-    pub fn set_bitrate(&mut self, bps: u32) {
-        if self.fixed_bitrate {
-            return;
-        }
-        if let Err(error) = set_u32(&self.codec, &CODECAPI_AVEncCommonMeanBitRate, bps) {
-            tracing::info!("hardware encoder keeps its bitrate: {error:#}");
-            self.fixed_bitrate = true;
-        }
-    }
-
-    pub fn encode(
+    fn encode_frame(
         &mut self,
-        image: &Picture,
+        input: Input<'_>,
         capture_time_us: u64,
         force_keyframe: bool,
     ) -> Result<Vec<HardwareFrame>> {
-        ensure!(image.size() == (self.width, self.height), "recreate hardware encoder after resizing");
-        ensure!(image.layout() == Layout::Nv12, "hardware encoder takes NV12");
+        match input {
+            Input::Picture(image) => {
+                ensure!(self.manager.is_none(), "this hardware encoder reads textures");
+                ensure!(image.size() == (self.width, self.height), "recreate hardware encoder after resizing");
+                ensure!(image.layout() == Layout::Nv12, "hardware encoder takes NV12");
+            }
+            Input::Texture(_) => ensure!(self.manager.is_some(), "this hardware encoder reads memory"),
+        }
         let timestamp = i64::try_from(capture_time_us.checked_mul(10).context("capture timestamp overflow")?)?;
         ensure!(self.last_timestamp.is_none_or(|last| timestamp > last), "capture timestamps must increase");
         let timeout = if self.frames == 0 { START_TIMEOUT } else { FRAME_TIMEOUT };
@@ -264,7 +314,7 @@ impl HardwareEncoder {
         if keyframe_requested {
             set_u32(&self.codec, &CODECAPI_AVEncVideoForceKeyFrame, 1).context("requesting hardware IDR frame")?;
         }
-        let sample = self.input_sample(image, timestamp)?;
+        let sample = self.input_sample(input, timestamp)?;
         unsafe {
             self.transform.ProcessInput(self.input_id, &sample, 0).context("submitting NV12 frame to hardware")?;
         }
@@ -335,16 +385,24 @@ impl HardwareEncoder {
         bail!("hardware encoder flooded its event queue")
     }
 
-    fn input_sample(&self, image: &Picture, timestamp: i64) -> Result<IMFSample> {
-        let nv12 = image.data();
-        ensure!(nv12.len() <= MAX_RAW_BYTES, "NV12 image exceeds input limit");
+    fn input_sample(&self, input: Input<'_>, timestamp: i64) -> Result<IMFSample> {
+        let buffer = match input {
+            Input::Picture(image) => {
+                let nv12 = image.data();
+                ensure!(nv12.len() <= MAX_RAW_BYTES, "NV12 image exceeds input limit");
+                unsafe {
+                    let buffer = mfplat::memory_buffer(nv12.len() as u32)?;
+                    let mut pointer = std::ptr::null_mut();
+                    buffer.Lock(&mut pointer, None, None)?;
+                    std::ptr::copy_nonoverlapping(nv12.as_ptr(), pointer, nv12.len());
+                    buffer.Unlock()?;
+                    buffer.SetCurrentLength(nv12.len() as u32)?;
+                    buffer
+                }
+            }
+            Input::Texture(texture) => texture_buffer(texture)?,
+        };
         unsafe {
-            let buffer = mfplat::memory_buffer(nv12.len() as u32)?;
-            let mut pointer = std::ptr::null_mut();
-            buffer.Lock(&mut pointer, None, None)?;
-            std::ptr::copy_nonoverlapping(nv12.as_ptr(), pointer, nv12.len());
-            buffer.Unlock()?;
-            buffer.SetCurrentLength(nv12.len() as u32)?;
             let sample = mfplat::sample()?;
             sample.AddBuffer(&buffer)?;
             sample.SetSampleTime(timestamp)?;
@@ -438,10 +496,63 @@ impl Drop for HardwareEncoder {
     }
 }
 
-fn hardware_encoders() -> Result<Vec<Activation>> {
+impl VideoEncoder for HardwareEncoder {
+    fn codec(&self) -> Codec {
+        Codec::H264
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn hardware(&self) -> bool {
+        true
+    }
+
+    fn input(&self) -> InputKind {
+        if self.manager.is_some() { InputKind::Texture } else { InputKind::Picture(Layout::Nv12) }
+    }
+
+    /// Changes the target bitrate for the frames that follow, if the driver allows it mid-stream.
+    fn set_bitrate(&mut self, _from: u32, to: u32) {
+        if self.fixed_bitrate {
+            return;
+        }
+        if let Err(error) = set_u32(&self.codec, &CODECAPI_AVEncCommonMeanBitRate, to) {
+            tracing::info!("hardware encoder keeps its bitrate: {error:#}");
+            self.fixed_bitrate = true;
+        }
+    }
+
+    fn encode(&mut self, input: Input<'_>, capture_time_us: u64, force_keyframe: bool) -> Result<Vec<Encoded>> {
+        Ok(self
+            .encode_frame(input, capture_time_us, force_keyframe)?
+            .into_iter()
+            .map(|frame| Encoded {
+                data: frame.data.into(),
+                keyframe: frame.keyframe,
+                capture_time_us: frame.capture_time_us,
+            })
+            .collect())
+    }
+}
+
+/// A Media Foundation device manager sharing `device` with encoders.
+fn device_manager(device: &ID3D11Device) -> Result<IMFDXGIDeviceManager> {
+    let (token, manager) = mfplat::dxgi_device_manager()?;
+    unsafe { manager.ResetDevice(device, token) }.context("sharing the capture device with Media Foundation")?;
+    Ok(manager)
+}
+
+/// A media buffer wrapping `texture`, for a sample the encoder reads straight from the GPU.
+fn texture_buffer(texture: &ID3D11Texture2D) -> Result<IMFMediaBuffer> {
+    mfplat::dxgi_surface_buffer(texture)
+}
+
+fn hardware_encoders(codec: &GUID) -> Result<Vec<Activation>> {
     unsafe {
         let input = MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Video, guidSubtype: MFVideoFormat_NV12 };
-        let output = MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Video, guidSubtype: MFVideoFormat_H264 };
+        let output = MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Video, guidSubtype: *codec };
         let (mut pointer, mut count) = (std::ptr::null_mut(), 0);
         mfplat::enum_ex(
             MFT_CATEGORY_VIDEO_ENCODER,
@@ -535,10 +646,16 @@ fn read_buffer(buffer: &IMFMediaBuffer) -> Result<Vec<u8>> {
 mod mfplat {
     use std::{ffi::c_void, ptr::null_mut, sync::OnceLock};
 
+    use windows::core::BOOL;
+
     use anyhow::{Result, anyhow, ensure};
     use windows::{
         Win32::{
-            Media::MediaFoundation::{IMFActivate, IMFMediaBuffer, IMFMediaType, IMFSample, MFT_REGISTER_TYPE_INFO},
+
+            Graphics::Direct3D11::ID3D11Texture2D,
+            Media::MediaFoundation::{
+                IMFActivate, IMFDXGIDeviceManager, IMFMediaBuffer, IMFMediaType, IMFSample, MFT_REGISTER_TYPE_INFO,
+            },
             System::LibraryLoader::{GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW},
         },
         core::{GUID, HRESULT, Interface, s, w},
@@ -561,6 +678,8 @@ mod mfplat {
         aligned_memory_buffer: unsafe extern "system" fn(u32, u32, Out) -> HRESULT,
         sample: unsafe extern "system" fn(Out) -> HRESULT,
         media_type: unsafe extern "system" fn(Out) -> HRESULT,
+        dxgi_device_manager: unsafe extern "system" fn(*mut u32, Out) -> HRESULT,
+        dxgi_surface_buffer: unsafe extern "system" fn(*const GUID, *mut c_void, u32, BOOL, Out) -> HRESULT,
     }
 
     fn api() -> Result<&'static Api> {
@@ -587,6 +706,8 @@ mod mfplat {
             aligned_memory_buffer: get!("MFCreateAlignedMemoryBuffer"),
             sample: get!("MFCreateSample"),
             media_type: get!("MFCreateMediaType"),
+            dxgi_device_manager: get!("MFCreateDXGIDeviceManager"),
+            dxgi_surface_buffer: get!("MFCreateDXGISurfaceBuffer"),
         })
     }
 
@@ -638,6 +759,19 @@ mod mfplat {
     pub fn media_type() -> Result<IMFMediaType> {
         let api = api()?;
         created(|out| unsafe { (api.media_type)(out) })
+    }
+
+    /// A new device manager and the token for handing it a device.
+    pub fn dxgi_device_manager() -> Result<(u32, IMFDXGIDeviceManager)> {
+        let api = api()?;
+        let mut token = 0;
+        let manager = created(|out| unsafe { (api.dxgi_device_manager)(&mut token, out) })?;
+        Ok((token, manager))
+    }
+
+    pub fn dxgi_surface_buffer(texture: &ID3D11Texture2D) -> Result<IMFMediaBuffer> {
+        let api = api()?;
+        created(|out| unsafe { (api.dxgi_surface_buffer)(&ID3D11Texture2D::IID, texture.as_raw(), 0, false.into(), out) })
     }
 }
 
@@ -798,6 +932,7 @@ fn nal_units(data: &[u8], length_size: Option<usize>) -> Result<Vec<&[u8]>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::yuv::Picture;
     use openh264::{decoder::Decoder, formats::YUVSource as _};
 
     #[test]
@@ -861,7 +996,7 @@ mod tests {
     #[ignore = "requires a local Windows hardware H.264 MFT"]
     fn native_hardware_encode_decode_and_resize() {
         for (width, height, fps) in [(640, 480, 60), (1920, 1080, 60), (800, 600, 60), (1920, 1080, 240)] {
-            let mut encoder = HardwareEncoder::new(width, height, 20_000_000, fps).unwrap();
+            let mut encoder = HardwareEncoder::new(Codec::H264, width, height, 20_000_000, fps, None).unwrap();
             println!("{} {width}x{height} at {fps} fps ceiling", encoder.name());
             let mut decoder = Decoder::new().unwrap();
             let mut timings = Vec::new();
@@ -869,7 +1004,7 @@ mod tests {
                 let image = moving_image(width as usize, height as usize, index);
                 let timestamp = 1_798_500_000_000_000 + index as u64 * (1_000_000 / u64::from(fps));
                 let start = Instant::now();
-                let frames = encoder.encode(&image, timestamp, index == 10).unwrap();
+                let frames = encoder.encode_frame(Input::Picture(&image), timestamp, index == 10).unwrap();
                 timings.push(start.elapsed().as_secs_f64() * 1000.0);
                 assert_eq!(frames.len(), 1);
                 for frame in frames {

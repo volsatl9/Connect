@@ -7,7 +7,7 @@
 //! of that isn't available, or fails, pictures go through memory as before.
 
 #[cfg(windows)]
-mod mf;
+pub(crate) mod mf;
 mod software;
 
 use std::{
@@ -201,10 +201,12 @@ impl Stage {
     /// The picture in memory, laid out as `layout`, reading it back from the graphics card if
     /// that's where it is.
     fn into_memory(self, layout: Layout) -> Result<Picture> {
+        // Only one way in off Windows.
+        #[cfg_attr(not(windows), expect(clippy::infallible_destructuring_match))]
         let picture = match self {
             Stage::Memory(picture) => picture,
             #[cfg(windows)]
-            Stage::Gpu(converter) => converter.read_back().context("reading the picture back from the GPU")?,
+            Stage::Gpu(mut converter) => converter.read_back().context("reading the picture back from the GPU")?,
         };
         Ok(if picture.layout() == layout { picture } else { picture.to_layout(layout) })
     }

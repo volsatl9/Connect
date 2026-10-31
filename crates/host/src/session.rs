@@ -397,7 +397,9 @@ fn send_frame(conn: &Connection, frame: &EncodedFrame, loss: f32) -> Result<()> 
     let max = conn.max_datagram_size().context("the client doesn't accept video datagrams")?;
     let data_chunks = frame.data.len().div_ceil(max.saturating_sub(video::HEADER_LEN).max(2) & !1);
     let recovery = video::recovery_count(data_chunks, loss, frame.meta.keyframe);
-    let chunks = video::packetize(frame.meta, &frame.data, max, recovery)?;
+    let sent_after = connect_proto::now_micros().saturating_sub(frame.meta.capture_time_us);
+    let meta = video::FrameMeta { sent_after_us: sent_after.min(u64::from(u32::MAX)) as u32, ..frame.meta };
+    let chunks = video::packetize(meta, &frame.data, max, recovery)?;
     if frame.meta.keyframe {
         debug!(seq = frame.meta.seq, bytes = frame.data.len(), datagrams = chunks.len(), max, "sending keyframe");
     }

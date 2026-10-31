@@ -9,9 +9,11 @@ mod audio;
 mod decoder;
 pub mod diagnostics;
 mod gpu_decode;
+mod latency;
 mod video;
 
 pub use decoder::{GpuDecodeSupport, gpu_decode_support};
+pub use latency::{FrameTiming, Latency};
 
 use std::{
     fmt,
@@ -125,6 +127,8 @@ pub struct VideoFrame {
     pub height: u32,
     pub yuv: Vec<u8>,
     pub meta: FrameMeta,
+    /// Where the frame's time went; call [`FrameTiming::mark_painted`] when it's drawn.
+    pub timing: FrameTiming,
 }
 
 impl VideoFrame {
@@ -186,8 +190,11 @@ pub struct Stats {
     pub decode_ms: f32,
     /// Whether the graphics card is decoding the video, rather than the processor.
     pub gpu_decode: bool,
-    /// Host capture → decoded here, via the estimated clock offset between the two PCs.
+    /// The host's screen → drawn here, on average, via the estimated clock offset between the
+    /// two PCs: [`Latency::total`].
     pub latency_ms: Option<f32>,
+    /// Where that time goes, stage by stage.
+    pub latency: Option<Latency>,
 }
 
 impl Default for Stats {
@@ -206,6 +213,7 @@ impl Default for Stats {
             decode_ms: 0.0,
             gpu_decode: false,
             latency_ms: None,
+            latency: None,
         }
     }
 }
@@ -231,6 +239,7 @@ struct Shared {
     gpu_decoding: AtomicBool,
     stats: Mutex<Stats>,
     counters: Counters,
+    latency: Mutex<latency::LatencyWindow>,
     cursor: Mutex<(CursorPosition, Option<Arc<CursorShape>>, Instant)>,
     cursor_sequence: AtomicU64,
     playback: Mutex<Option<Arc<audio::Playback>>>,
@@ -255,7 +264,6 @@ struct Counters {
     decode_us: AtomicU64,
     /// Client clock minus host clock, µs; `i64::MIN` until measured.
     clock_offset_us: AtomicI64,
-    latency_us: AtomicI64,
 }
 
 /// Starts connecting to `host`. `wake` is called (from any thread) whenever there's a new event
@@ -278,6 +286,7 @@ pub fn connect(
         decoder: Mutex::new(String::new()),
         gpu_decoding: AtomicBool::new(false),
         stats: Mutex::new(Stats::default()),
+        latency: Mutex::new(latency::LatencyWindow::default()),
         cursor: Mutex::new((CursorPosition::default(), None, Instant::now())),
         cursor_sequence: AtomicU64::new(0),
         playback: Mutex::new(None),
@@ -288,7 +297,6 @@ pub fn connect(
         counters: Counters {
             host_kbps: AtomicU32::new(u32::MAX),
             clock_offset_us: AtomicI64::new(i64::MIN),
-            latency_us: AtomicI64::new(i64::MIN),
             ..Default::default()
         },
     });
@@ -312,6 +320,8 @@ impl ClientHandle {
 
     /// Returns a shown frame's buffer for the decoder to reuse.
     pub fn recycle(&self, frame: VideoFrame) {
+        let offset = self.0.counters.clock_offset_us.load(Ordering::Relaxed);
+        lock(&self.0.latency).add(&frame.timing, (offset != i64::MIN).then_some(offset));
         recycle(&self.0, frame.yuv);
     }
 
@@ -665,7 +675,7 @@ impl StatsWindow {
         }
         let (bytes, frames) = (c.bytes.load(Ordering::Relaxed), c.frames_decoded.load(Ordering::Relaxed));
         let (path, rtt) = net::selected_path(conn);
-        let latency_us = c.latency_us.load(Ordering::Relaxed);
+        let latency = lock(&shared.latency).take();
         *lock(&shared.stats) = Stats {
             path,
             rtt,
@@ -683,7 +693,8 @@ impl StatsWindow {
             encode_ms: c.encode_us.load(Ordering::Relaxed) as f32 / 1000.0,
             decode_ms: c.decode_us.load(Ordering::Relaxed) as f32 / 1000.0,
             gpu_decode: shared.gpu_decoding.load(Ordering::Relaxed),
-            latency_ms: (latency_us != i64::MIN).then(|| latency_us.max(0) as f32 / 1000.0),
+            latency_ms: latency.and_then(|latency| latency.total),
+            latency,
         };
         *self = Self { at: Instant::now(), bytes, frames };
         (shared.wake)();
@@ -777,13 +788,7 @@ mod media_tests {
             .unwrap();
             let image = YUVBuffer::new(16, 16);
             let encoded = encoder.encode(&image).unwrap().to_vec();
-            let meta = FrameMeta {
-                seq: 0,
-                keyframe: true,
-                codec: Codec::H264,
-                capture_time_us: now_micros(),
-                encode_time_us: 0,
-            };
+            let meta = FrameMeta { keyframe: true, capture_time_us: now_micros(), ..Default::default() };
             for chunk in video::packetize(meta, &encoded, 1200, 0).unwrap() {
                 conn.send_datagram(chunk).unwrap();
             }

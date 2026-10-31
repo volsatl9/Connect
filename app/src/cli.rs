@@ -156,7 +156,9 @@ pub async fn join(key: SecretKey, args: &[String]) -> Result<()> {
                 None => break,
             },
             _ = woken.notified() => {
-                if let Some(frame) = client.take_frame() {
+                if let Some(mut frame) = client.take_frame() {
+                    // No window to draw into: taking the frame stands in for drawing it.
+                    frame.timing.mark_painted();
                     client.recycle(frame);
                 }
             }

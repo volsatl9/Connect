@@ -4,7 +4,7 @@
 pub(crate) mod dxgi;
 mod test_pattern;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
@@ -46,9 +46,21 @@ pub(crate) struct Frame<'a> {
     pub bgra: &'a [u8],
 }
 
+/// When a captured image came in.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CaptureTiming {
+    /// When capture got hold of the image (not when it started waiting for one).
+    pub acquired: Instant,
+    /// From the image reaching the screen to capture getting it, where the source knows.
+    pub present_to_capture: Option<Duration>,
+}
+
 pub(crate) trait Capturer {
     /// Waits up to `timeout` for the screen to change; `Ok(None)` if it didn't.
     fn next_frame(&mut self, timeout: Duration) -> Result<Option<Frame<'_>>>;
+
+    /// When the last image came in, and how long after the screen showed it.
+    fn timing(&self) -> CaptureTiming;
 
     /// How many times a second the source can change, if known.
     fn refresh_hz(&self) -> Option<u32> {

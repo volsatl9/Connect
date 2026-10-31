@@ -66,7 +66,7 @@ impl VideoView {
     }
 
     /// Shows `frame` from the next repaint on.
-    pub fn set_frame(&mut self, ctx: &egui::Context, frame: VideoFrame) {
+    pub fn set_frame(&mut self, ctx: &egui::Context, mut frame: VideoFrame) {
         self.size = Some(egui::vec2(frame.width as f32, frame.height as f32));
         if !matches!(gpu(), Gpu::Cpu) {
             let mut exchange = lock(&self.exchange);
@@ -92,6 +92,7 @@ impl VideoView {
         // Opaque, so these are already premultiplied.
         let image = ColorImage::from_rgba_premultiplied(size, rgba);
         self.cpu.as_mut().expect("set above").0.set(image, TextureOptions::LINEAR);
+        frame.timing.mark_painted();
         lock(&self.exchange).done.push(frame);
     }
 
@@ -315,7 +316,7 @@ impl egui_wgpu::CallbackTrait for WgpuVideo {
             resources.insert(WgpuResources::new(device, self.format));
         }
         let mut exchange = lock(&self.exchange);
-        let Some(frame) = exchange.next.take() else { return Vec::new() };
+        let Some(mut frame) = exchange.next.take() else { return Vec::new() };
         let gpu = resources.get_mut::<WgpuResources>().expect("inserted above");
         let textures = &gpu.planes_for(device, &frame).textures;
         for (texture, (width, height, bytes)) in textures.iter().zip(planes(&frame)) {
@@ -326,6 +327,7 @@ impl egui_wgpu::CallbackTrait for WgpuVideo {
                 wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
             );
         }
+        frame.timing.mark_painted();
         exchange.done.push(frame);
         Vec::new()
     }
@@ -388,7 +390,7 @@ unsafe fn paint_gl(gl: &glow::Context, exchange: &Mutex<Exchange>) {
     };
     unsafe {
         let mut exchange = lock(exchange);
-        if let Some(frame) = exchange.next.take() {
+        if let Some(mut frame) = exchange.next.take() {
             let size = [frame.width, frame.height];
             let resize = resources.size != Some(size);
             gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
@@ -415,6 +417,7 @@ unsafe fn paint_gl(gl: &glow::Context, exchange: &Mutex<Exchange>) {
             }
             gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
             resources.size = Some(size);
+            frame.timing.mark_painted();
             exchange.done.push(frame);
         }
         if resources.size.is_none() {

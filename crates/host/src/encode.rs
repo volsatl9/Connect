@@ -272,6 +272,10 @@ fn gpu_pipeline_wanted(source: &VideoSource) -> bool {
         && std::env::var("CONNECT_GPU_PIPELINE").map_or(true, |value| value != "0")
 }
 
+fn micros(duration: Duration) -> u32 {
+    duration.as_micros().min(u32::MAX as u128) as u32
+}
+
 /// The stream's encoder and the picture it reads, rebuilt when the size or codec changes.
 struct Pipeline {
     stage: Stage,
@@ -292,6 +296,8 @@ fn run(source: &VideoSource, tx: &mpsc::Sender<Result<VideoEvent>>, control: &Co
     // the network catches up can be sent once it has.
     let mut unsent = false;
     let mut picture_time_us = 0;
+    // How long the staged picture took to capture, and how long it was on screen before that.
+    let (mut picture_capture_us, mut picture_present_us) = (0, 0);
     let mut sent_time_us = 0;
     let mut seq = 0u32;
     let clock_start = now_micros();
@@ -320,6 +326,9 @@ fn run(source: &VideoSource, tx: &mpsc::Sender<Result<VideoEvent>>, control: &Co
         let now_us = clock_start + stream_start.elapsed().as_micros() as u64;
         if fresh {
             picture_time_us = now_us;
+            let timing = capturer.timing();
+            picture_capture_us = micros(timing.acquired.elapsed());
+            picture_present_us = timing.present_to_capture.map_or(0, micros);
             unsent = true;
         }
         let Some(active) = &mut pipeline else { continue };
@@ -385,9 +394,13 @@ fn run(source: &VideoSource, tx: &mpsc::Sender<Result<VideoEvent>>, control: &Co
                 codec,
                 capture_time_us: picture.capture_time_us,
                 encode_time_us,
+                present_to_capture_us: picture_present_us,
+                capture_us: picture_capture_us,
+                // Filled in as the frame goes out.
+                sent_after_us: 0,
             };
             seq = seq.wrapping_add(1);
-            if !send(VideoEvent::Frame(EncodedFrame { meta, data: picture.data })) {
+            if !send(VideoEvent::Frame(EncodedFrame { meta, data: picture.data, first_seen: None })) {
                 return Ok(());
             }
         }

@@ -7,6 +7,7 @@
 //!                                     share this PC (Windows); Allow/Deny is asked on the terminal
 //! connect join <USER-ID> [--seconds N]
 //! connect id                          print this PC's User-ID
+//! connect gpu-check                   check what the graphics hardware offers, and test it
 //! ```
 //!
 //! Only Windows can host; other platforms can only connect. `--test-pattern` hosts a generated
@@ -39,7 +40,8 @@ usage: connect                        open the app
        connect host [--test-pattern[=WxH@FPS]] [--print-input]
                                       share this PC from the terminal (Windows)
        connect join <USER-ID> [--seconds N]
-       connect id                     print this PC's User-ID";
+       connect id                     print this PC's User-ID
+       connect gpu-check              check this PC's graphics hardware and save a report";
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -69,6 +71,7 @@ fn main() -> Result<()> {
         None => gui::run(runtime, config_dir),
         Some("host") => runtime.block_on(cli::host(key()?, &args[1..])),
         Some("join") => runtime.block_on(cli::join(key()?, &args[1..])),
+        Some("gpu-check") => cli::gpu_check(),
         Some("id") => {
             println!("{}", net::format_user_id(&key()?.public()));
             Ok(())

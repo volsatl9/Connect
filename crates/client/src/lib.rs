@@ -6,8 +6,12 @@
 //! from the [`ClientHandle`].
 
 mod audio;
+mod decoder;
+pub mod diagnostics;
 mod gpu_decode;
 mod video;
+
+pub use decoder::{GpuDecodeSupport, gpu_decode_support};
 
 use std::{
     fmt,
@@ -21,7 +25,7 @@ use std::{
 use anyhow::{Result, bail};
 use connect_net::{self as net, PathKind};
 use connect_proto::{
-    CLOSE_NORMAL, CLOSE_REJECTED, DeviceClass, PROTOCOL_VERSION, Permissions,
+    CLOSE_NORMAL, CLOSE_REJECTED, Codec, DeviceClass, PROTOCOL_VERSION, Permissions,
     control::{ClientMsg, HostMsg},
     cursor::{CursorPosition, CursorShape},
     input::InputEvent,
@@ -78,6 +82,7 @@ pub enum ClientEvent {
     },
     VideoEncoder {
         name: String,
+        codec: Codec,
     },
     AudioStatus {
         active: bool,
@@ -420,10 +425,14 @@ async fn session(
     events: &Events,
 ) -> Result<Option<EndReason>> {
     // Opening the graphics card's decoder can take a moment; do it while the host user decides.
-    let decoder = video::start_decoder(shared.clone())?;
+    let (failed_tx, failed_codecs) = mpsc::unbounded_channel();
+    let decoder = video::start_decoder(shared.clone(), failed_tx)?;
+    let decoders = tokio::task::spawn_blocking(decoder::supported).await?;
+    debug!(?decoders, "decoders offered");
     let (mut send, mut recv) = conn.open_bi().await?;
     let hello = ClientMsg::Hello { version: PROTOCOL_VERSION, client_name: client_name.to_owned() };
     net::write_msg(&mut send, &hello).await?;
+    net::write_msg(&mut send, &ClientMsg::Decoders(decoders)).await?;
     events.send(ClientEvent::Stage(Stage::WaitingForApproval)).await;
 
     let reply = tokio::select! {
@@ -446,7 +455,7 @@ async fn session(
         Err(e) => return Err(e),
     }
 
-    stream(conn, send, recv, decoder, shared, events).await
+    stream(conn, send, recv, decoder, failed_codecs, shared, events).await
 }
 
 async fn stream(
@@ -454,6 +463,7 @@ async fn stream(
     mut send: SendStream,
     recv: RecvStream,
     decoder: video::DecoderQueue,
+    mut failed_codecs: mpsc::UnboundedReceiver<Codec>,
     shared: &Arc<Shared>,
     events: &Events,
 ) -> Result<Option<EndReason>> {
@@ -486,7 +496,9 @@ async fn stream(
                     if !p.allows(DeviceClass::Audio) { stop_audio(shared); }
                     events.send(ClientEvent::PermissionsChanged(p)).await;
                 }
-                Some(Ok(HostMsg::VideoEncoder { name })) => events.send(ClientEvent::VideoEncoder { name }).await,
+                Some(Ok(HostMsg::VideoEncoder { name, codec })) => {
+                    events.send(ClientEvent::VideoEncoder { name, codec }).await
+                }
                 Some(Ok(HostMsg::VideoStats { bitrate_kbps, loss_permille })) => {
                     shared.counters.host_kbps.store(bitrate_kbps, Ordering::Relaxed);
                     shared.counters.loss_permille.store(loss_permille.into(), Ordering::Relaxed);
@@ -518,6 +530,9 @@ async fn stream(
                     debug!("requesting a keyframe");
                     net::write_msg(&mut send, &ClientMsg::RequestKeyframe).await?;
                 }
+            }
+            Some(codec) = failed_codecs.recv() => {
+                net::write_msg(&mut send, &ClientMsg::DecoderFailed { codec }).await?;
             }
             _ = ping.tick() => {
                 let failure = lock(&shared.audio_failure).take();
@@ -762,7 +777,13 @@ mod media_tests {
             .unwrap();
             let image = YUVBuffer::new(16, 16);
             let encoded = encoder.encode(&image).unwrap().to_vec();
-            let meta = FrameMeta { seq: 0, keyframe: true, capture_time_us: now_micros(), encode_time_us: 0 };
+            let meta = FrameMeta {
+                seq: 0,
+                keyframe: true,
+                codec: Codec::H264,
+                capture_time_us: now_micros(),
+                encode_time_us: 0,
+            };
             for chunk in video::packetize(meta, &encoded, 1200, 0).unwrap() {
                 conn.send_datagram(chunk).unwrap();
             }

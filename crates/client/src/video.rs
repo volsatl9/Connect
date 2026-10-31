@@ -12,15 +12,18 @@ use std::{
 
 use anyhow::{Context, Result};
 use connect_proto::{
-    now_micros,
+    Codec, now_micros,
     video::{EncodedFrame, FrameAssembler},
 };
 use iroh::endpoint::Connection;
-use openh264::formats::YUVSource;
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, info, warn};
 
-use crate::{Shared, VideoFrame, gpu_decode::GpuDecoder, lock};
+use crate::{
+    Shared, VideoFrame,
+    decoder::{self, VideoDecoder},
+    lock,
+};
 
 /// Complete frames waiting for the decoder. Every frame has to be decoded, as the next one
 /// builds on it, but a decoder that is briefly behind only shows the newest; past this many it
@@ -51,15 +54,19 @@ impl DecoderQueue {
     }
 }
 
-pub(crate) fn start_decoder(shared: Arc<Shared>) -> Result<DecoderQueue> {
+/// Starts the decoder thread. A codec it finds it can't decode goes to `failed`, for the host
+/// to switch away from.
+pub(crate) fn start_decoder(shared: Arc<Shared>, failed: UnboundedSender<Codec>) -> Result<DecoderQueue> {
     let (tx, rx) = std_mpsc::sync_channel::<EncodedFrame>(DECODE_QUEUE);
     let queued = Arc::new(AtomicUsize::new(0));
     let pending = queued.clone();
     std::thread::Builder::new()
         .name("connect-decode".into())
         .spawn(move || {
-            let mut decoder = match Decoder::open(&shared) {
-                Ok(decoder) => decoder,
+            // Opened ahead of the first frame, as the graphics card takes a moment: H.264, the
+            // codec every session can use. Another codec gets its own decoder when it arrives.
+            let mut decoder = match decoder::open(Codec::H264, hardware_allowed()) {
+                Ok(decoder) => install(&shared, decoder),
                 Err(e) => return warn!("no video decoder: {e:#}"),
             };
             let mut shown_at = Instant::now();
@@ -67,7 +74,7 @@ pub(crate) fn start_decoder(shared: Arc<Shared>) -> Result<DecoderQueue> {
                 let behind = pending.fetch_sub(1, Ordering::AcqRel) > 1;
                 // Behind: decode this one only to build on it, and show a newer one.
                 let show = !behind || shown_at.elapsed() >= MAX_DISPLAY_GAP;
-                if decode(&mut decoder, &frame, &shared, show) && show {
+                if decode(&mut decoder, &frame, &shared, &failed, show) && show {
                     shown_at = Instant::now();
                 }
             }
@@ -76,80 +83,67 @@ pub(crate) fn start_decoder(shared: Arc<Shared>) -> Result<DecoderQueue> {
     Ok(DecoderQueue { frames: tx, queued })
 }
 
-enum Decoder {
-    Gpu(Box<GpuDecoder>),
-    Cpu(openh264::decoder::Decoder),
+fn hardware_allowed() -> bool {
+    crate::HARDWARE_DECODING.load(Ordering::Relaxed)
 }
 
-impl Decoder {
-    /// The graphics card's decoder where it has one and the user hasn't turned it off,
-    /// otherwise OpenH264 on the processor.
-    fn open(shared: &Shared) -> Result<Self> {
-        if crate::HARDWARE_DECODING.load(Ordering::Relaxed) {
-            match GpuDecoder::new() {
-                Ok(gpu) => {
-                    info!(gpu = gpu.name, "decoding video on the graphics card");
-                    *lock(&shared.decoder) = format!("Decoder: GPU · {}", gpu.name);
-                    shared.gpu_decoding.store(true, Ordering::Relaxed);
-                    return Ok(Self::Gpu(Box::new(gpu)));
-                }
-                Err(e) => info!("hardware decoding unavailable, decoding on the processor: {e:#}"),
-            }
-        }
-        Self::cpu(shared)
-    }
-
-    fn cpu(shared: &Shared) -> Result<Self> {
-        let decoder = openh264::decoder::Decoder::new().context("starting H.264 decoder")?;
-        *lock(&shared.decoder) = "Decoder: CPU (OpenH264)".into();
-        shared.gpu_decoding.store(false, Ordering::Relaxed);
-        Ok(Self::Cpu(decoder))
-    }
-
-    /// Decodes `data`, writing the picture to `yuv` as tightly packed I420 if given one.
-    /// Returns the picture's size, or `None` if this data finished no picture.
-    fn decode(&mut self, data: &[u8], yuv: Option<&mut Vec<u8>>) -> Result<Option<(usize, usize)>> {
-        match self {
-            Self::Gpu(gpu) => gpu.decode(data, yuv),
-            Self::Cpu(decoder) => {
-                let Some(picture) = decoder.decode(data)? else { return Ok(None) };
-                let (w, h) = picture.dimensions();
-                if let Some(buf) = yuv {
-                    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
-                    buf.resize(w * h + 2 * cw * ch, 0);
-                    let (y, chroma) = buf.split_at_mut(w * h);
-                    let (u, v) = chroma.split_at_mut(cw * ch);
-                    let (ys, us, vs) = picture.strides();
-                    for (dst, src, stride, width) in
-                        [(y, picture.y(), ys, w), (u, picture.u(), us, cw), (v, picture.v(), vs, cw)]
-                    {
-                        for (row, line) in dst.chunks_exact_mut(width).enumerate() {
-                            line.copy_from_slice(&src[row * stride..][..width]);
-                        }
-                    }
-                }
-                Ok(Some((w, h)))
-            }
-        }
-    }
+/// Makes `decoder` the session's, and says so.
+fn install(shared: &Shared, decoder: Box<dyn VideoDecoder>) -> Box<dyn VideoDecoder> {
+    info!(codec = %decoder.codec(), "{}", decoder.label());
+    *lock(&shared.decoder) = decoder.label();
+    shared.gpu_decoding.store(decoder.hardware(), Ordering::Relaxed);
+    decoder
 }
 
 /// Decodes `frame`, publishing the picture if `show`. False if it didn't decode.
-fn decode(decoder: &mut Decoder, frame: &EncodedFrame, shared: &Shared, show: bool) -> bool {
+fn decode(
+    decoder: &mut Box<dyn VideoDecoder>,
+    frame: &EncodedFrame,
+    shared: &Shared,
+    failed: &UnboundedSender<Codec>,
+    show: bool,
+) -> bool {
+    let codec = frame.meta.codec;
+    let give_up = |why: String| {
+        warn!("{why}; asking the host for another codec");
+        let _ = failed.send(codec);
+        shared.decoder_failed.store(true, Ordering::Relaxed);
+        false
+    };
+    if decoder.codec() != codec {
+        // The host changes codec only at a keyframe; anything before it can't be decoded.
+        if !frame.meta.keyframe {
+            shared.decoder_failed.store(true, Ordering::Relaxed);
+            return false;
+        }
+        match decoder::open(codec, hardware_allowed()) {
+            Ok(opened) => *decoder = install(shared, opened),
+            Err(e) => return give_up(format!("can't decode {codec}: {e:#}")),
+        }
+    }
     let started = Instant::now();
     // Tightly packed planes, in a buffer the GUI handed back after showing an earlier frame.
     let mut buf = show.then(|| lock(&shared.spare_buffers).pop().unwrap_or_default());
     let mut result = decoder.decode(&frame.data, buf.as_mut());
-    if let (Err(e), Decoder::Gpu(_), true) = (&result, &*decoder, frame.meta.keyframe) {
+    if let Err(e) = &result
+        && decoder.hardware()
+        && frame.meta.keyframe
+    {
         // A keyframe needs nothing before it, so failing one means the graphics card can't
-        // decode this stream at all: carry on on the processor, starting with this keyframe.
-        warn!("hardware decoding failed on a keyframe, switching to software: {e:#}");
-        match Decoder::cpu(shared) {
-            Ok(cpu) => {
-                *decoder = cpu;
+        // decode this stream at all: carry on on the processor, starting with this keyframe,
+        // or with another codec if this one has no software decoder.
+        warn!("hardware {codec} decoding failed on a keyframe: {e:#}");
+        match decoder::software(codec) {
+            Ok(software) => {
+                *decoder = install(shared, software);
                 result = decoder.decode(&frame.data, buf.as_mut());
             }
-            Err(e) => warn!("{e:#}"),
+            Err(e) => {
+                if let Some(buf) = buf {
+                    crate::recycle(shared, buf);
+                }
+                return give_up(format!("{e:#}"));
+            }
         }
     }
     let (w, h) = match result {

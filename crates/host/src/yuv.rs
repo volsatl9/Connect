@@ -37,13 +37,18 @@ impl Picture {
         Self { layout, width, height, data: vec![0; width * height * 3 / 2] }
     }
 
-    #[cfg_attr(not(windows), allow(dead_code))]
     pub fn layout(&self) -> Layout {
         self.layout
     }
 
     pub fn size(&self) -> (usize, usize) {
         (self.width, self.height)
+    }
+
+    /// The whole picture, for filling in directly.
+    #[cfg(windows)]
+    pub fn data_mut(&mut self) -> &mut [u8] {
+        &mut self.data
     }
 
     /// The whole picture, planes back to back.

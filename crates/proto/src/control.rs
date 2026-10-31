@@ -4,7 +4,7 @@
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-use crate::{DeviceClass, Permissions, cursor::CursorShape};
+use crate::{Codec, CodecSupport, DeviceClass, Permissions, cursor::CursorShape};
 
 /// Upper bound on a single control message; anything larger is a protocol violation.
 pub const MAX_MESSAGE_LEN: usize = 64 * 1024;
@@ -17,6 +17,11 @@ pub enum ClientMsg {
     RequestKeyframe,
     /// Clock/RTT probe; the host answers with [`HostMsg::Pong`].
     Ping { client_time_us: u64 },
+    /// Straight after the hello: the codecs this PC can decode. (Separate from the hello, so a
+    /// host of another version can still read the hello and say why it won't connect.)
+    Decoders(Vec<CodecSupport>),
+    /// This PC couldn't decode `codec` after all; the host switches to another one.
+    DecoderFailed { codec: Codec },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -49,9 +54,10 @@ pub enum HostMsg {
         device: DeviceClass,
         reason: String,
     },
-    /// Actual selected encoder, including software fallback when necessary.
+    /// Actual selected encoder, including software fallback when necessary, and its codec.
     VideoEncoder {
         name: String,
+        codec: Codec,
     },
     AudioStatus {
         active: bool,

@@ -406,7 +406,7 @@ impl App {
                     }
                 }
                 ClientEvent::InputUnavailable { reason, .. } => client.note(reason, 10),
-                ClientEvent::VideoEncoder { name } => client.encoder = name,
+                ClientEvent::VideoEncoder { name, codec } => client.encoder = format!("{codec} · {name}"),
                 ClientEvent::AudioStatus { active, reason } => {
                     client.audio_active = active;
                     if let Some(reason) = reason {

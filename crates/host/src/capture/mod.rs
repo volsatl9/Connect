@@ -1,7 +1,7 @@
 //! Screen capture sources. Capturers are created and used on the video thread only.
 
 #[cfg(windows)]
-mod dxgi;
+pub(crate) mod dxgi;
 mod test_pattern;
 
 use std::time::Duration;
@@ -52,6 +52,12 @@ pub(crate) trait Capturer {
 
     /// How many times a second the source can change, if known.
     fn refresh_hz(&self) -> Option<u32> {
+        None
+    }
+
+    /// Desktop Duplication, which can also hand frames over on the graphics card.
+    #[cfg(windows)]
+    fn as_dxgi(&mut self) -> Option<&mut dxgi::DxgiCapturer> {
         None
     }
 }

@@ -95,7 +95,11 @@ fn test_pattern(spec: &str) -> Result<VideoSource> {
     let parse = || -> Option<VideoSource> {
         let (size, fps) = spec.split_once('@')?;
         let (width, height) = size.split_once('x')?;
-        Some(VideoSource::TestPattern { width: width.parse().ok()?, height: height.parse().ok()?, fps: fps.parse().ok()? })
+        Some(VideoSource::TestPattern {
+            width: width.parse().ok()?,
+            height: height.parse().ok()?,
+            fps: fps.parse().ok()?,
+        })
     };
     parse().with_context(|| format!("expected WIDTHxHEIGHT@FPS, like 1920x1080@144, not {spec:?}"))
 }
@@ -140,7 +144,7 @@ pub async fn join(key: SecretKey, args: &[String]) -> Result<()> {
                 Some(ClientEvent::PermissionsChanged(p)) => println!("Host changed permissions to {:#05b}.", p.bits()),
                 Some(ClientEvent::VideoFormat { width, height }) => println!("Host screen is now {width}×{height}."),
                 Some(ClientEvent::InputUnavailable { reason, .. }) => println!("{reason}"),
-                Some(ClientEvent::VideoEncoder { name }) => println!("Video encoder: {name}"),
+                Some(ClientEvent::VideoEncoder { name, codec }) => println!("Video: {codec} · {name}"),
                 Some(ClientEvent::AudioStatus { active, reason }) => {
                     if let Some(reason) = reason { println!("{reason}"); }
                     else { println!("Desktop audio: {}", if active { "on" } else { "off" }); }
@@ -184,4 +188,22 @@ fn stdin_lines() -> mpsc::UnboundedReceiver<String> {
         }
     });
     rx
+}
+
+/// Checks what this PC's graphics hardware offers for sharing and viewing, runs the GPU paths
+/// briefly, and saves the report for pasting.
+pub fn gpu_check() -> Result<()> {
+    let mut report = Vec::new();
+    let mut out = |line: String| {
+        println!("{line}");
+        report.push(line);
+    };
+    out(format!("Connect {} GPU check on {} ({})", env!("CARGO_PKG_VERSION"), std::env::consts::OS, device_name()));
+    out("Testing for a few seconds; a video playing on the screen gives more realistic timings.".into());
+    connect_client::diagnostics::run(&mut out);
+    connect_host::diagnostics::run(&mut out);
+    let path = std::env::current_dir().unwrap_or_default().join("connect-gpu-check.txt");
+    std::fs::write(&path, report.join("\n") + "\n").with_context(|| format!("saving {}", path.display()))?;
+    println!("\nSaved to {}", path.display());
+    Ok(())
 }

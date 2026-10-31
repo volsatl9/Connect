@@ -1,8 +1,10 @@
 # Connect
 
-Version 0.5.0 decodes video on the graphics card (Vulkan Video, on NVIDIA, AMD and Intel, Windows
-and Linux) and sends desktop audio as Opus instead of uncompressed PCM. Its protocol is 5, so
-both PCs need 0.5.0; older peers receive a version mismatch message. See [performance notes](PERFORMANCE.md) for measurements
+Version 0.6.0 keeps the shared screen on the host's graphics card from capture to encoder, and
+the two PCs now agree on a video codec from what each one's hardware can do. It builds on 0.5.0's
+GPU decoding and Opus audio. Its protocol is 6, so both PCs need 0.6.0; older peers receive a
+version mismatch message. See [CODECS.md](CODECS.md) for how codecs are chosen and the plans for
+H.265 and AV1. See [performance notes](PERFORMANCE.md) for measurements
 and remaining stutter risks.
 
 Peer-to-peer remote desktop for gaming, built on [iroh](https://iroh.computer). Click **Generate
@@ -15,8 +17,8 @@ each permission on or off at any time.
 
 | | |
 |---|---|
-| Works | Generate Account, connect by User-ID across networks, Allow / Deny with per-device permissions, "Always allow" list, desktop audio (Opus) with viewer mute, automatic hardware H.264 encoding and decoding with CPU fallback, host cursor in the viewer, a distinct viewer pointer on the host, remote mouse (normal or captured for games), keyboard by scancode, up to 4 gamepads as virtual Xbox controllers |
-| Not yet | Monitor selection, microphone sharing, GPU-only capture/conversion |
+| Works | Generate Account, connect by User-ID across networks, Allow / Deny with per-device permissions, "Always allow" list, desktop audio (Opus) with viewer mute, automatic hardware H.264 encoding and decoding with CPU fallback, a GPU-only capture → encode path on the host, codec negotiation, host cursor in the viewer, a distinct viewer pointer on the host, remote mouse (normal or captured for games), keyboard by scancode, up to 4 gamepads as virtual Xbox controllers |
+| Not yet | Monitor selection, microphone sharing, H.265 and AV1 (planned, see [CODECS.md](CODECS.md)) |
 | Platforms | Windows can host and connect. Linux can connect only |
 
 ## Download
@@ -67,9 +69,12 @@ The glass shelf on the left contains fullscreen, mouse capture, audio mute, stat
 disconnect controls. Collapse it with the arrow; shortcuts remain available while the mouse
 is captured. The shelf's clicks stay local.
 
-Windows hosts automatically try a Media Foundation hardware H.264 encoder and fall back to
+Windows hosts keep each captured frame on the graphics card: Direct3D 11's video processor
+converts it to NV12 there, and a Media Foundation hardware H.264 encoder reads it straight from
+the GPU. Where that isn't available, frames go through memory to the hardware encoder, and to
 parallel OpenH264 if initialization or encoding fails (or if Media Foundation is missing, as on
-Windows "N" editions). The viewer decodes on its graphics card through Vulkan Video where the
+Windows "N" editions). The two PCs pick the codec together, preferring one both graphics cards
+handle. The viewer decodes on its graphics card through Vulkan Video where the
 driver supports H.264 decoding (current NVIDIA, AMD and Intel drivers on Windows, and NVIDIA's
 driver or a recent Mesa on Linux), and on the processor with OpenH264 otherwise, or if Settings → Viewing →
 **Hardware video decoding** is off. The shelf shows the actual encoder and decoder, and the stats
@@ -145,12 +150,15 @@ connect host [--test-pattern[=WxH@FPS]] [--print-input]
                                     share this PC (Windows); Allow/Deny is asked on the terminal
 connect join <USER-ID> [--seconds N]
 connect id                          print this PC's User-ID
+connect gpu-check                   check the graphics hardware for sharing and viewing,
+                                    and save the report to connect-gpu-check.txt
 ```
 
 `--test-pattern` shares a generated image (1280×720 at 60 fps, or e.g. `--test-pattern=1920x1080@144`)
 and `--print-input` prints the remote input instead of acting on it, both for development. On Windows the app has no console window, so start these as
 `start /wait connect.exe id` for the terminal to wait for them. `CONNECT_CONFIG_DIR` selects a separate identity, e.g. to run two
-copies on one PC.
+copies on one PC. `CONNECT_GPU_PIPELINE=0` makes a host send frames through memory instead of
+keeping them on the graphics card, for comparison.
 
 ## Third-party components
 

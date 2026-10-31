@@ -76,8 +76,8 @@ fn decode_test(out: &mut dyn FnMut(String)) -> Result<()> {
     ensure!(decoded == stream.len(), "decoded {decoded} of {} frames", stream.len());
     ensure!(picture.len() == cpu.len(), "picture sizes differ");
     // Decoders must agree to the bit for H.264; allow a hair for rounding in the copy back.
-    let difference = picture.iter().zip(&cpu).map(|(a, b)| u64::from(a.abs_diff(*b))).sum::<u64>() as f64
-        / picture.len() as f64;
+    let difference =
+        picture.iter().zip(&cpu).map(|(a, b)| u64::from(a.abs_diff(*b))).sum::<u64>() as f64 / picture.len() as f64;
     out(format!(
         "Hardware H.264 decoding: {} on {}. {WIDTH}×{HEIGHT}: {} (including the copy back); difference from the \
          processor's picture {difference:.3}",

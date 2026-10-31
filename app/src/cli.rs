@@ -95,7 +95,11 @@ fn test_pattern(spec: &str) -> Result<VideoSource> {
     let parse = || -> Option<VideoSource> {
         let (size, fps) = spec.split_once('@')?;
         let (width, height) = size.split_once('x')?;
-        Some(VideoSource::TestPattern { width: width.parse().ok()?, height: height.parse().ok()?, fps: fps.parse().ok()? })
+        Some(VideoSource::TestPattern {
+            width: width.parse().ok()?,
+            height: height.parse().ok()?,
+            fps: fps.parse().ok()?,
+        })
     };
     parse().with_context(|| format!("expected WIDTHxHEIGHT@FPS, like 1920x1080@144, not {spec:?}"))
 }
@@ -194,12 +198,7 @@ pub fn gpu_check() -> Result<()> {
         println!("{line}");
         report.push(line);
     };
-    out(format!(
-        "Connect {} GPU check on {} ({})",
-        env!("CARGO_PKG_VERSION"),
-        std::env::consts::OS,
-        device_name()
-    ));
+    out(format!("Connect {} GPU check on {} ({})", env!("CARGO_PKG_VERSION"), std::env::consts::OS, device_name()));
     out("Testing for a few seconds; a video playing on the screen gives more realistic timings.".into());
     connect_client::diagnostics::run(&mut out);
     connect_host::diagnostics::run(&mut out);

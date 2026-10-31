@@ -43,9 +43,15 @@ const HELD_POLL: Duration = Duration::from_millis(2);
 
 pub(crate) enum VideoEvent {
     /// The encoded size; always the first event, and sent again whenever the screen resizes.
-    Format { width: u32, height: u32 },
+    Format {
+        width: u32,
+        height: u32,
+    },
     Frame(EncodedFrame),
-    Encoder { name: String, codec: Codec },
+    Encoder {
+        name: String,
+        codec: Codec,
+    },
 }
 
 /// True while the network is too backed up to take another frame.
@@ -511,12 +517,7 @@ fn capture(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openh264::{
-        OpenH264API,
-        decoder::Decoder,
-        encoder::Encoder,
-        formats::YUVSource as _,
-    };
+    use openh264::{OpenH264API, decoder::Decoder, encoder::Encoder, formats::YUVSource as _};
 
     fn moving_image(width: usize, height: usize, frame: usize) -> Picture {
         let mut pixels = vec![0; width * height * 4];
@@ -575,7 +576,8 @@ mod tests {
 
     #[test]
     fn tiny_frames_still_encode() {
-        let mut encoder = Encoder::with_api_config(OpenH264API::from_source(), software::config(20_000_000, 60)).unwrap();
+        let mut encoder =
+            Encoder::with_api_config(OpenH264API::from_source(), software::config(20_000_000, 60)).unwrap();
         let data = encoder.encode(&moving_image(16, 16, 0)).unwrap().to_vec();
         let mut decoder = Decoder::new().unwrap();
         assert_eq!(decoder.decode(&data).unwrap().unwrap().dimensions(), (16, 16));

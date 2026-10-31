@@ -47,9 +47,7 @@ pub(crate) fn open(codec: Codec, hardware: bool) -> Result<Box<dyn VideoDecoder>
 /// The processor's decoder for `codec`, where there is one.
 pub(crate) fn software(codec: Codec) -> Result<Box<dyn VideoDecoder>> {
     match codec {
-        Codec::H264 => Ok(Box::new(OpenH264(
-            openh264::decoder::Decoder::new().context("starting the H.264 decoder")?,
-        ))),
+        Codec::H264 => Ok(Box::new(OpenH264(openh264::decoder::Decoder::new().context("starting the H.264 decoder")?))),
         Codec::H265 | Codec::Av1 => bail!("no software {codec} decoder"),
     }
 }
@@ -137,7 +135,8 @@ impl VideoDecoder for OpenH264 {
             let (y, chroma) = buf.split_at_mut(w * h);
             let (u, v) = chroma.split_at_mut(cw * ch);
             let (ys, us, vs) = picture.strides();
-            for (dst, src, stride, width) in [(y, picture.y(), ys, w), (u, picture.u(), us, cw), (v, picture.v(), vs, cw)]
+            for (dst, src, stride, width) in
+                [(y, picture.y(), ys, w), (u, picture.u(), us, cw), (v, picture.v(), vs, cw)]
             {
                 for (row, line) in dst.chunks_exact_mut(width).enumerate() {
                     line.copy_from_slice(&src[row * stride..][..width]);

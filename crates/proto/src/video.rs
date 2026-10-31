@@ -444,7 +444,8 @@ mod tests {
     use super::*;
 
     fn frame(seq: u32, keyframe: bool, len: usize) -> (FrameMeta, Vec<u8>) {
-        let meta = FrameMeta { seq, keyframe, codec: Codec::H264, capture_time_us: 1_000 + seq as u64, encode_time_us: 7 };
+        let meta =
+            FrameMeta { seq, keyframe, codec: Codec::H264, capture_time_us: 1_000 + seq as u64, encode_time_us: 7 };
         (meta, (0..len).map(|i| (i * 7 + seq as usize) as u8).collect())
     }
 

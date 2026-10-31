@@ -651,7 +651,6 @@ mod mfplat {
     use anyhow::{Result, anyhow, ensure};
     use windows::{
         Win32::{
-
             Graphics::Direct3D11::ID3D11Texture2D,
             Media::MediaFoundation::{
                 IMFActivate, IMFDXGIDeviceManager, IMFMediaBuffer, IMFMediaType, IMFSample, MFT_REGISTER_TYPE_INFO,
@@ -771,7 +770,9 @@ mod mfplat {
 
     pub fn dxgi_surface_buffer(texture: &ID3D11Texture2D) -> Result<IMFMediaBuffer> {
         let api = api()?;
-        created(|out| unsafe { (api.dxgi_surface_buffer)(&ID3D11Texture2D::IID, texture.as_raw(), 0, false.into(), out) })
+        created(|out| unsafe {
+            (api.dxgi_surface_buffer)(&ID3D11Texture2D::IID, texture.as_raw(), 0, false.into(), out)
+        })
     }
 }
 

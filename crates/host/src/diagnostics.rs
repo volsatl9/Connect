@@ -122,8 +122,10 @@ mod windows {
             timestamp += 1_000_000 / u64::from(fps);
         }
         let quality = match &keyframe {
-            Some(data) => quality(data, &on_gpu.data()[..luma], w as usize)
-                .map_or_else(|e| format!("but its first keyframe didn't decode ({e:#})"), |db| format!("quality {db:.1} dB")),
+            Some(data) => quality(data, &on_gpu.data()[..luma], w as usize).map_or_else(
+                |e| format!("but its first keyframe didn't decode ({e:#})"),
+                |db| format!("quality {db:.1} dB"),
+            ),
             None => "but no keyframe came out".into(),
         };
         out(format!(

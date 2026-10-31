@@ -12,14 +12,14 @@ use windows::{
         Direct3D11::{
             D3D11_BIND_RENDER_TARGET, D3D11_CPU_ACCESS_READ, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE,
             D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING,
-            D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE, D3D11_VIDEO_PROCESSOR_COLOR_SPACE, D3D11_VIDEO_PROCESSOR_CONTENT_DESC,
-            D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT, D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT,
-            D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0,
-            D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0,
-            D3D11_VIDEO_PROCESSOR_STREAM, D3D11_VIDEO_USAGE_OPTIMAL_SPEED, D3D11_VPIV_DIMENSION_TEXTURE2D,
-            D3D11_VPOV_DIMENSION_TEXTURE2D, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, ID3D11VideoContext,
-            ID3D11VideoContext1, ID3D11VideoDevice, ID3D11VideoProcessor, ID3D11VideoProcessorEnumerator,
-            ID3D11VideoProcessorInputView, ID3D11VideoProcessorOutputView,
+            D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE, D3D11_VIDEO_PROCESSOR_COLOR_SPACE,
+            D3D11_VIDEO_PROCESSOR_CONTENT_DESC, D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT,
+            D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC,
+            D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC,
+            D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0, D3D11_VIDEO_PROCESSOR_STREAM, D3D11_VIDEO_USAGE_OPTIMAL_SPEED,
+            D3D11_VPIV_DIMENSION_TEXTURE2D, D3D11_VPOV_DIMENSION_TEXTURE2D, ID3D11Device, ID3D11DeviceContext,
+            ID3D11Texture2D, ID3D11VideoContext, ID3D11VideoContext1, ID3D11VideoDevice, ID3D11VideoProcessor,
+            ID3D11VideoProcessorEnumerator, ID3D11VideoProcessorInputView, ID3D11VideoProcessorOutputView,
         },
         Dxgi::Common::{
             DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P601,
@@ -51,7 +51,10 @@ pub(crate) struct Nv12Converter {
 impl Nv12Converter {
     /// A converter from `width`×`height` BGRA captures on `device`.
     pub fn new(device: &ID3D11Device, width: u32, height: u32) -> Result<Self> {
-        ensure!(width > 0 && height > 0 && width.is_multiple_of(2) && height.is_multiple_of(2), "NV12 needs even dimensions");
+        ensure!(
+            width > 0 && height > 0 && width.is_multiple_of(2) && height.is_multiple_of(2),
+            "NV12 needs even dimensions"
+        );
         unsafe {
             let video: ID3D11VideoDevice = device.cast().context("the Direct3D device has no video support")?;
             let context = device.GetImmediateContext()?;
@@ -88,12 +91,15 @@ impl Nv12Converter {
                 context1.VideoProcessorSetOutputColorSpace1(&processor, DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P601);
             } else {
                 // Usage 0, RGB full range, BT.601 matrix, YCbCr nominal range 16–235 (bits 4–5 = 1).
-                video_context.VideoProcessorSetStreamColorSpace(&processor, 0, &D3D11_VIDEO_PROCESSOR_COLOR_SPACE {
-                    _bitfield: 0,
-                });
-                video_context.VideoProcessorSetOutputColorSpace(&processor, &D3D11_VIDEO_PROCESSOR_COLOR_SPACE {
-                    _bitfield: 1 << 4,
-                });
+                video_context.VideoProcessorSetStreamColorSpace(
+                    &processor,
+                    0,
+                    &D3D11_VIDEO_PROCESSOR_COLOR_SPACE { _bitfield: 0 },
+                );
+                video_context.VideoProcessorSetOutputColorSpace(
+                    &processor,
+                    &D3D11_VIDEO_PROCESSOR_COLOR_SPACE { _bitfield: 1 << 4 },
+                );
             }
 
             let desc = D3D11_TEXTURE2D_DESC {

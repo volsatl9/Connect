@@ -76,9 +76,7 @@ impl CodecSupport {
 /// struggling at high frame rates costs more than a less efficient codec. Among equals, the
 /// more efficient codec wins.
 pub fn choose(encoders: &[CodecSupport], decoders: &[CodecSupport], excluded: &[Codec]) -> Option<Codec> {
-    let best = |list: &[CodecSupport], codec| {
-        list.iter().filter(|s| s.codec == codec).map(|s| s.hardware).max()
-    };
+    let best = |list: &[CodecSupport], codec| list.iter().filter(|s| s.codec == codec).map(|s| s.hardware).max();
     Codec::BY_EFFICIENCY
         .into_iter()
         .filter(|codec| !excluded.contains(codec))

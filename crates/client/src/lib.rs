@@ -777,7 +777,13 @@ mod media_tests {
             .unwrap();
             let image = YUVBuffer::new(16, 16);
             let encoded = encoder.encode(&image).unwrap().to_vec();
-            let meta = FrameMeta { seq: 0, keyframe: true, codec: Codec::H264, capture_time_us: now_micros(), encode_time_us: 0 };
+            let meta = FrameMeta {
+                seq: 0,
+                keyframe: true,
+                codec: Codec::H264,
+                capture_time_us: now_micros(),
+                encode_time_us: 0,
+            };
             for chunk in video::packetize(meta, &encoded, 1200, 0).unwrap() {
                 conn.send_datagram(chunk).unwrap();
             }

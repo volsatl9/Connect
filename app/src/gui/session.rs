@@ -22,6 +22,10 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     let (host_name, permissions) = (host_name.clone(), *permissions);
     let area = ui.max_rect();
     let frame = client.handle.take_frame();
+    // A frame held back for smooth pacing: look again when it's due.
+    if let Some(due) = client.handle.next_frame_due() {
+        ctx.request_repaint_after(due);
+    }
     let image_size =
         frame.as_ref().map(|f| egui::vec2(f.width as f32, f.height as f32)).or_else(|| client.video.size());
     let video_rect = image_size.map_or(area, |size| fit(size, area));

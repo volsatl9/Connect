@@ -38,6 +38,18 @@ const GOP_FRAMES: u64 = 600;
 /// How long to wait between looks at a hardware encoder that isn't ready yet: short, as a
 /// frame takes only a few milliseconds and every one waited past adds to the delay.
 const WAIT_STEP: Duration = Duration::from_micros(200);
+/// For this long into a wait, only yield instead of sleeping: a sleep can overshoot by half a
+/// millisecond on Windows, as long as a whole encode at 1080p.
+const SPIN: Duration = Duration::from_millis(3);
+
+/// Waits a moment before looking at the encoder again, `since` the wait began.
+fn pause(since: Instant) {
+    if since.elapsed() < SPIN {
+        std::thread::yield_now();
+    } else {
+        std::thread::sleep(WAIT_STEP);
+    }
+}
 
 pub(crate) struct HardwareFrame {
     pub data: Vec<u8>,
@@ -302,12 +314,13 @@ impl HardwareEncoder {
         let timestamp = i64::try_from(capture_time_us.checked_mul(10).context("capture timestamp overflow")?)?;
         ensure!(self.last_timestamp.is_none_or(|last| timestamp > last), "capture timestamps must increase");
         let timeout = if self.frames == 0 { START_TIMEOUT } else { FRAME_TIMEOUT };
-        let deadline = Instant::now() + timeout;
+        let waiting = Instant::now();
+        let deadline = waiting + timeout;
         while self.events.is_some() && self.input_credit == 0 {
             self.poll_events()?;
             ensure!(Instant::now() < deadline, "hardware encoder timed out requesting input");
             if self.input_credit == 0 {
-                std::thread::sleep(WAIT_STEP);
+                pause(waiting);
             }
         }
         let keyframe_requested = force_keyframe || self.frames.is_multiple_of(GOP_FRAMES);
@@ -341,7 +354,7 @@ impl HardwareEncoder {
                 return Ok(vec![HardwareFrame { data, keyframe, capture_time_us: (output_time / 10) as u64 }]);
             }
             ensure!(Instant::now() < deadline, "hardware encoder timed out producing a frame (one frame in flight)");
-            std::thread::sleep(WAIT_STEP);
+            pause(waiting);
         }
     }
 

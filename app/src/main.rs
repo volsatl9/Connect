@@ -131,5 +131,25 @@ pub(crate) fn stats_line(s: &Stats) -> String {
             ms(l.render),
         );
     }
+    let gpu = |load: Option<connect_client::GpuLoad>| {
+        load.map(|g| {
+            let mut text = format!("{}% graphics", g.graphics);
+            if let Some(encode) = g.encode {
+                text += &format!(", {encode}% encoder");
+            }
+            if let Some(decode) = g.decode {
+                text += &format!(", {decode}% decoder");
+            }
+            text
+        })
+    };
+    if s.host_gpu.is_some() || s.gpu.is_some() {
+        let unknown = || "–".to_owned();
+        text += &format!(
+            "\nGPU load: host {} · here {}",
+            gpu(s.host_gpu).unwrap_or_else(unknown),
+            gpu(s.gpu).unwrap_or_else(unknown)
+        );
+    }
     text
 }

@@ -617,6 +617,21 @@ pub fn settings(app: &mut App, ui: &mut Ui) {
              high resolutions and frame rates. Connect uses the processor instead where the card can't. Turn this \
              off if the picture shows glitches. Applies from the next connection.",
         ));
+        ui.add_space(8.0);
+        ui.label(RichText::new("Frame pacing").font(theme::medium(14.0)));
+        ui.label(theme::caption(
+            "Lowest latency shows each frame the moment it arrives. Smooth evens out motion when frames arrive \
+             unevenly, by showing them a steady few milliseconds later. Takes effect at once.",
+        ));
+        ui.add_space(4.0);
+        ui.horizontal_wrapped(|ui| {
+            for (smooth, label) in [(false, "Lowest latency"), (true, "Smooth")] {
+                if theme::chip(ui, None, label, app.settings.smooth_pacing == smooth).clicked() {
+                    app.settings.smooth_pacing = smooth;
+                    connect_client::set_smooth_pacing(smooth);
+                }
+            }
+        });
     });
     ui.add_space(gap);
 

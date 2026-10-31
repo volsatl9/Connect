@@ -922,6 +922,7 @@ name = "connect-client"
 version = "0.6.0"
 dependencies = [
  "anyhow",
+ "connect-gpu-load",
  "connect-net",
  "connect-proto",
  "cpal",
@@ -934,12 +935,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "connect-gpu-load"
+version = "0.6.0"
+dependencies = [
+ "serde",
+ "windows",
+]
+
+[[package]]
 name = "connect-host"
 version = "0.6.0"
 dependencies = [
  "anyhow",
  "bytes",
  "connect-client",
+ "connect-gpu-load",
  "connect-net",
  "connect-proto",
  "cpal",
@@ -973,6 +983,7 @@ version = "0.6.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "connect-gpu-load",
  "postcard",
  "reed-solomon-simd",
  "serde",

@@ -178,8 +178,11 @@ fn decode(
         painted: None,
     };
     let frame = VideoFrame { width: w as u32, height: h as u32, yuv: buf, meta: frame.meta, timing };
-    // A frame the GUI never got to is simply replaced; its buffer is reused.
-    if let Some(unseen) = lock(&shared.frame).replace(frame) {
+    // Frames the GUI never got to are simply replaced; their buffers are reused.
+    let offset = c.clock_offset_us.load(Ordering::Relaxed);
+    let smooth = crate::SMOOTH_PACING.load(Ordering::Relaxed);
+    let replaced = lock(&shared.frame).push(frame, (offset != i64::MIN).then_some(offset), smooth);
+    for unseen in replaced {
         c.frames_superseded.fetch_add(1, Ordering::Relaxed);
         crate::recycle(shared, unseen.yuv);
     }

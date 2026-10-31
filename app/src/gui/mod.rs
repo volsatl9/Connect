@@ -269,6 +269,7 @@ enum ClientState {
 impl App {
     fn new(ctx: &egui::Context, endpoint: Endpoint, settings: Settings, restart: Restart) -> Self {
         connect_client::set_hardware_decoding(settings.hardware_decoding);
+        connect_client::set_smooth_pacing(settings.smooth_pacing);
         let online = Arc::new(AtomicBool::new(false));
         tokio::spawn({
             let (endpoint, online, ctx) = (endpoint.clone(), online.clone(), ctx.clone());

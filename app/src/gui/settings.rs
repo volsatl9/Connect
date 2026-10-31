@@ -30,6 +30,8 @@ pub struct Settings {
     pub sidebar_collapsed: bool,
     /// Decode video on the graphics card where it can, rather than the processor.
     pub hardware_decoding: bool,
+    /// Show frames evenly paced rather than as soon as they arrive.
+    pub smooth_pacing: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -63,6 +65,7 @@ impl Default for Settings {
             computers: Vec::new(),
             sidebar_collapsed: false,
             hardware_decoding: true,
+            smooth_pacing: false,
         }
     }
 }

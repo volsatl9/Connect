@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/proto", "crates/net", "crates/host", "crates/client", "app"]
+members = ["crates/proto", "crates/net", "crates/host", "crates/client", "crates/gpu-load", "app"]
 
 [workspace.package]
 version = "0.6.0"
@@ -12,6 +12,7 @@ connect-proto = { path = "crates/proto" }
 connect-net = { path = "crates/net" }
 connect-host = { path = "crates/host" }
 connect-client = { path = "crates/client" }
+connect-gpu-load = { path = "crates/gpu-load" }
 
 anyhow = "1"
 bytes = "1"

@@ -289,9 +289,10 @@ pub(crate) struct TimerCheck {
 #[cfg_attr(not(windows), allow(dead_code))]
 impl TimerCheck {
     pub const GIVE_UP_AFTER: u32 = 32;
-    /// Shorter than this can't be a 1080p conversion on a graphics card; it's timestamps that
-    /// missed the work.
-    pub const MIN_US: u64 = 5;
+    /// Shorter than this can't be a whole-screen conversion on a graphics card (the shaders take
+    /// tens of µs at 1080p); it's timestamps that missed the work, as NVIDIA's video processor
+    /// gives (under 1 µs).
+    pub const MIN_US: u64 = 2;
 
     /// `ticks` is end minus start, at `frequency` ticks a second.
     pub fn check(&mut self, ticks: u64, frequency: u64) -> TimerVerdict {
@@ -369,6 +370,7 @@ mod tests {
         // A timer that works but now and then reads 0 keeps going, minus those readings.
         let mut check = TimerCheck::default();
         assert_eq!(check.check(250_000, GHZ), TimerVerdict::Keep);
+        assert_eq!(check.check(3_000, GHZ), TimerVerdict::Keep, "a small screen's quick conversion is real");
         for _ in 0..100 {
             assert_eq!(check.check(0, GHZ), TimerVerdict::Skip);
         }

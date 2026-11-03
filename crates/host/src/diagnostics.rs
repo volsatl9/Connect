@@ -24,7 +24,7 @@ mod windows {
     use crate::{
         capture::{Capturer, dxgi::DxgiCapturer},
         encode::{Input, VideoEncoder, mf},
-        gpu::Nv12Converter,
+        gpu::{ConvertMethod, Nv12Converter},
         yuv::{Layout, Picture},
     };
 
@@ -81,31 +81,50 @@ mod windows {
         out(format!("Screen: {w}×{h} at {fps} Hz"));
         let device = capturer.device().clone();
 
-        // Colour conversion on the GPU, against the processor's conversion of the same image.
-        let mut converter = Nv12Converter::new(&device, w, h).context("GPU colour conversion (video processor)")?;
-        converter.convert(capturer.latest(), None)?;
-        let on_gpu = converter.read_back()?;
+        // Colour conversion on the GPU, both ways, against the processor's conversion of the same
+        // image, and timed on the GPU.
         let frame = capturer.read_latest()?.context("no image to compare")?;
         let mut on_cpu = Picture::new(Layout::Nv12, w as usize, h as usize);
         let convert_started = Instant::now();
         on_cpu.convert_from_bgra(frame.bgra, frame.stride);
         let cpu_convert = convert_started.elapsed();
         let luma = (w * h) as usize;
-        let (y_mean, y_max) = difference(&on_gpu.data()[..luma], &on_cpu.data()[..luma]);
-        let (c_mean, c_max) = difference(&on_gpu.data()[luma..], &on_cpu.data()[luma..]);
-        let matches = y_mean < 1.5 && c_mean < 1.5 && y_max <= 16 && c_max <= 16;
-        out(format!(
-            "GPU colour conversion: {} (difference from the processor's: brightness {y_mean:.2} on average, at most \
-             {y_max}; colour {c_mean:.2}, at most {c_max})",
-            if matches { "OK" } else { "MISMATCH" }
-        ));
+        for method in [ConvertMethod::Shaders, ConvertMethod::VideoProcessor] {
+            let line = Nv12Converter::with_method(&device, w, h, method).and_then(|mut converter| {
+                converter.convert(capturer.latest(), None)?;
+                let on_gpu = converter.read_back()?;
+                let (y_mean, y_max) = difference(&on_gpu.data()[..luma], &on_cpu.data()[..luma]);
+                let (c_mean, c_max) = difference(&on_gpu.data()[luma..], &on_cpu.data()[luma..]);
+                let verdict = match (y_max, c_max) {
+                    (0, 0) => "OK, identical to the processor's".to_owned(),
+                    _ if y_mean < 1.5 && c_mean < 1.5 && y_max <= 16 && c_max <= 16 => format!(
+                        "OK (difference from the processor's: brightness {y_mean:.2} on average, at most {y_max}; \
+                         colour {c_mean:.2}, at most {c_max})"
+                    ),
+                    _ => format!(
+                        "MISMATCH (brightness {y_mean:.2} on average, at most {y_max}; colour {c_mean:.2}, at most {c_max})"
+                    ),
+                };
+                Ok(format!("{verdict}; {}", gpu_time(&mut converter, capturer.latest())))
+            });
+            match line {
+                Ok(line) => out(format!("GPU colour conversion ({method}): {line}")),
+                Err(error) => out(format!("GPU colour conversion ({method}): unavailable: {error:#}")),
+            }
+        }
+        let mut converter = Nv12Converter::new(&device, w, h).context("GPU colour conversion")?;
+        out(format!("GPU colour conversion in sessions: {}", converter.method()));
+        converter.convert(capturer.latest(), None)?;
+        let on_gpu = converter.read_back()?;
 
         // The encoder reading the converted textures directly, on live frames for a few seconds.
         let mut encoder = mf::HardwareEncoder::new(Codec::H264, w, h, BITRATE, fps, Some(&device))
             .context("hardware H.264 encoder reading textures")?;
         out(format!("GPU encoder: {}, reading textures directly", encoder.name()));
-        let mut keyframe = None;
+        out(format!("  Burst controls: {}", burst(encoder.burst())));
+        let mut first_keyframe = None;
         let (mut times, mut fresh, mut timestamp) = (Vec::new(), 0, 0u64);
+        let (mut sizes, mut keyframe_sizes) = (Vec::new(), Vec::new());
         let run_started = Instant::now();
         while run_started.elapsed() < RUN {
             if let Some(size) = capturer.next_texture(Duration::from_millis(4))?
@@ -115,14 +134,19 @@ mod windows {
                 fresh += 1;
             }
             let encode_started = Instant::now();
-            let encoded = encoder.encode(Input::Texture(converter.texture()), timestamp, timestamp == 0)?;
+            // A keyframe every second of video, to see how big the cap lets them get.
+            let keyframe = times.len().is_multiple_of(fps as usize);
+            let encoded = encoder.encode(Input::Texture(converter.texture()), timestamp, keyframe)?;
             times.push(encode_started.elapsed());
-            if keyframe.is_none() {
-                keyframe = encoded.into_iter().find(|frame| frame.keyframe).map(|frame| frame.data);
+            for frame in &encoded {
+                if frame.keyframe { keyframe_sizes.push(frame.data.len()) } else { sizes.push(frame.data.len()) }
+            }
+            if first_keyframe.is_none() {
+                first_keyframe = encoded.into_iter().find(|frame| frame.keyframe).map(|frame| frame.data);
             }
             timestamp += 1_000_000 / u64::from(fps);
         }
-        let quality = match &keyframe {
+        let quality = match &first_keyframe {
             Some(data) => quality(data, &on_gpu.data()[..luma], w as usize).map_or_else(
                 |e| format!("but its first keyframe didn't decode ({e:#})"),
                 |db| format!("quality {db:.1} dB"),
@@ -134,6 +158,17 @@ mod windows {
             times.len(),
             RUN.as_secs(),
             timing(&times),
+        ));
+        let kb = |bytes: usize| format!("{:.1} KB", bytes as f64 / 1000.0);
+        let largest = |sizes: &[usize]| sizes.iter().copied().max().map_or("–".into(), kb);
+        out(format!(
+            "  Frame sizes at {} Mb/s: average frame {} (target {}), largest {}; keyframes up to {}{}",
+            BITRATE / 1_000_000,
+            kb(sizes.iter().sum::<usize>() / sizes.len().max(1)),
+            kb((BITRATE / 8 / fps) as usize),
+            largest(&sizes),
+            largest(&keyframe_sizes),
+            encoder.burst().buffer_bytes.map_or(String::new(), |cap| format!(" (cap {})", kb(cap as usize))),
         ));
 
         // The memory path, as 0.5.0 always did it, for comparison.
@@ -156,6 +191,7 @@ mod windows {
         // encoder can still refuse what a stream needs, and then the stream falls back to H.264.
         let h265 = |device: Option<&ID3D11Device>, fps: u32| -> Result<String> {
             let mut encoder = mf::HardwareEncoder::new(Codec::H265, w, h, BITRATE, fps, device)?;
+            let controls = burst(encoder.burst());
             let (mut times, mut frames) = (Vec::new(), 0);
             for frame in 0..60u64 {
                 let input =
@@ -164,7 +200,7 @@ mod windows {
                 frames += encoder.encode(input, frame * 1_000_000 / u64::from(fps), frame == 0)?.len();
                 times.push(encode_started.elapsed());
             }
-            Ok(format!("{}, encode {}, {frames} frames out of 60", encoder.name(), timing(&times)))
+            Ok(format!("{}, encode {}, {frames} frames out of 60; {controls}", encoder.name(), timing(&times)))
         };
         for (how, device) in [("reading textures", Some(&device)), ("reading memory", None)] {
             match h265(device, fps) {
@@ -179,6 +215,51 @@ mod windows {
             }
         }
         Ok(())
+    }
+
+    /// The conversion's run time on the GPU over 60 conversions, from timestamp queries.
+    fn gpu_time(
+        converter: &mut Nv12Converter,
+        image: &windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
+    ) -> String {
+        let mut times = Vec::new();
+        for tag in 0..60 {
+            if converter.convert(image, Some(tag)).is_err() {
+                break;
+            }
+            converter.flush();
+            std::thread::sleep(Duration::from_millis(2));
+            converter.poll_timings(|_, us| times.push(us));
+        }
+        let waited = Instant::now();
+        while times.len() < 50 && waited.elapsed() < Duration::from_millis(300) {
+            converter.flush();
+            std::thread::sleep(Duration::from_millis(5));
+            converter.poll_timings(|_, us| times.push(us));
+        }
+        if times.is_empty() {
+            return "GPU time not measurable with this driver".into();
+        }
+        times.sort_unstable();
+        format!(
+            "{:.3} ms on the GPU (median of {}, slowest {:.3})",
+            f64::from(times[times.len() / 2]) / 1000.0,
+            times.len(),
+            f64::from(times[times.len() - 1]) / 1000.0
+        )
+    }
+
+    /// The burst controls as the report shows them.
+    fn burst(controls: mf::BurstControls) -> String {
+        let refresh = controls
+            .intra_refresh_frames
+            .map_or("intra refresh not offered (keyframes every 30 s instead)".to_owned(), |frames| {
+                format!("intra refresh over {frames} frames")
+            });
+        let cap = controls.buffer_bytes.map_or("no frame-size cap".to_owned(), |bytes| {
+            format!("frame-size cap {:.1} KB ({} frames)", bytes as f64 / 1000.0, controls.buffer_frames.unwrap_or(0))
+        });
+        format!("{refresh}, {cap}")
     }
 
     /// Mean and largest absolute difference between two planes.

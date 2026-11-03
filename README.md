@@ -1,5 +1,11 @@
 # Connect
 
+Version 0.9.0 keeps frames even. Hosts no longer send a full keyframe every 600 frames; where the
+graphics card's encoder offers it, the picture is renewed a band at a time (intra refresh). The
+encoder's buffer is capped at about two frames, so no single frame becomes a burst. The host's
+colour conversion now runs as two small shaders, whose GPU time shows in the stats. It works with
+0.8 viewers (protocol 8).
+
 Version 0.8.0 measures. Every frame is traced from the host's screen to the viewer's window,
 and every input event from the viewer to the host. The stats overlay (Ctrl+Alt+S) shows
 p50/p95/p99 latency, frame-time spread, dropped and repeated frames, and each PC's CPU and

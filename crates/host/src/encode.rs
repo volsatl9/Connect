@@ -36,8 +36,12 @@ use crate::{
 /// Used when the capture source can't tell its refresh rate. Capture only yields a frame when
 /// the screen changes, so the stream runs at whatever rate the host's monitor and content do.
 const DEFAULT_FPS: u32 = 144;
-/// A keyframe at least this often, in case a keyframe request is lost along with the video.
+/// OpenH264's own keyframe interval, in frames.
 const INTRA_PERIOD_FRAMES: u32 = 600;
+/// Without intra refresh, a keyframe at least this often, in case the picture went wrong in a
+/// way the viewer couldn't notice. Not by frame count: at 240 fps, 600 frames was a keyframe
+/// burst every 2.5 s. With intra refresh, keyframes only go out when the viewer asks.
+const KEYFRAME_PERIOD: Duration = Duration::from_secs(30);
 /// How long one capture wait may block, so a stop request is noticed promptly.
 const POLL: Duration = Duration::from_millis(100);
 /// How soon to look again while a captured picture waits for the network to catch up.
@@ -194,6 +198,12 @@ pub(crate) trait VideoEncoder {
     /// Changes the target bitrate for the frames that follow, where the encoder allows it.
     fn set_bitrate(&mut self, from: u32, to: u32);
 
+    /// Whether the encoder renews the picture band by band (intra refresh), so it never needs a
+    /// keyframe unless the viewer asks for one.
+    fn intra_refresh(&self) -> bool {
+        false
+    }
+
     fn encode(&mut self, input: Input<'_>, capture_time_us: u64, force_keyframe: bool) -> Result<Vec<Encoded>>;
 }
 
@@ -293,6 +303,7 @@ fn open_gpu_path(
     fps: u32,
 ) -> Result<(Stage, Box<dyn VideoEncoder>)> {
     let converter = crate::gpu::Nv12Converter::new(device, width, height).context("GPU colour conversion")?;
+    tracing::info!(method = %converter.method(), "GPU colour conversion");
     let encoder = or_h264(codec, |codec| mf::HardwareEncoder::new(codec, width, height, bitrate, fps, Some(device)))
         .context("GPU encoder taking textures")?;
     Ok((Stage::Gpu(converter), Box::new(encoder)))
@@ -345,6 +356,7 @@ fn run(
     // game presenting faster than that would spend bitrate on pictures the viewer never shows.
     let frame_interval = Duration::from_secs(1) * 19 / (20 * fps);
     let mut last_sent: Option<Instant> = None;
+    let mut last_keyframe = Instant::now();
     let mut seq = 0u32;
     let clock_start = now_micros();
     let stream_start = Instant::now();
@@ -434,8 +446,10 @@ fn run(
             active.encoder.set_bitrate(bitrate, wanted);
             bitrate = wanted;
         }
+        // The periodic keyframe never jumps the queue as a requested one does.
+        let periodic = !active.encoder.intra_refresh() && last_keyframe.elapsed() >= KEYFRAME_PERIOD;
         let started = Instant::now();
-        let encoded = match active.encoder.encode(active.stage.input(), capture_time_us, force_keyframe) {
+        let encoded = match active.encoder.encode(active.stage.input(), capture_time_us, force_keyframe || periodic) {
             Ok(encoded) => encoded,
             Err(error) if active.encoder.codec() != Codec::H264 => {
                 // A codec only the graphics card does: H.264 instead, on the graphics card if it
@@ -467,6 +481,9 @@ fn run(
             Err(error) => return Err(error.context("encoding frame")),
         };
         let encoded_at = Instant::now();
+        if encoded.iter().any(|picture| picture.keyframe) {
+            last_keyframe = encoded_at;
+        }
         let encode_time_us = micros(encoded_at.duration_since(started));
         let stamp = FrameStamp {
             capture: picture_index,

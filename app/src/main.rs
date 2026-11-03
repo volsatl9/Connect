@@ -22,6 +22,11 @@
 //! `CONNECT_RENDERER=separate` to keep the window off the video decoder's graphics device.
 //! `CONNECT_TRACE=DIR` (or `--trace DIR`) writes each session's performance trace there as CSV;
 //! `CONNECT_TRACE=0` turns tracing off. See METRICS.md.
+//!
+//! Hosting, for comparisons: `CONNECT_GPU_CONVERT=video-processor` converts colours with the
+//! driver's video processor instead of Connect's shaders; `CONNECT_INTRA_REFRESH=0` goes back to
+//! periodic keyframes; `CONNECT_FRAME_BUFFER=<frames>` changes the encoder's buffer cap (0: the
+//! driver's default).
 
 // No console window behind the app. Debug builds keep theirs, for the logs.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
@@ -122,7 +127,11 @@ pub(crate) fn stats_line(s: &Stats) -> String {
     let ms = |us: i64| format!("{:.1}", us as f64 / 1000.0);
     let p50 = |p: Option<connect_client::Percentiles>| p.map_or("–".into(), |p| ms(p.p50));
     if let Some(f) = &s.frames {
-        text += &format!(" · last second: dropped {}, repeated ~{}", s.dropped, f.repeated);
+        text += &format!(" · last second: dropped {}, repeated ~{}, keyframes {}", s.dropped, f.repeated, f.keyframes);
+        if let Some(bytes) = f.frame_bytes {
+            let kb = |b: i64| format!("{:.0}", b as f64 / 1000.0);
+            text += &format!(" · frame size p50 {} / p99 {} KB", kb(bytes.p50), kb(bytes.p99));
+        }
         if let (Some(time), Some(interval)) = (f.frame_time, f.frame_interval) {
             text += &format!(" · frame time {:.1} ± {:.1} ms (p99 {})", time.mean, time.stddev, ms(interval.p99));
         }

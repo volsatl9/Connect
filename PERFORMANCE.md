@@ -101,6 +101,39 @@ by 2 ms (`cargo test -p connect-host --release --test lossy_path -- --ignored --
 Windows "N" editions ship without Media Foundation; 0.3.0 linked to it, so Connect wouldn't
 start there. It is now loaded when first needed, and hosting falls back to OpenH264 without it.
 
+## Version 0.9.0: even frames
+
+The 0.8 traces from the RTX 5060 host showed the host itself steady: capture to send took 2.6 ms
+(p50) and 4.5 ms (p99). The uneven frames came from bursts:
+
+- **A full keyframe every 600 frames.** That was every 2.5–5 s at 120–240 fps: 47 of the 50
+  keyframes in a 256 s session. Each was up to 690 KB, taking tens of milliseconds to arrive
+  (reassembly p99 14 ms, max 70 ms).
+- **No cap on frame size,** so any keyframe or scene cut could be many times the average frame.
+
+What changed:
+
+- **Intra refresh** (`CODECAPI_AVEncVideoGradualIntraRefresh`), where the encoder takes it. Each
+  frame recodes a band of the picture, renewing all of it every half second. Keyframes go out
+  only when the viewer asks, after a loss. Encoders without it send one every 30 s instead of
+  every 600 frames.
+- **Frame-size cap:** the encoder's buffer (`CODECAPI_AVEncCommonBufferSize`) is two frames at
+  the starting bitrate, set once per encoder (changing it mid-stream could make a driver restart
+  with a keyframe). Keyframes requested after a loss are capped too, so recovery is quick.
+- **Shader colour conversion:** BGRA→NV12 is two pixel shaders writing the NV12 texture's planes
+  directly. It replaces Direct3D 11's video processor, which remains the fallback.
+  - It is bit-identical to the processor path; a test checks this against the CPU conversion.
+  - Unlike the video processor on NVIDIA, its GPU time can be measured, so *GPU convert* in the
+    stats has real figures.
+- **Settings check:** `connect gpu-check` reports both conversions (identical or not, and GPU
+  time), what the encoder accepted (intra refresh, cap), and how large frames and keyframes come
+  out against the cap.
+
+Environment switches, for comparisons:
+- `CONNECT_GPU_CONVERT=video-processor`
+- `CONNECT_INTRA_REFRESH=0`
+- `CONNECT_FRAME_BUFFER=<frames>` (0 is the driver's default)
+
 ## Reading the stats (Ctrl+Alt+S)
 
 Since 0.8.0 the figures come from the performance trace. [METRICS.md](METRICS.md) defines each

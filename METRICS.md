@@ -62,7 +62,7 @@ capture, encode, and sent after. Only the host's own trace records the rest.
 |---|---|---|
 | present→capture | Windows putting the image on screen (DXGI `LastPresentTime`) → capture acquiring it | 0/empty when Windows doesn't report it (e.g. no new present, only a pointer move) and with the test pattern. |
 | capture | Image acquired → staged for the encoder | CPU time: the copy out of the duplication surface and *submitting* the colour conversion. GPU work still pending isn't included; see GPU convert. |
-| GPU convert | The BGRA→NV12 conversion's run time on the graphics card | D3D11 timestamp queries around the conversion's draws, read back a frame or two later without waiting. Only on the GPU-only path. Up to four in flight. A conversion whose slot is still busy goes untimed, as does one where the GPU clock changed frequency (disjoint). Joined to frames by `capture_index`. Since 0.9 the conversion is two pixel shaders, which timestamps time on every driver. **The video-processor fallback can't always be timed.** Some drivers run the video processor outside the command stream that timestamps mark, so start and end land almost together. On an RTX 5060 (driver 621.01), every conversion read 0 µs. Readings under 2 µs can't be a real conversion and are dropped. A timer that gives nothing else in its first 32 readings is switched off for the stream, and the stage shows "–". The conversion's cost then lands in *encode*, which waits for it. |
+| GPU convert (µs in the overlay) | The BGRA→NV12 conversion's run time on the graphics card | D3D11 timestamp queries around the conversion's draws, read back a frame or two later without waiting. Only on the GPU-only path. Up to four in flight. A conversion whose slot is still busy goes untimed, as does one where the GPU clock changed frequency (disjoint). Joined to frames by `capture_index`. Since 0.9 the conversion is two pixel shaders, which timestamps time on every driver. **The video-processor fallback can't always be timed.** Some drivers run the video processor outside the command stream that timestamps mark, so start and end land almost together. On an RTX 5060 (driver 621.01), every conversion read 0 µs. Readings under 2 µs can't be a real conversion and are dropped. A timer that gives nothing else in its first 32 readings is switched off for the stream, and the stage shows "–". The conversion's cost then lands in *encode*, which waits for it. |
 | held | Staged → the encoder starting on it | Waiting for the network backlog to clear, or for the frame's slot at the screen's refresh rate. Re-sent pictures (a requested keyframe of an unchanged screen) record 0 and are left out of percentiles. |
 | encode | The encoder call | Includes waiting for the GPU conversion to finish, as the hardware encoder reads its result, and the encoder's own synchronous wait. |
 | queue | Encoder done → the session task picking the frame up | The 2-frame channel to the network task, and the task being scheduled. |
@@ -90,9 +90,9 @@ The viewer's clock, except for the estimates.
 | Figure | Meaning | Limits |
 |---|---|---|
 | fps | Frames decoded per second | |
-| lost | Frames never completed: more chunks lost than recovery covered, or too late | Running total. Each one costs a keyframe request. |
+| lost | Frames that never came together on the way: chunks missing beyond what recovery covered (or late past the wait), or none of their datagrams arrived | Running total. Each loss costs a keyframe request. Before 0.9.1 this also counted, a second time, the frames skipped while waiting for that keyframe, so one lost frame could read as five. `viewer-*-loss.csv` says why each one went, and whether its datagrams turned up later. |
 | repaired | Frames rebuilt from recovery chunks | Running total. |
-| skipped | Complete frames thrown away because one they depended on was lost | Running total. |
+| skipped | Frames thrown away here, not lost: they built on a lost frame (so video waited for the next keyframe), or the decoder was too far behind | Running total. Before 0.9.1, frames the decoder's full queue turned away weren't counted at all. |
 | superseded | Decoded, then replaced by a newer frame before being drawn | Running total in the first line, per window in `dropped`. Normal when the host sends faster than the display shows. |
 | dropped | Lost + skipped + superseded, last second | |
 | repeated (est.) | Extra frame times a picture stayed on screen, beyond what the host's own gap between frames explains | Counted against the stream's cadence: the median gap between captures or between draws, whichever is slower. A static screen sends nothing and isn't counted. This is an estimate from draw times, not display flips. |
@@ -149,6 +149,19 @@ are µs.
 **`host-*-convert.csv`**: `capture_index`, `convert_gpu_us`. Join to frames on `capture_index`;
 captures replaced before encoding have no frame.
 
+**`host-*-network.csv`**, every 250 ms (since 0.9.1):
+- `time_us`
+- `sent_packets`, `lost_packets`: on the path since the last row (QUIC's count)
+- `queued_bytes`: datagrams waiting to be sent
+- `bandwidth_estimate_bps`, `cwnd_bytes`, `rtt_us`, `congestion_events`: the congestion
+  controller's (BBR's) view of the path
+- `path`: `direct` or `relay`
+- `recovery_requests`: keyframe requests from the viewer since the last row, each a loss
+- `bitrate_kbps`, `ceiling_kbps`, `reason`: the encoder's target after this tick, the ceiling the
+  rate controller keeps under, and why it changed (`steady`, `backlog`, `loss`, `viewer_loss`,
+  `climb`, `creep`)
+- `video_bytes`: video handed to the network since the last row
+
 **`host-*-input.csv`**: `seq`, `kind`, then the times:
 - `client_time_us_viewer_clock` (the viewer's clock; don't compare it with the others)
 - `received_us`, `done_us`, `inject_us` (host clock)
@@ -169,6 +182,23 @@ and `outcome`: `injected`, `refused` (Windows blocked it, e.g. an elevated windo
 - `reassembly_us`, `decode_queue_us`, `decode_us`, `render_us`
 - `clock_offset_us`, `clock_uncertainty_us`: the estimate when the frame was recorded
 - `network_est_us`, `total_est_us`
+
+**`viewer-*-loss.csv`**, one row per frame that never reached the decoder (since 0.9.1):
+- `seq`, `keyframe`
+- `reason`: `incomplete`, `never_seen` or `evicted` (lost: `lost` is 1), or `skipped_after_loss` or
+  `skipped_decoder_behind`
+- `chunks_received`, `chunks_needed` (data chunks; empty if none came)
+- `viewer_first_seen_us`, `viewer_last_seen_us`: its first and last datagram before it was given up
+- `viewer_given_up_us`
+- `late_datagrams`, `viewer_last_late_us`: its datagrams that came after it was given up on, within
+  a second. A lost frame with late datagrams was delayed, not dropped by the network.
+
+Join to the host's frames on `seq` for its size and when it was sent.
+
+**`viewer-*-network.csv`**, once a second: `viewer_time_us`, `path` (`direct` or `relay`), `rtt_us`,
+`mbps`, `fps`, the running totals `frames_lost`, `frames_skipped`, `frames_repaired` and
+`frames_superseded`, the host's `host_target_kbps` and `host_loss_permille`, and the clock estimate.
+A change of `path` mid-session shows here.
 
 **`viewer-*-input.csv`**: `seq`, `kind`, `viewer_sent_us`, `clock_offset_us`,
 `clock_uncertainty_us`. Join to the host's input file on `seq`. The one-way estimate is

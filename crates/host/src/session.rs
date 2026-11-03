@@ -26,8 +26,8 @@ use crate::{
     cursor::CursorStream,
     encode::{FrameStamp, VideoEvent, VideoStream},
     input::{self, Unavailable},
-    rate::{self, RateControl},
-    trace::{FrameRecord, HostTrace, Reporter},
+    rate::{self, PathSample, RateControl},
+    trace::{FrameRecord, HostTrace, NetworkRecord, Reporter},
 };
 
 /// An unchanged pointer position is sent again this often, so the viewer knows it's current.
@@ -230,6 +230,10 @@ async fn stream(
     let mut rate_ticks = 0u32;
     let mut gpu_load = connect_gpu_load::Monitor::new();
     let mut reporter = Reporter::new();
+    // For the rate controller and the trace: the viewer's keyframe requests (each means it lost
+    // video), video bytes sent, and the path's counters at the last tick.
+    let (mut recovery_requests, mut video_bytes) = (0u64, 0u64);
+    let mut last_tick = (0u64, 0u64, 0u64, 0u64, 0u64);
     let mut remote_seq = None;
     let mut audio_enabled = desktop && permissions.borrow().allows(DeviceClass::Audio);
     let mut audio = start_audio(conn, &mut send, audio_enabled).await?;
@@ -243,6 +247,7 @@ async fn stream(
                 }
                 Some(Ok(ClientMsg::RequestKeyframe)) => {
                     debug!("client asked for a keyframe");
+                    recovery_requests += 1;
                     video.request_keyframe();
                 }
                 Some(Ok(ClientMsg::DecoderFailed { codec })) => {
@@ -315,10 +320,37 @@ async fn stream(
             _ = rate_tick.tick() => {
                 let (sent, lost) = net::packet_counts(conn);
                 let queued = net::queued_datagram_bytes(conn);
-                if let Some(bps) = rate.update(Instant::now(), sent, lost, queued) {
-                    debug!(mbps = bps as f32 / 1e6, loss = rate.loss(), queued, "video bitrate changed");
+                let path = net::path_snapshot(conn);
+                let sample = PathSample {
+                    sent_packets: sent,
+                    lost_packets: lost,
+                    queued_bytes: queued,
+                    bandwidth_estimate: path.and_then(|p| p.bandwidth_estimate),
+                    recovery_requests,
+                };
+                if let Some(bps) = rate.update(Instant::now(), sample) {
+                    debug!(mbps = bps as f32 / 1e6, loss = rate.loss(), queued, reason = rate.reason().name(), "video bitrate changed");
                     video.set_bitrate(bps);
                 }
+                let congestion = path.map_or(0, |p| p.congestion_events);
+                let delta = |now: u64, then: u64| now.saturating_sub(then).min(u64::from(u32::MAX)) as u32;
+                trace.network.push(NetworkRecord {
+                    time_us: connect_proto::now_micros(),
+                    sent_packets: delta(sent, last_tick.0),
+                    lost_packets: delta(lost, last_tick.1),
+                    queued_bytes: queued.min(u32::MAX as usize) as u32,
+                    bandwidth_estimate_bps: path.and_then(|p| p.bandwidth_estimate),
+                    cwnd_bytes: path.map_or(0, |p| p.cwnd),
+                    rtt_us: path.map_or(0, |p| p.rtt.as_micros().min(u128::from(u32::MAX)) as u32),
+                    congestion_events: delta(congestion, last_tick.2),
+                    relay: path.is_some_and(|p| p.kind == net::PathKind::Relay),
+                    recovery_requests: delta(recovery_requests, last_tick.3),
+                    bitrate_kbps: rate.bitrate() / 1000,
+                    ceiling_kbps: rate.ceiling().map(|bps| bps / 1000),
+                    reason: rate.reason().name(),
+                    video_bytes: delta(video_bytes, last_tick.4),
+                });
+                last_tick = (sent, lost, congestion, recovery_requests, video_bytes);
                 rate_ticks += 1;
                 if rate_ticks.is_multiple_of(4) {
                     let stats = HostMsg::VideoStats {
@@ -342,6 +374,7 @@ async fn stream(
             }
             event = video.next() => match event {
                 Some(Ok(VideoEvent::Frame(frame, stamp))) => {
+                    video_bytes += frame.data.len() as u64;
                     send_frame(conn, &frame, stamp, rate.loss(), rate.bitrate() / 1000, trace)?;
                 }
                 Some(Ok(VideoEvent::Encoder { name, codec })) => {

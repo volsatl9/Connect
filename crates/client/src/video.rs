@@ -40,14 +40,14 @@ pub(crate) struct DecoderQueue {
 }
 
 impl DecoderQueue {
-    /// Queues `frame`; false if the decoder is too far behind to take it.
-    fn send(&self, frame: EncodedFrame) -> Result<bool, ()> {
+    /// Queues `frame`; gives it back if the decoder is too far behind to take it.
+    fn send(&self, frame: EncodedFrame) -> Result<Option<EncodedFrame>, ()> {
         self.queued.fetch_add(1, Ordering::AcqRel);
         match self.frames.try_send(frame) {
-            Ok(()) => Ok(true),
-            Err(TrySendError::Full(_)) => {
+            Ok(()) => Ok(None),
+            Err(TrySendError::Full(frame)) => {
                 self.queued.fetch_sub(1, Ordering::AcqRel);
-                Ok(false)
+                Ok(Some(frame))
             }
             Err(TrySendError::Disconnected(_)) => Err(()),
         }
@@ -209,6 +209,13 @@ pub(crate) async fn receive(
     shared: Arc<Shared>,
 ) {
     let mut assembler = FrameAssembler::new();
+    // Frames gone are collected now and then, not at every datagram.
+    let mut fates_checked = Instant::now();
+    let record_fates = |assembler: &mut FrameAssembler, all: bool| {
+        for fate in assembler.take_fates(Instant::now(), all) {
+            shared.trace.losses.push(crate::trace::LossRecord { fate });
+        }
+    };
     while let Ok(datagram) = conn.read_datagram().await {
         shared.counters.bytes.fetch_add(datagram.len() as u64, Ordering::Relaxed);
         match datagram.first().copied() {
@@ -250,14 +257,21 @@ pub(crate) async fn receive(
         }
         while let Some(frame) = assembler.next_frame() {
             match decoder.send(frame) {
-                Ok(true) => {}
+                Ok(None) => {}
                 // The decoder is too far behind to catch up: skip to a fresh keyframe.
-                Ok(false) => assembler.request_keyframe(),
+                Ok(Some(frame)) => {
+                    assembler.skipped(&frame);
+                    assembler.request_keyframe();
+                }
                 Err(()) => return,
             }
         }
         if assembler.take_keyframe_request() {
             let _ = keyframes.send(());
+        }
+        if fates_checked.elapsed() >= Duration::from_millis(100) {
+            fates_checked = Instant::now();
+            record_fates(&mut assembler, false);
         }
         let stats = assembler.stats;
         let c = &shared.counters;
@@ -265,4 +279,5 @@ pub(crate) async fn receive(
         c.frames_recovered.store(stats.frames_recovered, Ordering::Relaxed);
         c.frames_skipped.store(stats.frames_skipped, Ordering::Relaxed);
     }
+    record_fates(&mut assembler, true);
 }

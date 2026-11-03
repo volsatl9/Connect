@@ -827,6 +827,26 @@ impl StatsWindow {
         let (bytes, decoded) = (c.bytes.load(Ordering::Relaxed), c.frames_decoded.load(Ordering::Relaxed));
         let (path, rtt) = net::selected_path(conn);
         let latency = lock(&shared.latency).take();
+        let host_kbps = match c.host_kbps.load(Ordering::Relaxed) {
+            u32::MAX => None,
+            kbps => Some(kbps),
+        };
+        if connect_perf::enabled() {
+            shared.trace.network.push(trace::NetworkRecord {
+                time_us: now_micros(),
+                path,
+                rtt_us: rtt.map(|r| r.as_micros().min(u128::from(u32::MAX)) as u32),
+                mbps: (bytes - self.bytes) as f32 * 8.0 / secs / 1e6,
+                fps: (decoded - self.frames) as f32 / secs,
+                frames_lost: c.frames_lost.load(Ordering::Relaxed),
+                frames_skipped: c.frames_skipped.load(Ordering::Relaxed),
+                frames_recovered: c.frames_recovered.load(Ordering::Relaxed),
+                frames_superseded: c.frames_superseded.load(Ordering::Relaxed),
+                host_kbps,
+                loss_permille: host_kbps.map(|_| c.loss_permille.load(Ordering::Relaxed)),
+                clock: c.clock(),
+            });
+        }
         let frames = connect_perf::enabled().then(|| {
             let (records, mark) = shared.trace.frames.since(self.mark);
             self.mark = mark;

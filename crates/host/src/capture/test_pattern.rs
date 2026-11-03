@@ -17,7 +17,10 @@ const BARS: [[u8; 4]; 8] = [
 ];
 
 /// Colour bars scrolling sideways and a bouncing white square, so motion and dropped frames show.
+/// Optionally a band of random blocks across the middle third, new every frame.
 pub(crate) struct TestPattern {
+    /// The xorshift state for the noise band, if there is one.
+    noise: Option<u64>,
     width: u32,
     height: u32,
     interval: Duration,
@@ -28,8 +31,9 @@ pub(crate) struct TestPattern {
 }
 
 impl TestPattern {
-    pub fn new(width: u32, height: u32, fps: u32) -> Self {
+    pub fn new(width: u32, height: u32, fps: u32, noise: bool) -> Self {
         Self {
+            noise: noise.then_some(0x2545_f491_4f6c_dd1d),
             width: width.max(16),
             height: height.max(16),
             interval: Duration::from_secs(1) / fps.max(1),
@@ -63,6 +67,25 @@ impl TestPattern {
         let (sx, sy) = (bounce(self.frame as usize * 7, w), bounce(self.frame as usize * 5, h));
         for row in self.buf.chunks_exact_mut(stride).skip(sy).take(size) {
             row[sx * 4..(sx + size).min(w) * 4].fill(255);
+        }
+
+        // Random-coloured 8×8 blocks, all new every frame: detail an encoder can spend any
+        // bitrate on, and still squeeze into little at a coarser quality, as with a busy game.
+        if let Some(seed) = &mut self.noise {
+            let band = (h / 3) & !7..(2 * h / 3) & !7;
+            for block_row in band.step_by(8) {
+                for block in 0..w / 8 {
+                    *seed ^= *seed << 13;
+                    *seed ^= *seed >> 7;
+                    *seed ^= *seed << 17;
+                    let colour = (*seed as u32 | 0xff00_0000).to_le_bytes();
+                    for row in block_row..block_row + 8 {
+                        for px in self.buf[row * stride + block * 32..][..32].as_chunks_mut::<4>().0 {
+                            *px = colour;
+                        }
+                    }
+                }
+            }
         }
     }
 }

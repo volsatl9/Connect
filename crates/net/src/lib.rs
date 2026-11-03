@@ -36,9 +36,7 @@ pub fn load_identity(dir: &Path) -> Result<Option<SecretKey>> {
     let path = dir.join(KEY_FILE);
     match std::fs::read(&path) {
         Ok(bytes) => {
-            let bytes: [u8; 32] = bytes
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("{} is corrupt", path.display()))?;
+            let bytes: [u8; 32] = bytes.try_into().map_err(|_| anyhow::anyhow!("{} is corrupt", path.display()))?;
             Ok(Some(SecretKey::from_bytes(&bytes)))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -90,38 +88,34 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
 /// Formats a User-ID in groups of 8 hex digits so people can read it out or compare it.
 pub fn format_user_id(id: &EndpointId) -> String {
     let hex = id.to_string();
-    hex.as_bytes()
-        .chunks(8)
-        .map(|c| std::str::from_utf8(c).expect("hex is ascii"))
-        .collect::<Vec<_>>()
-        .join(" ")
+    hex.as_bytes().chunks(8).map(|c| std::str::from_utf8(c).expect("hex is ascii")).collect::<Vec<_>>().join(" ")
 }
 
 /// Parses a User-ID as typed or pasted, ignoring spaces, dashes and case.
 pub fn parse_user_id(input: &str) -> Result<EndpointId> {
-    let cleaned: String = input
-        .chars()
-        .filter(|c| !c.is_whitespace() && *c != '-')
-        .map(|c| c.to_ascii_lowercase())
-        .collect();
+    let cleaned: String =
+        input.chars().filter(|c| !c.is_whitespace() && *c != '-').map(|c| c.to_ascii_lowercase()).collect();
     cleaned.parse().map_err(|_| anyhow::anyhow!("that doesn't look like a valid User-ID"))
 }
 
 /// Creates the app's single endpoint, used both to accept and to make connections.
 pub async fn bind_endpoint(secret_key: SecretKey) -> Result<Endpoint> {
-    configure(Endpoint::builder(presets::N0), secret_key)
-        .bind()
-        .await
-        .context("starting network endpoint")
+    configure(Endpoint::builder(presets::N0), secret_key).bind().await.context("starting network endpoint")
 }
 
 /// An endpoint that only listens on localhost, with no relay or User-ID lookup.
 /// Dial it with [`local_addr`]. For tests.
 pub async fn bind_local_endpoint(secret_key: SecretKey) -> Result<Endpoint> {
+    bind_local_endpoint_at(secret_key, "127.0.0.1:0").await
+}
+
+/// Like [`bind_local_endpoint`], on `addr` only, e.g. `[::1]:0`: an endpoint on IPv6 alone can't
+/// reach one on IPv4 alone, so a test can make all traffic go through a relay between them.
+pub async fn bind_local_endpoint_at(secret_key: SecretKey, addr: &str) -> Result<Endpoint> {
     configure(Endpoint::builder(presets::Minimal), secret_key)
         .relay_mode(RelayMode::Disabled)
         .clear_ip_transports()
-        .bind_addr("127.0.0.1:0")?
+        .bind_addr(addr)?
         .bind()
         .await
         .context("starting local endpoint")
@@ -129,10 +123,7 @@ pub async fn bind_local_endpoint(secret_key: SecretKey) -> Result<Endpoint> {
 
 /// The direct address of an endpoint made by [`bind_local_endpoint`].
 pub fn local_addr(endpoint: &Endpoint) -> EndpointAddr {
-    endpoint
-        .bound_sockets()
-        .into_iter()
-        .fold(EndpointAddr::new(endpoint.id()), EndpointAddr::with_ip_addr)
+    endpoint.bound_sockets().into_iter().fold(EndpointAddr::new(endpoint.id()), EndpointAddr::with_ip_addr)
 }
 
 fn configure(builder: Builder, secret_key: SecretKey) -> Builder {
@@ -200,6 +191,33 @@ impl PathKind {
             PathKind::Unknown => "Connecting…",
         }
     }
+}
+
+/// What the congestion controller knows about the path QUIC is sending on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PathSnapshot {
+    pub kind: PathKind,
+    pub rtt: Duration,
+    /// The congestion window, bytes.
+    pub cwnd: u64,
+    /// BBR's estimate of what the path can carry, bits per second.
+    pub bandwidth_estimate: Option<u64>,
+    /// Times the congestion controller has reacted to loss.
+    pub congestion_events: u64,
+}
+
+/// The selected path's congestion state, if a path is selected.
+pub fn path_snapshot(conn: &Connection) -> Option<PathSnapshot> {
+    let paths = conn.paths();
+    let path = paths.iter().find(|p| p.is_selected())?;
+    let stats = path.stats();
+    Some(PathSnapshot {
+        kind: if path.is_relay() { PathKind::Relay } else { PathKind::Direct },
+        rtt: path.rtt(),
+        cwnd: stats.cwnd,
+        bandwidth_estimate: stats.bandwidth_estimate,
+        congestion_events: stats.congestion_events,
+    })
 }
 
 /// The path QUIC is currently sending on, and its round-trip time.

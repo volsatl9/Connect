@@ -160,6 +160,54 @@ impl CsvRecord for InputRecord {
     }
 }
 
+/// The path and the bitrate controller at one rate tick (every 250 ms).
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct NetworkRecord {
+    pub time_us: u64,
+    /// Packets sent and lost on the path since the last tick.
+    pub sent_packets: u32,
+    pub lost_packets: u32,
+    /// Bytes of datagrams waiting to be sent.
+    pub queued_bytes: u32,
+    /// The congestion controller's estimate of the path's bandwidth, its window and round trip.
+    pub bandwidth_estimate_bps: Option<u64>,
+    pub cwnd_bytes: u64,
+    pub rtt_us: u32,
+    /// Times the congestion controller has reacted to loss, since the last tick.
+    pub congestion_events: u32,
+    pub relay: bool,
+    /// The viewer's keyframe requests since the last tick: each means it lost video.
+    pub recovery_requests: u32,
+    /// The encoder's target after this tick, the controller's ceiling, and why.
+    pub bitrate_kbps: u32,
+    pub ceiling_kbps: Option<u32>,
+    pub reason: &'static str,
+    /// Video bytes handed to the network since the last tick.
+    pub video_bytes: u32,
+}
+
+impl CsvRecord for NetworkRecord {
+    const HEADER: &'static str = "time_us,sent_packets,lost_packets,queued_bytes,bandwidth_estimate_bps,cwnd_bytes,\
+rtt_us,congestion_events,path,recovery_requests,bitrate_kbps,ceiling_kbps,reason,video_bytes";
+
+    fn write_row(&self, out: &mut String) {
+        let _ = write!(out, "{},{},{},{},", self.time_us, self.sent_packets, self.lost_packets, self.queued_bytes);
+        cell(out, self.bandwidth_estimate_bps);
+        let _ = write!(
+            out,
+            "{},{},{},{},{},{},",
+            self.cwnd_bytes,
+            self.rtt_us,
+            self.congestion_events,
+            if self.relay { "relay" } else { "direct" },
+            self.recovery_requests,
+            self.bitrate_kbps
+        );
+        cell(out, self.ceiling_kbps);
+        let _ = write!(out, "{},{}", self.reason, self.video_bytes);
+    }
+}
+
 /// When a remote input event was sent and received, carried with it to where it's acted on.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct InputStamp {
@@ -186,6 +234,7 @@ pub(crate) struct HostTrace {
     pub frames: TraceRing<FrameRecord>,
     pub conversions: TraceRing<ConvertRecord>,
     pub inputs: TraceRing<InputRecord>,
+    pub network: TraceRing<NetworkRecord>,
     /// When the session started, in Unix seconds, to name its files.
     session: u64,
 }
@@ -197,20 +246,25 @@ impl HostTrace {
             frames: TraceRing::new(capacity),
             conversions: TraceRing::new(capacity),
             inputs: TraceRing::new(capacity),
+            network: TraceRing::new(capacity),
             session: connect_perf::session_stamp(),
         }
     }
 
     fn dropped(&self) -> u64 {
-        self.frames.dropped_busy() + self.conversions.dropped_busy() + self.inputs.dropped_busy()
+        self.frames.dropped_busy()
+            + self.conversions.dropped_busy()
+            + self.inputs.dropped_busy()
+            + self.network.dropped_busy()
     }
 
-    /// Writes the trace to `dir` as three CSV files. Blocks on file I/O.
+    /// Writes the trace to `dir` as CSV files. Blocks on file I/O.
     pub fn write(&self, dir: &Path) -> std::io::Result<()> {
         let path = |what| connect_perf::trace_path(dir, "host", self.session, what);
         connect_perf::write_csv(&path("frames"), &self.frames.snapshot())?;
         connect_perf::write_csv(&path("convert"), &self.conversions.snapshot())?;
-        connect_perf::write_csv(&path("input"), &self.inputs.snapshot())
+        connect_perf::write_csv(&path("input"), &self.inputs.snapshot())?;
+        connect_perf::write_csv(&path("network"), &self.network.snapshot())
     }
 }
 
@@ -390,6 +444,19 @@ mod tests {
         frame.write_row(&mut row);
         assert_eq!(row.split(',').count(), FrameRecord::HEADER.split(',').count(), "{row}");
         assert!(row.starts_with("3,1,H.265,0,"), "{row}");
+        for network in [
+            NetworkRecord::default(),
+            NetworkRecord {
+                bandwidth_estimate_bps: Some(40_000_000),
+                ceiling_kbps: Some(32_000),
+                relay: true,
+                ..Default::default()
+            },
+        ] {
+            row.clear();
+            network.write_row(&mut row);
+            assert_eq!(row.split(',').count(), NetworkRecord::HEADER.split(',').count(), "{row}");
+        }
         let input = InputStamp { seq: 1, client_time_us: 10, received_us: 20 }.record("key", InputOutcome::Refused);
         row.clear();
         input.write_row(&mut row);

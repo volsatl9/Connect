@@ -22,7 +22,7 @@ mod windows {
     use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE, IDXGIFactory1};
 
     use crate::{
-        capture::{Capturer, dxgi::DxgiCapturer},
+        capture::{Capturer, dxgi::DxgiCapturer, test_pattern::TestPattern},
         encode::{Input, VideoEncoder, mf},
         gpu::{ConvertMethod, Nv12Converter},
         yuv::{Layout, Picture},
@@ -213,6 +213,173 @@ mod windows {
                     }
                 }
             }
+        }
+
+        // What the encoders say about the settings that shape keyframes and frame sizes, and
+        // which values they take: supported configurations from the driver, not guesses.
+        for codec in [Codec::H264, Codec::H265] {
+            match mf::probe_controls(codec, w, h, SESSION_BITRATE, fps) {
+                Ok(lines) => {
+                    out(format!("{codec} encoder settings offered:"));
+                    for line in lines {
+                        out(format!("  {line}"));
+                    }
+                }
+                Err(e) => out(format!("{codec} encoder settings: can't tell ({e:#})")),
+            }
+        }
+        if let Err(e) = frame_sizes(out, &device, fps) {
+            out(format!("Frame-size test: FAILED: {e:#}"));
+        }
+        Ok(())
+    }
+
+    /// The bitrate sessions start at (the default cap is 20 Mb/s; Kellu's sessions ran at 80).
+    const SESSION_BITRATE: u32 = 80_000_000;
+
+    /// The same busy picture (random blocks moving, new every frame) through the session's GPU
+    /// conversion and the H.264 encoder with each way of keeping frames small: what each does to
+    /// frame sizes, keyframes, the bitrate and picture quality. Identical input every run.
+    fn frame_sizes(out: &mut dyn FnMut(String), device: &ID3D11Device, fps: u32) -> Result<()> {
+        use windows::Win32::Graphics::{
+            Direct3D11::{D3D11_BIND_SHADER_RESOURCE, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT},
+            Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC},
+        };
+        const W: u32 = 1920;
+        const H: u32 = 1080;
+        let frames = (fps * 2) as usize; // two seconds of video, a keyframe at the start and at 1 s
+        let configs: [(&str, mf::EncoderSettings); 5] = [
+            (
+                "CBR, driver's buffer",
+                mf::EncoderSettings { peak_percent: None, buffer_frames: None, min_qp: None, intra_refresh: false },
+            ),
+            (
+                "CBR, 2-frame buffer (0.9 default)",
+                mf::EncoderSettings { peak_percent: None, buffer_frames: Some(2), min_qp: None, intra_refresh: false },
+            ),
+            (
+                "CBR, 1-frame buffer",
+                mf::EncoderSettings { peak_percent: None, buffer_frames: Some(1), min_qp: None, intra_refresh: false },
+            ),
+            (
+                "Peak VBR 100%, 1-frame buffer",
+                mf::EncoderSettings {
+                    peak_percent: Some(100),
+                    buffer_frames: Some(1),
+                    min_qp: None,
+                    intra_refresh: false,
+                },
+            ),
+            (
+                "CBR, 2-frame buffer, min QP 24",
+                mf::EncoderSettings {
+                    peak_percent: None,
+                    buffer_frames: Some(2),
+                    min_qp: Some(24),
+                    intra_refresh: false,
+                },
+            ),
+        ];
+        let context = unsafe { device.GetImmediateContext() }?;
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: W,
+            Height: H,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let mut source = None;
+        unsafe { device.CreateTexture2D(&desc, None, Some(&mut source)) }?;
+        let source = source.context("no source texture")?;
+        let mut converter = Nv12Converter::new(device, W, H)?;
+        let target = SESSION_BITRATE / 8 / fps;
+        out(format!(
+            "Frame-size test: {W}×{H} busy picture at {fps} fps, {} Mb/s, {} frames per setting; average frame target {:.1} KB",
+            SESSION_BITRATE / 1_000_000,
+            frames,
+            target as f64 / 1000.0
+        ));
+        for (name, settings) in configs {
+            let mut encoder = match mf::HardwareEncoder::with_settings(
+                Codec::H264,
+                W,
+                H,
+                SESSION_BITRATE,
+                fps,
+                Some(device),
+                &settings,
+            ) {
+                Ok(encoder) => encoder,
+                Err(e) => {
+                    out(format!("  {name}: refused ({e:#})"));
+                    continue;
+                }
+            };
+            let mut pattern = TestPattern::new(W, H, 100_000, true);
+            let mut reference = Picture::new(Layout::Nv12, W as usize, H as usize);
+            let mut decoder = Decoder::new()?;
+            let (mut sizes, mut keyframes, mut psnr, mut decoded) = (Vec::new(), Vec::new(), 0f64, 0u32);
+            for frame in 0..frames {
+                let image = pattern.next_frame(Duration::from_secs(1))?.context("no test picture")?;
+                unsafe {
+                    context.UpdateSubresource(&source, 0, None, image.bgra.as_ptr().cast(), image.stride as u32, 0)
+                };
+                reference.convert_from_bgra(image.bgra, image.stride);
+                converter.convert(&source, None)?;
+                let keyframe = frame % fps as usize == 0;
+                let encoded = encoder.encode(
+                    Input::Texture(converter.texture()),
+                    frame as u64 * 1_000_000 / u64::from(fps),
+                    keyframe,
+                )?;
+                for picture in encoded {
+                    if picture.keyframe {
+                        keyframes.push(picture.data.len())
+                    } else {
+                        sizes.push(picture.data.len())
+                    }
+                    if let Ok(Some(yuv)) = decoder.decode(&picture.data) {
+                        let (dw, _) = yuv.dimensions();
+                        let (stride, y) = (yuv.strides().0, yuv.y());
+                        let mut squared = 0f64;
+                        for row in 0..H as usize {
+                            for (a, b) in
+                                y[row * stride..][..dw].iter().zip(&reference.data()[row * W as usize..][..W as usize])
+                            {
+                                squared += f64::from(a.abs_diff(*b)).powi(2);
+                            }
+                        }
+                        let mse = squared / f64::from(W * H);
+                        psnr += if mse == 0.0 { 99.0 } else { 10.0 * (255.0f64.powi(2) / mse).log10() };
+                        decoded += 1;
+                    }
+                }
+            }
+            sizes.sort_unstable();
+            let kb = |bytes: usize| bytes as f64 / 1000.0;
+            let at =
+                |p: usize| sizes.get((sizes.len() * p / 100).min(sizes.len().saturating_sub(1))).copied().unwrap_or(0);
+            let all: usize = sizes.iter().chain(&keyframes).sum();
+            out(format!(
+                "  {name} [{}]: average {:.1} KB, median {:.1}, p95 {:.1}, largest {:.1}; keyframes {}; {:.1} Mb/s; quality {}",
+                encoder.burst(),
+                kb(all / (sizes.len() + keyframes.len()).max(1)),
+                kb(at(50)),
+                kb(at(95)),
+                kb(sizes.last().copied().unwrap_or(0)),
+                keyframes.iter().map(|&k| format!("{:.1} KB", kb(k))).collect::<Vec<_>>().join(", "),
+                all as f64 * 8.0 / 2.0 / 1e6,
+                if decoded > 0 {
+                    format!("{:.1} dB average over {decoded} frames", psnr / f64::from(decoded))
+                } else {
+                    "not decodable here".into()
+                },
+            ));
         }
         Ok(())
     }

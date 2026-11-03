@@ -101,6 +101,69 @@ by 2 ms (`cargo test -p connect-host --release --test lossy_path -- --ignored --
 Windows "N" editions ship without Media Foundation; 0.3.0 linked to it, so Connect wouldn't
 start there. It is now loaded when first needed, and hosting falls back to OpenH264 without it.
 
+## Version 0.9.1: frame delivery
+
+The 0.9.0 test on the RTX 5060 host reported 44 frames lost and 34 skipped. The 0.8.2 run before
+it reported none. The host trace and a local reproduction show three things.
+
+- **The count was inflated.** When a frame was lost, the frames skipped while the viewer waited
+  for the next keyframe were counted again as lost when it came. One lost frame read as about
+  five. The 44 lost came from about six loss events, roughly one lost frame each. Frames turned
+  away by a full decoder queue weren't counted at all. Both are fixed, with tests. The 0.8 runs
+  were inflated the same way.
+- **The losses were burst losses from overrunning the path.** Midway through that session the
+  path's capacity fell from about 80 to about 40 Mb/s. The rate controller climbed back towards
+  80 Mb/s 24 times. Each climb filled the send queue (up to 483 KB), and most loss events came
+  within a second or two of one.
+  - A full queue at the bottleneck drops packets in runs, so the recovery data can't rebuild the
+    frames, and nothing got repaired. Losses don't have to be frequent: in a local test, 0.1% of
+    packets dropped this way cost 15 frames.
+  - In the 0.8.1 run, the path carried the full 75 Mb/s, so nothing was lost.
+- **Viewer-side causes found nothing.** Nothing in the trace points to the viewer, the reorder
+  wait, the decoder, or the transport's buffers. The send buffer is 2 MB, the receive buffer
+  8 MB, and only the selected path carries data. The new per-frame loss records will confirm
+  this on the next hardware run.
+
+What changed:
+
+- **The rate controller remembers the path's ceiling.**
+  - When the path proves too slow (backlog, heavy loss, or the viewer losing frames), the
+    controller sets a ceiling at 80% of BBR's bandwidth estimate, leaving room for recovery data
+    and probing.
+  - It climbs quickly to 90% of the ceiling, then creeps at about 1% a second. It forgets the
+    ceiling after 20 s without congestion.
+  - In a model of the 0.9.0 session, bitrate cuts went from 41 to 9, and data sent beyond the
+    path's capacity from 9.0 to 2.4 MB, for 97% of the throughput.
+  - `CONNECT_RATE_CEILING=0` restores 0.9.0's controller, to compare.
+- **A viewer keyframe request counts as congestion.** A lost frame means the path overflowed.
+- **The send hold is time-based.** The host stops encoding new frames while more than 30 ms of
+  video is queued, with a floor of 64 KB. It used to be 50 ms with a 128 KB floor, which on slow
+  paths allowed 100 ms or more.
+  - On a 10 Mb/s test path, latency fell from about 160 to about 105 ms. The CPU encoder there
+    can't go below the path's rate.
+- **New traces:**
+  - `viewer-*-loss.csv`: why each frame was lost or skipped, and whether its datagrams came late.
+  - `viewer-*-network.csv` and `host-*-network.csv`: each side's view of the path over time,
+    including BBR's estimate and the controller's reasons.
+- **Intra refresh** uses the range the driver reports. Where it reports none, it tries shorter
+  waves, both before and after the stream format is set. Unaccepted, keyframes come from a
+  30 s safety interval and the viewer's requests.
+- **`gpu-check` reports, for each encoder:**
+  - what it offers of the intra-refresh, buffer, QP, GOP, LTR and slice settings: supported or
+    not, the default, the range or allowed values, and the values it actually takes;
+  - a frame-size test on an identical synthetic busy picture, with five setups: average, median,
+    p95 and largest frame, keyframe sizes, bitrate and PSNR.
+- **Overlay:**
+  - Stages under 1 ms show in µs (GPU convert was showing 0.0 for 27 µs).
+  - Frame sizes are the actual received p50/p95/p99/max.
+  - The encoder's label calls its buffer a setting, not a limit.
+- **Test fix:** the lossy-path and bottleneck tests now force every packet through their relay.
+  Before, the endpoints found a direct path around it once connected.
+
+Known limit: on busy content, the CPU encoder (OpenH264, no frame skipping) can't go below about
+12 Mb/s at 720p60, whatever its target. A host without hardware encoding on a slower path still
+overruns it.
+
 ## Version 0.9.0: even frames
 
 The 0.8 traces from the RTX 5060 host showed the host itself steady: capture to send took 2.6 ms

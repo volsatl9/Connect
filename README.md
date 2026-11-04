@@ -1,8 +1,14 @@
 # Connect
 
+Version 0.9.2 keeps the bitrate through quiet scenes. Connect remembers what the path has carried
+when the congestion controller loses sight of it, cuts the bitrate only for a backlog that lasts,
+and recovers when the path does. Traces now stream to disk, so long sessions keep every frame, and
+`connect trace-report` follows each frame from one PC to the other. See PERFORMANCE.md for the
+trade-offs and what's still open.
+
 Version 0.9.0 keeps frames even. Hosts no longer send a full keyframe every 600 frames; where the
 graphics card's encoder offers it, the picture is renewed a band at a time (intra refresh). The
-encoder's buffer is capped at about two frames, so no single frame becomes a burst. The host's
+encoder's buffer is set to about two frames: a setting, which drivers needn't hold to. The host's
 colour conversion now runs as two small shaders, whose GPU time shows in the stats. It works with
 0.8 viewers (protocol 8).
 

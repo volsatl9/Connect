@@ -213,6 +213,13 @@ fn stdin_lines() -> mpsc::UnboundedReceiver<String> {
 
 /// Checks what this PC's graphics hardware offers for sharing and viewing, runs the GPU paths
 /// briefly, and saves the report for pasting.
+pub fn trace_report(dir: Option<&str>) -> Result<()> {
+    let dir = std::path::Path::new(dir.context("trace-report needs the folder with the trace files")?);
+    let (report, path) = crate::trace_report::write(dir)?;
+    println!("{report}\nSaved to {}", path.display());
+    Ok(())
+}
+
 pub fn gpu_check() -> Result<()> {
     let mut report = Vec::new();
     let mut out = |line: String| {

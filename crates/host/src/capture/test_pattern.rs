@@ -92,7 +92,7 @@ impl TestPattern {
 
 impl Capturer for TestPattern {
     fn timing(&self) -> CaptureTiming {
-        CaptureTiming { acquired: self.acquired, present_to_capture: None }
+        CaptureTiming { acquired: self.acquired, present_to_capture: None, accumulated: None }
     }
 
     fn refresh_hz(&self) -> Option<u32> {

@@ -4,6 +4,8 @@
 //! Connecting by User-ID alone works anywhere: iroh looks the ID up via n0's DNS address
 //! lookup, connects through a relay first, and hole-punches to a direct UDP path when it can.
 
+mod congestion;
+
 use std::{path::Path, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail};
@@ -137,9 +139,18 @@ fn configure(builder: Builder, secret_key: SecretKey) -> Builder {
         // BBR paces to the measured path rate and keeps queues short, and unlike the default
         // (CUBIC) it doesn't halve its rate at every stray lost packet, which on the internet
         // would starve a video stream that never retransmits anyway.
-        .congestion_controller_factory(Arc::new(noq_proto::congestion::Bbr3Config::default()))
+        .congestion_controller_factory(congestion_controller())
         .build();
     builder.secret_key(secret_key).alpns(vec![ALPN.to_vec()]).transport_config(transport)
+}
+
+/// BBR that remembers the path through quiet scenes; `CONNECT_PATH_MEMORY=0` runs plain BBR.
+fn congestion_controller() -> Arc<dyn noq_proto::congestion::ControllerFactory + Send + Sync> {
+    if std::env::var("CONNECT_PATH_MEMORY").is_ok_and(|v| v.trim() == "0") {
+        Arc::new(noq_proto::congestion::Bbr3Config::default())
+    } else {
+        Arc::new(congestion::PathMemory::default())
+    }
 }
 
 /// Bytes of datagrams waiting to be sent on `conn`.

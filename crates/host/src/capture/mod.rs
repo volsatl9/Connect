@@ -60,6 +60,9 @@ pub(crate) struct CaptureTiming {
     pub acquired: Instant,
     /// From the image reaching the screen to capture getting it, where the source knows.
     pub present_to_capture: Option<Duration>,
+    /// Images that reached the screen since the last capture, where the source knows: over 1
+    /// means capture came late and some were never seen.
+    pub accumulated: Option<u32>,
 }
 
 pub(crate) trait Capturer {

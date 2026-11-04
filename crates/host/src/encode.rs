@@ -29,7 +29,7 @@ use tokio::sync::mpsc;
 
 use crate::{
     capture::{Capturer, VideoSource},
-    trace::HostTrace,
+    trace::{CaptureRecord, HostTrace, Replaced},
     yuv::{Layout, Picture},
 };
 
@@ -351,6 +351,8 @@ fn run(
     // For the trace: captures so far, and the staged picture's number and when it was staged.
     let mut captures = 0u64;
     let (mut picture_index, mut picture_staged) = (0u64, Instant::now());
+    // Why the staged picture hasn't gone yet, for when a newer one replaces it.
+    let mut waiting = Replaced::No;
     let mut sent_time_us = 0;
     // At most one picture per refresh of the host's screen (with a little slack for jitter): a
     // game presenting faster than that would spend bitrate on pictures the viewer never shows.
@@ -397,8 +399,6 @@ fn run(
                 trace.conversions.push(crate::trace::ConvertRecord { capture, gpu_us });
             });
         }
-        #[cfg(not(windows))]
-        let _ = trace;
         if fresh {
             (picture_index, picture_staged) = (captures, staged);
             captures += 1;
@@ -406,6 +406,14 @@ fn run(
             let timing = capturer.timing();
             picture_capture_us = micros(staged.saturating_duration_since(timing.acquired));
             picture_present_us = timing.present_to_capture.map_or(0, micros);
+            trace.captures.push(CaptureRecord {
+                capture: picture_index,
+                time_us: now_us,
+                capture_us: picture_capture_us,
+                present_to_capture_us: picture_present_us,
+                accumulated: timing.accumulated,
+                replaced: if unsent { waiting } else { Replaced::No },
+            });
             unsent = true;
         }
         let Some(active) = &mut pipeline else { continue };
@@ -429,7 +437,9 @@ fn run(
         // the rest. Likewise until its turn comes, a newer picture replacing it meanwhile. A
         // requested keyframe goes regardless, as the viewer is stuck without one.
         let too_soon = last_sent.is_some_and(|sent| sent.elapsed() < frame_interval);
-        if !(unsent || force_keyframe) || (((control.backlogged)() || too_soon) && !force_keyframe) {
+        let backlogged = (unsent || force_keyframe) && (control.backlogged)();
+        if !(unsent || force_keyframe) || ((backlogged || too_soon) && !force_keyframe) {
+            waiting = if backlogged { Replaced::Backlog } else { Replaced::Turn };
             continue;
         }
         last_sent = Some(Instant::now());

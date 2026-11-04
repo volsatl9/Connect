@@ -168,7 +168,10 @@ mod windows {
             kb((BITRATE / 8 / fps) as usize),
             largest(&sizes),
             largest(&keyframe_sizes),
-            encoder.burst().buffer_bytes.map_or(String::new(), |cap| format!(" (cap {})", kb(cap as usize))),
+            encoder
+                .burst()
+                .buffer_bytes
+                .map_or(String::new(), |setting| format!(" (buffer setting {}, not a limit)", kb(setting as usize))),
         ));
 
         // The memory path, as 0.5.0 always did it, for comparison.
@@ -423,10 +426,11 @@ mod windows {
             .map_or("intra refresh not offered (keyframes every 30 s instead)".to_owned(), |frames| {
                 format!("intra refresh over {frames} frames")
             });
-        let cap = controls.buffer_bytes.map_or("no frame-size cap".to_owned(), |bytes| {
-            format!("frame-size cap {:.1} KB ({} frames)", bytes as f64 / 1000.0, controls.buffer_frames.unwrap_or(0))
+        let buffer = controls.buffer_bytes.map_or("no buffer setting".to_owned(), |bytes| {
+            let frames = controls.buffer_frames.unwrap_or(0);
+            format!("buffer setting {:.1} KB ({frames} frames, not a limit)", bytes as f64 / 1000.0)
         });
-        format!("{refresh}, {cap}")
+        format!("{refresh}, {buffer}")
     }
 
     /// Mean and largest absolute difference between two planes.

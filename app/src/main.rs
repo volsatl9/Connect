@@ -8,6 +8,7 @@
 //! connect join <USER-ID> [--seconds N] [--trace DIR]
 //! connect id                          print this PC's User-ID
 //! connect gpu-check                   check what the graphics hardware offers, and test it
+//! connect trace-report <DIR>           follow every frame through a session's traces
 //! ```
 //!
 //! Only Windows can host; other platforms can only connect. `--test-pattern` hosts a generated
@@ -28,13 +29,14 @@
 //! periodic keyframes; `CONNECT_FRAME_BUFFER=<frames>` changes the encoder's buffer setting (0:
 //! the driver's default); `CONNECT_PEAK_PERCENT=<n>` uses peak-constrained VBR at n% of the mean;
 //! `CONNECT_MIN_QP=<qp>` sets the finest quantizer; `CONNECT_RATE_CEILING=0` runs 0.9.0's rate
-//! controller.
+//! controller; `CONNECT_PATH_MEMORY=0` runs plain BBR, which forgets the path in quiet scenes.
 
 // No console window behind the app. Debug builds keep theirs, for the logs.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod cli;
 mod gui;
+mod trace_report;
 mod update;
 
 use std::path::PathBuf;
@@ -50,7 +52,8 @@ usage: connect                        open the app
                                       share this PC from the terminal (Windows)
        connect join <USER-ID> [--seconds N] [--trace DIR]
        connect id                     print this PC's User-ID
-       connect gpu-check              check this PC's graphics hardware and save a report";
+       connect gpu-check              check this PC's graphics hardware and save a report
+       connect trace-report <DIR>     follow every frame through a session's traces from both PCs";
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -86,6 +89,7 @@ fn main() -> Result<()> {
         Some("host") => runtime.block_on(cli::host(key()?, &args[1..])),
         Some("join") => runtime.block_on(cli::join(key()?, &args[1..])),
         Some("gpu-check") => cli::gpu_check(),
+        Some("trace-report") => cli::trace_report(args.get(1).map(String::as_str)),
         Some("id") => {
             println!("{}", net::format_user_id(&key()?.public()));
             Ok(())

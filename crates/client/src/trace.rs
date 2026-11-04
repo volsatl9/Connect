@@ -10,12 +10,15 @@
 use std::{
     fmt::Write as _,
     path::{Path, PathBuf},
+    sync::Arc,
     sync::atomic::{AtomicU32, Ordering},
     time::Instant,
 };
 
 use connect_net::PathKind;
-use connect_perf::{CsvRecord, Percentiles, Spread, TraceRing, cell, percentiles, spread};
+use connect_perf::{
+    CsvRecord, CsvStream, Percentiles, SessionRow, Spool, Spread, TraceRing, cell, percentiles, spread,
+};
 use connect_proto::{
     micros_at,
     video::{Fate, FrameMeta},
@@ -202,11 +205,13 @@ pub(crate) struct NetworkRecord {
     pub host_kbps: Option<u32>,
     pub loss_permille: Option<u32>,
     pub clock: Option<ClockOffset>,
+    pub gpu: Option<connect_gpu_load::GpuLoad>,
 }
 
 impl CsvRecord for NetworkRecord {
     const HEADER: &'static str = "viewer_time_us,path,rtt_us,mbps,fps,frames_lost,frames_skipped,frames_repaired,\
-frames_superseded,host_target_kbps,host_loss_permille,clock_offset_us,clock_uncertainty_us";
+frames_superseded,host_target_kbps,host_loss_permille,clock_offset_us,clock_uncertainty_us,gpu_graphics_percent,\
+gpu_decode_percent";
 
     fn write_row(&self, out: &mut String) {
         let path = match self.path {
@@ -224,8 +229,10 @@ frames_superseded,host_target_kbps,host_loss_permille,clock_offset_us,clock_unce
         cell(out, self.host_kbps);
         cell(out, self.loss_permille);
         cell(out, self.clock.map(|c| c.offset_us));
-        if let Some(clock) = self.clock {
-            let _ = write!(out, "{}", clock.uncertainty_us);
+        cell(out, self.clock.map(|c| c.uncertainty_us));
+        cell(out, self.gpu.map(|g| g.graphics));
+        if let Some(decode) = self.gpu.and_then(|g| g.decode) {
+            let _ = write!(out, "{decode}");
         }
     }
 }
@@ -284,40 +291,56 @@ impl ViewerTrace {
             + self.network.dropped_busy()
     }
 
-    /// Writes the trace to `dir` as CSV; returns the files written. Blocks on file I/O. Saves
-    /// during the session are numbered (`viewer-<session>-save1-frames.csv`), so the files
-    /// written when it ends don't replace them.
-    pub fn write(&self, dir: &Path, during_session: bool) -> std::io::Result<Vec<PathBuf>> {
-        let save = during_session.then(|| self.saves.fetch_add(1, Ordering::Relaxed) + 1);
-        let path = |what: &str| match save {
-            Some(n) => connect_perf::trace_path(dir, "viewer", self.session, &format!("save{n}-{what}")),
-            None => connect_perf::trace_path(dir, "viewer", self.session, what),
-        };
+    /// Writes what the rings hold to `dir` as CSV; returns the files written. Blocks on file
+    /// I/O. These saves are numbered (`viewer-<session>-save1-frames.csv`), apart from the files
+    /// streamed as the session goes, which [`Self::spool`] writes.
+    pub fn save(&self, dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+        let save = self.saves.fetch_add(1, Ordering::Relaxed) + 1;
+        let path = |what: &str| connect_perf::trace_path(dir, "viewer", self.session, &format!("save{save}-{what}"));
         let files = [path("frames"), path("input"), path("loss"), path("network"), path("session")];
         connect_perf::write_csv(&files[0], &self.frames.snapshot())?;
         connect_perf::write_csv(&files[1], &self.inputs.snapshot())?;
         connect_perf::write_csv(&files[2], &self.losses.snapshot())?;
         connect_perf::write_csv(&files[3], &self.network.snapshot())?;
-        let session = [
+        connect_perf::write_csv(&files[4], &self.summary(0))?;
+        Ok(files.into())
+    }
+
+    fn summary(&self, overrun: u64) -> [SessionRow; 6] {
+        [
             SessionRow("version", env!("CARGO_PKG_VERSION").into()),
             SessionRow("session_unix_s", self.session.to_string()),
             SessionRow("qpc_frequency_hz", connect_perf::qpc_frequency().to_string()),
             SessionRow("frames_recorded", self.frames.written().to_string()),
-            SessionRow("frames_kept", self.frames.capacity().min(self.frames.written() as usize).to_string()),
+            SessionRow("records_overrun", overrun.to_string()),
             SessionRow("records_dropped_busy", self.dropped().to_string()),
-        ];
-        connect_perf::write_csv(&files[4], &session)?;
-        Ok(files.into())
+        ]
     }
-}
 
-struct SessionRow(&'static str, String);
-
-impl CsvRecord for SessionRow {
-    const HEADER: &'static str = "key,value";
-
-    fn write_row(&self, out: &mut String) {
-        let _ = write!(out, "{},{}", self.0, self.1);
+    /// Starts writing the trace to CSV files in `dir` as it goes.
+    pub fn spool(self: &Arc<Self>, dir: &Path) -> std::io::Result<Spool> {
+        let path = |what| connect_perf::trace_path(dir, "viewer", self.session, what);
+        let session_file = path("session");
+        let (mut frames, mut inputs) = (CsvStream::new(path("frames")), CsvStream::new(path("input")));
+        let (mut losses, mut network) = (CsvStream::new(path("loss")), CsvStream::new(path("network")));
+        let trace = self.clone();
+        Spool::start(move |last| {
+            let written = frames
+                .drain(&trace.frames)
+                .and_then(|()| inputs.drain(&trace.inputs))
+                .and_then(|()| losses.drain(&trace.losses))
+                .and_then(|()| network.drain(&trace.network))
+                .and_then(|()| {
+                    if last {
+                        connect_perf::write_csv(&session_file, &trace.summary(frames.overrun() + losses.overrun()))
+                    } else {
+                        Ok(())
+                    }
+                });
+            if let Err(error) = written {
+                tracing::warn!("couldn't write the performance trace: {error}");
+            }
+        })
     }
 }
 
@@ -589,6 +612,7 @@ mod tests {
                 host_kbps: clock.map(|_| 80_000),
                 loss_permille: None,
                 clock,
+                gpu: None,
             };
             network.write_row(&mut row);
             assert_eq!(row.split(',').count(), NetworkRecord::HEADER.split(',').count(), "{row}");

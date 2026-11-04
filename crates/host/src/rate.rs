@@ -7,8 +7,15 @@
 //! *ceiling*, from the congestion controller's bandwidth estimate where there is one). It climbs
 //! back quickly to just under that, then only creeps: going over again would overflow the
 //! bottleneck's queue once more, and a full queue drops packets in runs, too many at once for
-//! the recovery data, so whole frames go. The ceiling is forgotten after a long calm, as paths
-//! get faster too.
+//! the recovery data, so whole frames go. The ceiling rises when the path measures faster, and is forgotten
+//! after a long calm.
+//!
+//! A game's video comes in bursts, so what counts as the path giving out needs care. One large
+//! frame queues for a moment on any path, so only a backlog lasting from one tick to the next
+//! does. And one burst of lost packets while the video uses a fraction of the path says something
+//! went wrong on the way, not that it was full: sending less wouldn't have helped. Heavy loss,
+//! or loss going on from one tick to the next, counts whatever the bandwidth estimate says, as
+//! that lags when the path really slows down.
 
 use std::{
     sync::{
@@ -28,6 +35,9 @@ const MIN_BPS: u32 = 2_000_000;
 /// Video waiting to be sent beyond this many seconds' worth means the path can't keep up.
 const BACKLOG_HIGH: f64 = 0.060;
 const BACKLOG_SOME: f64 = 0.025;
+/// Less than this is no backlog at any bitrate, whatever it comes to in time: a large frame or
+/// two on its way.
+const BACKLOG_MIN_BYTES: usize = 32 * 1024;
 /// How long the path has to keep up before the bitrate climbs again.
 const CALM_BEFORE_RAISE: Duration = Duration::from_secs(2);
 /// Loss beyond these is more than stray: the path is likely overloaded.
@@ -47,6 +57,8 @@ const VIDEO_SHARE: f64 = 0.80;
 /// about 1% a second.
 const FAST_UNTIL: f64 = 0.90;
 const CREEP: f64 = 1.0025;
+/// How far over its value at the ceiling the estimate has to be for the path to count as better.
+const BETTER_PATH: f64 = 1.25;
 /// A ceiling not run into again for this long is forgotten.
 const FORGET_CEILING: Duration = Duration::from_secs(20);
 /// Recovery requests this soon after the start are the viewer's first keyframe, not loss.
@@ -64,6 +76,8 @@ pub(crate) struct PathSample {
     pub bandwidth_estimate: Option<u64>,
     /// Running total of the viewer's requests for a keyframe: each means it lost video.
     pub recovery_requests: u64,
+    /// Running total of video bytes handed to the network.
+    pub video_bytes: u64,
 }
 
 /// Why the bitrate changed at a tick, for the trace.
@@ -101,10 +115,16 @@ pub(crate) struct RateControl {
     sent: u64,
     lost: u64,
     recovery_requests: u64,
+    video_bytes: u64,
+    /// Whether video was backing up, and packets were being lost, at the last tick.
+    backing_up: bool,
+    losing: bool,
     started: Instant,
     calm_since: Instant,
     /// Roughly what the path carried when it last proved too slow, and when.
     ceiling: Option<(u32, Instant)>,
+    /// The bandwidth estimate then.
+    estimate_at_ceiling: u64,
     /// Whether to keep a ceiling and count the viewer's losses: off with `CONNECT_RATE_CEILING=0`,
     /// to compare with 0.9.0's controller.
     learn: bool,
@@ -122,9 +142,13 @@ impl RateControl {
             sent: 0,
             lost: 0,
             recovery_requests: 0,
+            video_bytes: 0,
+            backing_up: false,
+            losing: false,
             started: now,
             calm_since: now,
             ceiling: None,
+            estimate_at_ceiling: 0,
             learn: std::env::var("CONNECT_RATE_CEILING").map_or(true, |v| v.trim() != "0"),
             reason: Reason::Steady,
         }
@@ -171,22 +195,39 @@ impl RateControl {
 
         let before = self.bitrate();
         let backlog = path.queued_bytes as f64 * 8.0 / before as f64;
+        let backing_up = path.queued_bytes >= BACKLOG_MIN_BYTES && backlog > BACKLOG_SOME;
+        let lasting = !self.learn || (backing_up && self.backing_up);
+        self.backing_up = backing_up;
+        // Loss says the path is full if it lasts, or if the video was using all of it.
+        let video_bps = path.video_bytes.saturating_sub(self.video_bytes) as f64 * 8.0 / TICK.as_secs_f64();
+        self.video_bytes = path.video_bytes;
+        let losing = sent >= MIN_SAMPLE_PACKETS && lost > 0 && sample > LOSS_SOME;
+        let filling = !self.learn
+            || (losing && self.losing)
+            || path.bandwidth_estimate.is_none_or(|estimate| video_bps >= estimate as f64 * VIDEO_SHARE);
+        self.losing = losing;
         let clamp = |bps: f64| (bps as u32).clamp(MIN_BPS, self.max_bps);
-        let congested = if backlog > BACKLOG_HIGH {
+        let congested = if lasting && backlog > BACKLOG_HIGH {
             Some((0.7, Reason::Backlog))
         } else if sample > LOSS_HEAVY {
             Some((0.7, Reason::Loss))
-        } else if backlog > BACKLOG_SOME {
+        } else if lasting && backlog > BACKLOG_SOME {
             Some((0.85, Reason::Backlog))
-        } else if sample > LOSS_SOME {
+        } else if filling && sample > LOSS_SOME {
             Some((0.85, Reason::Loss))
-        } else if viewer_lost {
+        } else if filling && viewer_lost {
             Some((0.85, Reason::ViewerLoss))
         } else {
             None
         };
         if self.ceiling.is_some_and(|(_, at)| now.duration_since(at) >= FORGET_CEILING) {
             self.ceiling = None;
+        }
+        // The path measures faster than when it last gave out: it has got better.
+        if let (None, Some((ceiling, at)), Some(estimate)) = (congested, self.ceiling, path.bandwidth_estimate)
+            && estimate as f64 > self.estimate_at_ceiling as f64 * BETTER_PATH
+        {
+            self.ceiling = Some((ceiling.max(clamp(estimate as f64 * VIDEO_SHARE)), at));
         }
         let (after, reason) = if let Some((factor, reason)) = congested {
             self.calm_since = now;
@@ -200,6 +241,7 @@ impl RateControl {
                 return self.settle(before, clamp(f64::from(before) * factor), reason);
             }
             self.ceiling = Some((ceiling, now));
+            self.estimate_at_ceiling = path.bandwidth_estimate.unwrap_or(u64::MAX);
             (clamp(f64::from(before) * factor).min(ceiling), reason)
         } else if now.duration_since(self.calm_since) >= CALM_BEFORE_RAISE && before < self.max_bps {
             match self.ceiling {
@@ -248,7 +290,9 @@ mod tests {
         let at = |ms: u64| start + Duration::from_millis(ms);
         // A clean path leaves the cap alone.
         assert_eq!(rate.update(at(250), sample(1000, 0, 0)), None);
-        // 200 ms of video queued: cut hard, and remember a ceiling under where it broke.
+        // 200 ms of video queued, still there a tick later: cut hard, and remember a ceiling under
+        // where it broke.
+        assert_eq!(rate.update(at(375), sample(1500, 0, 500_000)), None);
         assert_eq!(rate.update(at(500), sample(2000, 0, 500_000)), Some(14_000_000));
         assert_eq!(rate.ceiling(), Some(17_000_000));
         // Stray loss is for the recovery data to fix, not a reason to send less.
@@ -286,6 +330,7 @@ mod tests {
             ..Default::default()
         };
         // At 80 Mb/s on a 40 Mb/s path: straight down to the video's share of it.
+        assert_eq!(rate.update(at(2750), path(400_000, 40_000_000)), None);
         assert_eq!(rate.update(at(3000), path(400_000, 40_000_000)), Some(32_000_000));
         assert_eq!(rate.ceiling(), Some(32_000_000));
     }
@@ -302,6 +347,138 @@ mod tests {
         assert_eq!(rate.update(at(5000), requests(2)), Some(34_000_000));
         assert_eq!(rate.reason(), Reason::ViewerLoss);
         assert_eq!(rate.update(at(5250), requests(2)), None, "only new requests count");
+    }
+
+    /// Cuts that Kellu's first long session took for congestion, on a path that had room.
+    #[test]
+    fn a_burst_isnt_congestion() {
+        let mut rate = RateControl::new(80_000_000);
+        let start = rate.started;
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let path = |sent, queued| PathSample {
+            sent_packets: sent,
+            queued_bytes: queued,
+            bandwidth_estimate: Some(76_000_000),
+            ..Default::default()
+        };
+        // 330 KB for one tick, a scene change, then gone.
+        assert_eq!(rate.update(at(250), path(1000, 330_000)), None);
+        assert_eq!(rate.update(at(500), path(2000, 32)), None);
+        assert_eq!(rate.ceiling(), None);
+
+        // At a low bitrate, a single large frame is a lot of "time" but no backlog.
+        let mut rate = RateControl::new(3_000_000);
+        let start = rate.started;
+        for tick in 1..8u32 {
+            rate.update(start + TICK * tick, sample(u64::from(tick) * 1000, 0, 20_000));
+        }
+        assert_eq!(rate.bitrate(), 3_000_000);
+    }
+
+    #[test]
+    fn loss_on_a_path_with_room_keeps_the_bitrate() {
+        let mut rate = RateControl::new(40_000_000);
+        let start = rate.started;
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        // 20 Mb/s on a path good for 73: ten packets gone at once, and the viewer lost a frame.
+        let tick_of = |seconds: f64| (20e6 / 8.0 * seconds) as u64;
+        let sent = |n: u64, lost, requests, video_bytes| PathSample {
+            sent_packets: n,
+            lost_packets: lost,
+            recovery_requests: requests,
+            video_bytes,
+            bandwidth_estimate: Some(73_000_000),
+            ..Default::default()
+        };
+        assert_eq!(rate.update(at(4750), sent(500, 0, 0, tick_of(4.75))), None);
+        assert_eq!(rate.update(at(5000), sent(1050, 60, 1, tick_of(5.0))), None);
+        assert_eq!(rate.ceiling(), None);
+        // The same loss with the video filling the path is what a ceiling is for.
+        let filled = |n: u64, lost, requests, video_bytes| PathSample {
+            bandwidth_estimate: Some(21_000_000),
+            ..sent(n, lost, requests, video_bytes)
+        };
+        assert_eq!(rate.update(at(5250), filled(1600, 60, 2, tick_of(5.25))), Some(16_800_000));
+        assert_eq!(rate.reason(), Reason::ViewerLoss);
+    }
+
+    #[test]
+    fn a_ceiling_rises_with_the_estimate() {
+        let mut rate = RateControl::new(80_000_000);
+        let start = rate.started;
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let path = |sent: u64, queued, estimate| PathSample {
+            sent_packets: sent,
+            queued_bytes: queued,
+            bandwidth_estimate: Some(estimate),
+            ..Default::default()
+        };
+        rate.update(at(2750), path(1000, 400_000, 10_000_000));
+        rate.update(at(3000), path(2000, 400_000, 10_000_000));
+        assert_eq!(rate.ceiling(), Some(8_000_000));
+        // The path is back: no need to wait for the ceiling to be forgotten.
+        rate.update(at(5250), path(3000, 0, 40_000_000));
+        assert_eq!(rate.ceiling(), Some(32_000_000));
+        for tick in 0..40 {
+            rate.update(at(5500 + tick * 250), path(4000 + tick * 1000, 0, 40_000_000));
+        }
+        assert!(rate.bitrate() >= 28_000_000, "back near the path in ten seconds: {}", rate.bitrate());
+    }
+
+    /// A path that falls to 10 Mb/s and comes back, with an encoder that follows its target (as
+    /// the hardware ones do) and an estimate that can only see a little past what's being sent.
+    #[test]
+    fn comes_back_when_the_path_does() {
+        let mut rate = RateControl::new(40_000_000);
+        let start = rate.started;
+        let (mut queued, mut estimate, mut sent) = (0f64, 40e6f64, 0u64);
+        let (mut lowest, mut recovered_after) = (u32::MAX, None);
+        for tick in 1..=320u32 {
+            let seconds = f64::from(tick) / 4.0;
+            let capacity = if (20.0..35.0).contains(&seconds) { 10e6 } else { 40e6 };
+            let offered = f64::from(rate.bitrate()) * 1.12;
+            queued = (queued + (offered - capacity) * 0.25 / 8.0).max(0.0);
+            estimate = (offered.min(capacity) * 1.25).min(capacity).max(estimate.min(capacity) * 0.98);
+            sent += 1000;
+            rate.update(
+                start + TICK * tick,
+                PathSample {
+                    sent_packets: sent,
+                    queued_bytes: queued as usize,
+                    bandwidth_estimate: Some(estimate as u64),
+                    ..Default::default()
+                },
+            );
+            lowest = lowest.min(rate.bitrate());
+            if seconds >= 35.0 && recovered_after.is_none() && rate.bitrate() >= 32_000_000 {
+                recovered_after = Some(seconds - 35.0);
+            }
+        }
+        assert!(lowest < 10_000_000, "it did go under the slow path: {lowest}");
+        let recovered_after = recovered_after.expect("back to 80% of the cap");
+        println!("back to 80% of the cap {recovered_after} s after the path");
+        assert!(recovered_after <= 30.0, "{recovered_after} s");
+    }
+
+    /// The path really slowed down, and the estimate hasn't caught up.
+    #[test]
+    fn lasting_loss_counts_however_much_room_the_estimate_shows() {
+        let mut rate = RateControl::new(40_000_000);
+        let start = rate.started;
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let lossy = |n: u64| PathSample {
+            sent_packets: n * 100,
+            lost_packets: n * 15,
+            bandwidth_estimate: Some(400_000_000),
+            ..Default::default()
+        };
+        assert_eq!(rate.update(at(4750), lossy(1)), None);
+        assert_eq!(rate.update(at(5000), lossy(2)), Some(34_000_000));
+        assert_eq!(rate.reason(), Reason::Loss);
+        // Heavy loss doesn't wait for the next tick.
+        let mut rate = RateControl::new(40_000_000);
+        let heavy = PathSample { lost_packets: 30, ..lossy(1) };
+        assert_eq!(rate.update(rate.started + Duration::from_secs(5), heavy), Some(28_000_000));
     }
 
     /// The controller against a model of Kellu's 0.9.0 session: a path that carries 80 Mb/s,

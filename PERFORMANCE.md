@@ -249,6 +249,82 @@ OpenH264 uses size-limited 16 KiB slices and up to four workers; a single slice 
 one worker. On 60 precomputed 1920×1080 frames with NASM, median encode time went from 27.9 ms
 to 10.9 ms (p95 29.7 ms to 14.1 ms) for about 4% more bytes.
 
+## Version 0.9.2: quiet scenes
+
+The first long-ish session on real hardware (5 minutes, RTX 5060 to RTX 3070 Ti, both on Ethernet,
+43 ms apart) changed what 0.9.1 said about lost frames. 0.9.1 blamed overrunning the path. That
+session's three bursts of lost packets (10, 7 and 35, of 761,000) came with no queue, at about a
+third of the path's rate or less, so sending less wouldn't have prevented them. What did go wrong
+was how Connect took quiet scenes.
+
+- **BBR forgot the path.** With no loss at all, its estimate fell from 76 to 1.6 Mb/s and its window
+  from 883 to 30 KB as a game went quiet, and the next large frame took up to 247 ms to send. BBR
+  is now wrapped by a controller that remembers the best rate for two minutes. When BBR's estimate
+  falls under half of that, pacing and the window hold to the remembered rate
+  (`crates/net/src/congestion.rs`). It keeps out of the way otherwise: BBR shrinks its window on
+  purpose to measure the round trip, and can't finish, or ever probe for more, unless what's in
+  flight falls to match. An early version that always held the window up froze BBR that way. Loss,
+  or a round trip 50% over the best, halves what's remembered. `CONNECT_PATH_MEMORY=0` turns it off.
+  Replaying 80 s of that session's frames over an 80 Mb/s path:
+
+  | To the last datagram | Plain BBR | With memory |
+  |---|---|---|
+  | p99 | 647 ms | 27 ms |
+  | Worst | 756 ms | 65 ms |
+  | Frames over 60 ms | 463 | 5 |
+
+- **Queue pressure is judged by what lasts.** All 16 backlog cuts in that session came from one
+  tick of queue, or a frame's worth at a low bitrate. The bitrate spent 151 of 308 seconds under
+  25 Mb/s and 38 under 5, on a 76 Mb/s path. A backlog now has to last two ticks and be over 32 KB.
+- **Stray loss keeps the bitrate.** One burst while the video uses under 80% of the path no longer
+  costs anything. Heavy loss (20% of a tick) or loss lasting two ticks still counts, as the estimate
+  lags when a path really slows down.
+- **The bitrate comes back.** A ceiling now rises when the path measures over 25% faster than it
+  did when the ceiling was set, as well as being forgotten after 20 calm seconds.
+
+### The trade-off: sudden drops, skipped frames and picture quality
+
+Holding the bitrate through bursts is a bet that a burst is a burst. It's right for what real
+sessions have shown so far, and it means better pictures: the bitrate no longer falls with the
+scene, or stays down after a stray burst. It also means reacting about a tick (250 ms) later when
+a path really does collapse, where the old controller cut at once.
+
+Measured with a CPU-encoded stream over a 40 Mb/s path falling to 10 at once, then back:
+
+| | Old (0.9.0's controller, plain BBR) | 0.9.2 (three runs) |
+|---|---|---|
+| Frames lost at the drop | 18–19 | 19–20 |
+| Frames skipped waiting for a keyframe | 8 | 7–16 |
+| Worst one-second latency | 233–254 ms | 214–295 ms |
+| Latency back to normal after the path recovers | within 3 s | in 3–13 s |
+| Bitrate target 32 s after the path recovers | still 2 Mb/s | the full cap (2 of 3 runs) |
+
+So a sudden collapse costs a few more skipped frames, and a freeze of a quarter of a second either
+way. In return the picture isn't throttled for no reason, and recovers when the path does. In that
+third run the target was still near 3 Mb/s 32 s later: the CPU encoder doesn't follow low targets
+(it sent 15 Mb/s against a target of 3), so the queue kept looking like a backlog. Hardware encoders
+follow their target; in a model of that, the bitrate is back at 80% of the cap 19 s after the path.
+That is a model. It hasn't been seen on a real path yet.
+
+### Still open
+
+- **Bursts of lost packets.** Recovery data can't repair 10 packets in a row, which take a whole
+  frame. The frames after it arrive but can't be decoded, so the picture freezes until a keyframe
+  comes back: 82 ms in that session, a round trip and a bit. They happened on Ethernet, with no
+  queue on the host's side, and their cause is unknown. The host's and viewer's traces show when,
+  and how many packets, but not where on the path. 0.9.2 changes nothing about this.
+- **Host capture and encoder stalls.** 12 of the 13 encoder calls over 20 ms (up to 393 ms) came in
+  two moments, at 169–170 s and 178–180 s, during a stretch of gaps between captures of up to
+  half a second. The second lined up with a 113 ms round trip and 7 lost packets. That points at
+  something on the host stalling everything, not at the encoder alone, but it isn't established.
+  The bitrate was near its floor at the time, which 0.9.2 should stop, so the link can't be ruled
+  out. 0.9.2 traces tell a stalled capture from a game with nothing new to show (METRICS.md).
+- **Repeating network queue events.** Every 10–30 s under load, some 30 frames go 50–100 ms over
+  the usual latency: 1.5% of frames, and what the p99 latency is made of. Not yet explained.
+- **Host priority.** That session dropped 829 remote events to host priority, in runs around 180 s
+  and 280–300 s, with no explanation of what set it off. It's not established that anyone was
+  using the host's mouse. 0.9.2 records what the hooks saw (METRICS.md).
+
 ## Build requirement
 
 OpenH264 silently builds its C++ fallback if NASM is unavailable; install NASM so the codec

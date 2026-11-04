@@ -1,11 +1,16 @@
-//! The host's half of the performance trace: a record per frame sent, per colour conversion
-//! timed on the graphics card and per remote input event, kept in bounded rings. Summarised for
-//! the viewer about once a second, and written as CSV when the session ends if a trace directory
-//! is set. Every time here is on the host's clock ([`connect_proto::now_micros`]). See METRICS.md.
+//! The host's half of the performance trace: a record per frame sent, per capture, per colour
+//! conversion timed on the graphics card and per remote input event, kept in bounded rings.
+//! Summarised for the viewer about once a second, and streamed to CSV files as the session goes
+//! if a trace directory is set. Every time here is on the host's clock
+//! ([`connect_proto::now_micros`]). See METRICS.md.
 
-use std::{fmt::Write as _, path::Path};
+use std::{
+    fmt::Write as _,
+    path::Path,
+    sync::{Arc, atomic::AtomicU64},
+};
 
-use connect_perf::{CsvRecord, ProcessMonitor, TraceRing, cell, percentiles};
+use connect_perf::{CsvRecord, CsvStream, ProcessLoad, ProcessMonitor, Spool, TraceRing, cell, percentiles};
 use connect_proto::{Codec, perf::HostPerf};
 
 /// One frame, from capture to handing its datagrams to the network stack.
@@ -79,6 +84,55 @@ queued_bytes,bitrate_kbps,dropped";
             self.bitrate_kbps,
             self.dropped as u8
         );
+    }
+}
+
+/// Why a picture was replaced by a newer one before it could be encoded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum Replaced {
+    /// The picture before this one went, or was never held back.
+    #[default]
+    No,
+    /// It was waiting for its turn: at most one picture goes per refresh of the host's screen.
+    Turn,
+    /// It was held while the network caught up.
+    Backlog,
+}
+
+impl Replaced {
+    fn name(self) -> &'static str {
+        match self {
+            Replaced::No => "",
+            Replaced::Turn => "turn",
+            Replaced::Backlog => "backlog",
+        }
+    }
+}
+
+/// One image captured from the screen, whether or not it was encoded. A gap between these with
+/// `accumulated` at 1 means nothing new reached the screen; above 1, images came and capture
+/// missed them.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct CaptureRecord {
+    /// Matches [`FrameRecord::capture`], for the images that went on to be encoded.
+    pub capture: u64,
+    pub time_us: u64,
+    pub capture_us: u32,
+    pub present_to_capture_us: u32,
+    pub accumulated: Option<u32>,
+    /// What became of the image before this one, if it was never encoded.
+    pub replaced: Replaced,
+}
+
+impl CsvRecord for CaptureRecord {
+    const HEADER: &'static str = "capture_index,time_us,capture_us,present_to_capture_us,accumulated_frames,\
+previous_replaced";
+
+    fn write_row(&self, out: &mut String) {
+        let _ = write!(out, "{},{},{},", self.capture, self.time_us, self.capture_us);
+        cell(out, (self.present_to_capture_us > 0).then_some(self.present_to_capture_us));
+        cell(out, self.accumulated);
+        out.push_str(self.replaced.name());
     }
 }
 
@@ -184,11 +238,16 @@ pub(crate) struct NetworkRecord {
     pub reason: &'static str,
     /// Video bytes handed to the network since the last tick.
     pub video_bytes: u32,
+    /// What the host's own mouse and keyboard did since the last tick.
+    pub local: crate::input::LocalActivity,
+    /// The remote events host priority dropped since the last tick.
+    pub host_priority: u32,
 }
 
 impl CsvRecord for NetworkRecord {
     const HEADER: &'static str = "time_us,sent_packets,lost_packets,queued_bytes,bandwidth_estimate_bps,cwnd_bytes,\
-rtt_us,congestion_events,path,recovery_requests,bitrate_kbps,ceiling_kbps,reason,video_bytes";
+rtt_us,congestion_events,path,recovery_requests,bitrate_kbps,ceiling_kbps,reason,video_bytes,\
+local_mouse_moves,local_mouse_pixels,local_mouse_tagged,local_mouse_buttons,local_keys,host_priority_drops";
 
     fn write_row(&self, out: &mut String) {
         let _ = write!(out, "{},{},{},{},", self.time_us, self.sent_packets, self.lost_packets, self.queued_bytes);
@@ -204,7 +263,41 @@ rtt_us,congestion_events,path,recovery_requests,bitrate_kbps,ceiling_kbps,reason
             self.bitrate_kbps
         );
         cell(out, self.ceiling_kbps);
-        let _ = write!(out, "{},{}", self.reason, self.video_bytes);
+        let l = &self.local;
+        let _ = write!(
+            out,
+            "{},{},{},{},{},{},{},{}",
+            self.reason,
+            self.video_bytes,
+            l.mouse_moves,
+            l.mouse_pixels,
+            l.mouse_tagged,
+            l.mouse_buttons,
+            l.keys,
+            self.host_priority
+        );
+    }
+}
+
+/// How busy the host was, about once a second: a stall that lines up with a full graphics card
+/// or processor came from the load, not from Connect.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct LoadRecord {
+    pub time_us: u64,
+    pub process: Option<ProcessLoad>,
+    pub gpu: Option<connect_gpu_load::GpuLoad>,
+}
+
+impl CsvRecord for LoadRecord {
+    const HEADER: &'static str = "time_us,connect_cpu_percent,gpu_graphics_percent,gpu_encode_percent";
+
+    fn write_row(&self, out: &mut String) {
+        let _ = write!(out, "{},", self.time_us);
+        cell(out, self.process.map(|p| format!("{:.1}", p.cpu_percent)));
+        cell(out, self.gpu.map(|g| g.graphics));
+        if let Some(encode) = self.gpu.and_then(|g| g.encode) {
+            let _ = write!(out, "{encode}");
+        }
     }
 }
 
@@ -232,9 +325,13 @@ impl InputStamp {
 /// A session's trace.
 pub(crate) struct HostTrace {
     pub frames: TraceRing<FrameRecord>,
+    pub captures: TraceRing<CaptureRecord>,
     pub conversions: TraceRing<ConvertRecord>,
     pub inputs: TraceRing<InputRecord>,
     pub network: TraceRing<NetworkRecord>,
+    pub load: TraceRing<LoadRecord>,
+    /// Remote events host priority has dropped so far.
+    pub host_priority_drops: AtomicU64,
     /// When the session started, in Unix seconds, to name its files.
     session: u64,
 }
@@ -244,27 +341,59 @@ impl HostTrace {
         let capacity = connect_perf::ring_capacity();
         Self {
             frames: TraceRing::new(capacity),
+            captures: TraceRing::new(capacity),
             conversions: TraceRing::new(capacity),
             inputs: TraceRing::new(capacity),
             network: TraceRing::new(capacity),
+            load: TraceRing::new(capacity),
+            host_priority_drops: AtomicU64::new(0),
             session: connect_perf::session_stamp(),
         }
     }
 
     fn dropped(&self) -> u64 {
         self.frames.dropped_busy()
+            + self.captures.dropped_busy()
             + self.conversions.dropped_busy()
             + self.inputs.dropped_busy()
             + self.network.dropped_busy()
+            + self.load.dropped_busy()
     }
 
-    /// Writes the trace to `dir` as CSV files. Blocks on file I/O.
-    pub fn write(&self, dir: &Path) -> std::io::Result<()> {
+    /// Starts writing the trace to CSV files in `dir` as it goes.
+    pub fn spool(self: &Arc<Self>, dir: &Path) -> std::io::Result<Spool> {
         let path = |what| connect_perf::trace_path(dir, "host", self.session, what);
-        connect_perf::write_csv(&path("frames"), &self.frames.snapshot())?;
-        connect_perf::write_csv(&path("convert"), &self.conversions.snapshot())?;
-        connect_perf::write_csv(&path("input"), &self.inputs.snapshot())?;
-        connect_perf::write_csv(&path("network"), &self.network.snapshot())
+        let session_file = path("session");
+        let (mut frames, mut captures, mut conversions) =
+            (CsvStream::new(path("frames")), CsvStream::new(path("capture")), CsvStream::new(path("convert")));
+        let (mut inputs, mut network, mut load) =
+            (CsvStream::new(path("input")), CsvStream::new(path("network")), CsvStream::new(path("load")));
+        let trace = self.clone();
+        Spool::start(move |last| {
+            let written = frames
+                .drain(&trace.frames)
+                .and_then(|()| captures.drain(&trace.captures))
+                .and_then(|()| conversions.drain(&trace.conversions))
+                .and_then(|()| inputs.drain(&trace.inputs))
+                .and_then(|()| network.drain(&trace.network))
+                .and_then(|()| load.drain(&trace.load));
+            if let Err(error) = written {
+                tracing::warn!("couldn't write the performance trace: {error}");
+            }
+            if last {
+                let overrun = frames.overrun() + captures.overrun() + conversions.overrun();
+                let session = [
+                    connect_perf::SessionRow("version", env!("CARGO_PKG_VERSION").into()),
+                    connect_perf::SessionRow("session_unix_s", trace.session.to_string()),
+                    connect_perf::SessionRow("frames_recorded", trace.frames.written().to_string()),
+                    connect_perf::SessionRow("records_overrun", overrun.to_string()),
+                    connect_perf::SessionRow("records_dropped_busy", trace.dropped().to_string()),
+                ];
+                if let Err(error) = connect_perf::write_csv(&session_file, &session) {
+                    tracing::warn!("couldn't write the performance trace: {error}");
+                }
+            }
+        })
     }
 }
 

@@ -19,7 +19,7 @@ mod process;
 mod ring;
 mod stats;
 
-pub use csv::{CsvRecord, cell, write_csv};
+pub use csv::{CsvRecord, CsvStream, SessionRow, Spool, cell, write_csv};
 pub use process::{ProcessLoad, ProcessMonitor};
 pub use ring::TraceRing;
 pub use stats::{Percentiles, Spread, percentiles, spread};

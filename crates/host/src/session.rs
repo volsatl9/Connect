@@ -27,7 +27,7 @@ use crate::{
     encode::{FrameStamp, VideoEvent, VideoStream},
     input::{self, Unavailable},
     rate::{self, PathSample, RateControl},
-    trace::{FrameRecord, HostTrace, NetworkRecord, Reporter},
+    trace::{FrameRecord, HostTrace, LoadRecord, NetworkRecord, Reporter},
 };
 
 /// An unchanged pointer position is sent again this often, so the viewer knows it's current.
@@ -111,6 +111,7 @@ async fn serve(conn: &Connection, shared: &Shared, events: &mpsc::Sender<HostEve
     let bitrate_bps = shared.bitrate_mbps.load(Ordering::Relaxed).saturating_mul(1_000_000);
     let rate = RateControl::new(bitrate_bps);
     let trace = Arc::new(HostTrace::new());
+    let spool = start_trace(&trace);
     let backlog = Box::new(rate.backlog_check(conn.clone()));
     let mut video = VideoStream::start(shared.video.clone(), codec, rate.bitrate(), backlog, trace.clone())?;
     let (width, height) = match video.next().await {
@@ -153,7 +154,7 @@ async fn serve(conn: &Connection, shared: &Shared, events: &mpsc::Sender<HostEve
     if timeout(INPUT_RELEASE, input).await.is_err() {
         warn!("input took too long to release");
     }
-    write_trace(trace).await;
+    finish_trace(spool).await;
     let _ = events.send(HostEvent::SessionEnded { peer, reason }).await;
     Ok(())
 }
@@ -233,7 +234,7 @@ async fn stream(
     // For the rate controller and the trace: the viewer's keyframe requests (each means it lost
     // video), video bytes sent, and the path's counters at the last tick.
     let (mut recovery_requests, mut video_bytes) = (0u64, 0u64);
-    let mut last_tick = (0u64, 0u64, 0u64, 0u64, 0u64);
+    let mut last_tick = (0, 0, 0, 0, 0, crate::input::LocalActivity::default(), 0);
     let mut remote_seq = None;
     let mut audio_enabled = desktop && permissions.borrow().allows(DeviceClass::Audio);
     let mut audio = start_audio(conn, &mut send, audio_enabled).await?;
@@ -327,12 +328,15 @@ async fn stream(
                     queued_bytes: queued,
                     bandwidth_estimate: path.and_then(|p| p.bandwidth_estimate),
                     recovery_requests,
+                    video_bytes,
                 };
                 if let Some(bps) = rate.update(Instant::now(), sample) {
                     debug!(mbps = bps as f32 / 1e6, loss = rate.loss(), queued, reason = rate.reason().name(), "video bitrate changed");
                     video.set_bitrate(bps);
                 }
                 let congestion = path.map_or(0, |p| p.congestion_events);
+                let local = crate::input::local_activity();
+                let host_priority = trace.host_priority_drops.load(Ordering::Relaxed);
                 let delta = |now: u64, then: u64| now.saturating_sub(then).min(u64::from(u32::MAX)) as u32;
                 trace.network.push(NetworkRecord {
                     time_us: connect_proto::now_micros(),
@@ -349,15 +353,24 @@ async fn stream(
                     ceiling_kbps: rate.ceiling().map(|bps| bps / 1000),
                     reason: rate.reason().name(),
                     video_bytes: delta(video_bytes, last_tick.4),
+                    local: local.since(last_tick.5),
+                    host_priority: delta(host_priority, last_tick.6),
                 });
-                last_tick = (sent, lost, congestion, recovery_requests, video_bytes);
+                last_tick = (sent, lost, congestion, recovery_requests, video_bytes, local, host_priority);
                 rate_ticks += 1;
                 if rate_ticks.is_multiple_of(4) {
+                    let gpu = gpu_load.as_mut().and_then(connect_gpu_load::Monitor::sample);
+                    let perf = reporter.report(trace).map(Box::new);
+                    trace.load.push(LoadRecord {
+                        time_us: connect_proto::now_micros(),
+                        process: perf.as_ref().and_then(|p| p.process),
+                        gpu,
+                    });
                     let stats = HostMsg::VideoStats {
                         bitrate_kbps: rate.bitrate() / 1000,
                         loss_permille: (rate.loss() * 1000.0).round() as u16,
-                        gpu: gpu_load.as_mut().and_then(connect_gpu_load::Monitor::sample),
-                        perf: reporter.report(trace).map(Box::new),
+                        gpu,
+                        perf,
                     };
                     net::write_msg(&mut send, &stats).await?;
                 }
@@ -499,12 +512,16 @@ fn send_frame(
     }
 }
 
-/// Writes the session's trace as CSV, if a trace directory is set.
-async fn write_trace(trace: Arc<HostTrace>) {
-    let Some(dir) = connect_perf::trace_dir().filter(|_| connect_perf::enabled()) else { return };
-    match tokio::task::spawn_blocking(move || trace.write(&dir).map(|()| dir)).await {
-        Ok(Ok(dir)) => info!(dir = %dir.display(), "performance trace written"),
-        Ok(Err(error)) => warn!("couldn't write the performance trace: {error}"),
+/// Starts streaming the session's trace to CSV files, if a trace directory is set.
+fn start_trace(trace: &Arc<HostTrace>) -> Option<connect_perf::Spool> {
+    let dir = connect_perf::trace_dir().filter(|_| connect_perf::enabled())?;
+    trace.spool(&dir).inspect_err(|error| warn!("couldn't start the performance trace: {error}")).ok()
+}
+
+async fn finish_trace(spool: Option<connect_perf::Spool>) {
+    let Some(spool) = spool else { return };
+    match tokio::task::spawn_blocking(move || spool.finish()).await {
+        Ok(()) => info!("performance trace written"),
         Err(error) => warn!("writing the performance trace stopped: {error}"),
     }
 }

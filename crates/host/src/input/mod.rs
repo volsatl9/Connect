@@ -251,6 +251,41 @@ fn toggle<T: std::hash::Hash + Eq>(set: &mut HashSet<T>, item: T, on: bool) {
     }
 }
 
+/// What the host's own mouse and keyboard have done: running totals, or the change between two.
+/// Injected input isn't in here. Whatever is, set host priority off.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct LocalActivity {
+    pub mouse_moves: u64,
+    /// Distance moved, across and down added up: a hand moves hundreds, a jittery sensor a few.
+    pub mouse_pixels: u64,
+    /// Events from something that tagged them, as mouse software does.
+    pub mouse_tagged: u64,
+    pub mouse_buttons: u64,
+    pub keys: u64,
+}
+
+impl LocalActivity {
+    pub fn since(self, earlier: Self) -> Self {
+        Self {
+            mouse_moves: self.mouse_moves.saturating_sub(earlier.mouse_moves),
+            mouse_pixels: self.mouse_pixels.saturating_sub(earlier.mouse_pixels),
+            mouse_tagged: self.mouse_tagged.saturating_sub(earlier.mouse_tagged),
+            mouse_buttons: self.mouse_buttons.saturating_sub(earlier.mouse_buttons),
+            keys: self.keys.saturating_sub(earlier.keys),
+        }
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn local_activity() -> LocalActivity {
+    windows::local_activity()
+}
+
+#[cfg(not(windows))]
+pub(crate) fn local_activity() -> LocalActivity {
+    LocalActivity::default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

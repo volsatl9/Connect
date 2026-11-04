@@ -7,6 +7,14 @@
 //! `cargo test -p connect-host --release --test bottleneck -- --ignored --nocapture`
 //! (`BOTTLENECK_MBPS`, `BOTTLENECK_QUEUE_KB`, `BOTTLENECK_SECS`, `BOTTLENECK_FPS` change the path
 //! and the run; `CONNECT_RATE_CEILING=0` runs 0.9.0's rate controller, to compare.)
+//!
+//! `BOTTLENECK_DROP_SECS` makes the path four times slower that far in, `BOTTLENECK_BACK_SECS`
+//! brings it back, and `BOTTLENECK_CAP_MBPS` sets the host's cap.
+//!
+//! `replaying_a_session` sends a real session's frames, sizes and timing from a host trace
+//! (`REPLAY_FRAMES=host-…-frames.csv`, `REPLAY_FROM` and `REPLAY_TO` in seconds), over the same
+//! kind of path with room to spare. Synthetic traffic doesn't make BBR forget the path; a game
+//! does. `CONNECT_PATH_MEMORY=0` shows plain BBR.
 
 use std::{
     net::SocketAddr,
@@ -30,6 +38,9 @@ struct Path {
     queue_bytes: usize,
     /// Each way, on top of the queue.
     delay: Duration,
+    /// When the path gets four times slower, if it does, and when it gets better again.
+    slows_at: Option<Duration>,
+    back_at: Option<Duration>,
 }
 
 /// What got through the relay.
@@ -73,22 +84,30 @@ async fn bottleneck_relay(host: SocketAddr, path: Path, relayed: Arc<Mutex<Relay
         let mut buf = vec![0; 65_536];
         // When the bottleneck finishes sending what it holds.
         let mut free_at = tokio::time::Instant::now();
+        let started = Instant::now();
         loop {
             let Ok((len, _)) = host_side.recv_from(&mut buf).await else { return };
+            let slowed = path.slows_at.is_some_and(|at| started.elapsed() >= at)
+                && path.back_at.is_none_or(|at| started.elapsed() < at);
+            let bits_per_second = if slowed { path.bits_per_second / 4.0 } else { path.bits_per_second };
             let Some(client) = *client.lock().unwrap() else { continue };
             let now = tokio::time::Instant::now();
             free_at = free_at.max(now);
-            let held = (free_at - now).as_secs_f64() * path.bits_per_second / 8.0;
+            let held = (free_at - now).as_secs_f64() * bits_per_second / 8.0;
             if held as usize + len > path.queue_bytes {
                 relayed.lock().unwrap().dropped += 1;
                 continue;
             }
-            free_at += Duration::from_secs_f64(len as f64 * 8.0 / path.bits_per_second);
+            free_at += Duration::from_secs_f64(len as f64 * 8.0 / bits_per_second);
             relayed.lock().unwrap().forwarded += 1;
             let _ = to_client.send((free_at + path.delay, buf[..len].to_vec(), client));
         }
     });
     addr
+}
+
+fn seconds_from(name: &str) -> Option<Duration> {
+    std::env::var(name).ok().map(|s| Duration::from_secs(s.parse().unwrap()))
 }
 
 fn env<T: std::str::FromStr>(name: &str, default: T) -> T {
@@ -120,14 +139,18 @@ async fn video_through_a_bottleneck() {
         bits_per_second: env("BOTTLENECK_MBPS", 10.0) * 1e6,
         queue_bytes: env("BOTTLENECK_QUEUE_KB", 64) * 1024,
         delay: Duration::from_millis(20),
+        slows_at: seconds_from("BOTTLENECK_DROP_SECS"),
+        back_at: seconds_from("BOTTLENECK_BACK_SECS"),
     };
     let seconds = env("BOTTLENECK_SECS", 30u64);
     let fps = env("BOTTLENECK_FPS", 120u32);
 
+    let cap = env("BOTTLENECK_CAP_MBPS", 20);
+
     let host_ep = net::bind_local_endpoint_at(SecretKey::generate(), "[::1]:0").await.unwrap();
     let config = HostConfig {
         video: VideoSource::NoisyTestPattern { width: 1280, height: 720, fps },
-        bitrate_mbps: 20,
+        bitrate_mbps: cap,
         ..HostConfig::new("Bottleneck host")
     };
     let (host, mut host_events) = connect_host::start(host_ep.clone(), config);
@@ -151,7 +174,7 @@ async fn video_through_a_bottleneck() {
     }
 
     println!(
-        "path {:.0} Mb/s, queue {} KB, {} ms each way; host cap 20 Mb/s",
+        "path {:.0} Mb/s, queue {} KB, {} ms each way; host cap {cap} Mb/s",
         path.bits_per_second / 1e6,
         path.queue_bytes / 1024,
         path.delay.as_millis()
@@ -195,4 +218,104 @@ async fn video_through_a_bottleneck() {
     host.shutdown().await;
     client_ep.close().await;
     host_ep.close().await;
+}
+
+/// A frame from a host trace: when it went out, in microseconds, its bytes and datagrams.
+fn trace_frames(path: &str) -> Vec<(u64, usize, usize)> {
+    let text = std::fs::read_to_string(path).unwrap();
+    let mut lines = text.lines();
+    let header: Vec<&str> = lines.next().unwrap().split(',').collect();
+    let column = |name: &str| header.iter().position(|h| *h == name).unwrap();
+    let (captured, after, bytes, datagrams) =
+        (column("capture_time_us"), column("sent_after_us"), column("bytes"), column("datagrams"));
+    lines
+        .map(|line| {
+            let cells: Vec<&str> = line.split(',').collect();
+            let at = cells[captured].parse::<u64>().unwrap() + cells[after].parse::<u64>().unwrap();
+            (at, cells[bytes].parse().unwrap(), cells[datagrams].parse().unwrap())
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a host trace, and takes as long as the part of it replayed"]
+async fn replaying_a_session() {
+    let trace = trace_frames(&std::env::var("REPLAY_FRAMES").expect("REPLAY_FRAMES names a host trace"));
+    let session_start = trace[0].0;
+    let seconds = |name: &str, default: u64| session_start + env(name, default) * 1_000_000;
+    let (from, to) = (seconds("REPLAY_FROM", 0), seconds("REPLAY_TO", 60));
+    let frames: Vec<_> = trace.into_iter().filter(|frame| (from..to).contains(&frame.0)).collect();
+
+    let path = Path {
+        bits_per_second: 80e6,
+        queue_bytes: 1024 * 1024,
+        delay: Duration::from_millis(20),
+        slows_at: None,
+        back_at: None,
+    };
+    let sender = net::bind_local_endpoint_at(SecretKey::generate(), "[::1]:0").await.unwrap();
+    let relay = bottleneck_relay(*sender.bound_sockets().first().unwrap(), path, Arc::default()).await;
+    let receiver = net::bind_local_endpoint(SecretKey::generate()).await.unwrap();
+    let addr = EndpointAddr::new(sender.id()).with_ip_addr(relay);
+    let accepting = sender.clone();
+    let accepted = tokio::spawn(async move { accepting.accept().await.unwrap().await.unwrap() });
+    let client = net::connect(&receiver, addr).await.unwrap();
+    let conn = accepted.await.unwrap();
+
+    // Each datagram starts with its frame's number; the last to arrive says when a frame was whole.
+    let arrived = Arc::new(Mutex::new(vec![(None::<Instant>, 0usize); frames.len()]));
+    let recording = arrived.clone();
+    tokio::spawn(async move {
+        while let Ok(datagram) = client.read_datagram().await {
+            let frame = u32::from_le_bytes(datagram[..4].try_into().unwrap()) as usize;
+            let mut arrived = recording.lock().unwrap();
+            arrived[frame] = (Some(Instant::now()), arrived[frame].1 + 1);
+        }
+    });
+
+    let started = Instant::now();
+    let mut sent_at = Vec::with_capacity(frames.len());
+    let (mut lowest_estimate, mut lowest_window, mut checked) = (u64::MAX, u64::MAX, 0);
+    for (number, &(at, bytes, datagrams)) in frames.iter().enumerate() {
+        tokio::time::sleep_until((started + Duration::from_micros(at - frames[0].0)).into()).await;
+        sent_at.push(Instant::now());
+        let size = (bytes / datagrams.max(1)).clamp(8, 1150);
+        for _ in 0..datagrams {
+            let mut datagram = vec![0; size];
+            datagram[..4].copy_from_slice(&(number as u32).to_le_bytes());
+            let _ = conn.send_datagram(datagram.into());
+        }
+        if started.elapsed().as_secs() > checked {
+            checked = started.elapsed().as_secs();
+            let snapshot = net::path_snapshot(&conn).unwrap();
+            lowest_estimate = lowest_estimate.min(snapshot.bandwidth_estimate.unwrap_or(0));
+            lowest_window = lowest_window.min(snapshot.cwnd);
+        }
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let (mut times, mut incomplete) = (Vec::new(), 0);
+    for (number, &(last, count)) in arrived.lock().unwrap().iter().enumerate() {
+        incomplete += usize::from(count < frames[number].2);
+        // The first seconds are BBR finding the path, which a real session did before this part.
+        if let Some(last) = last.filter(|_| frames[number].0 - frames[0].0 > 3_000_000) {
+            times.push((last - sent_at[number]).as_secs_f64() * 1000.0);
+        }
+    }
+    times.sort_unstable_by(f64::total_cmp);
+    let at = |share: f64| times[((times.len() - 1) as f64 * share) as usize];
+    println!(
+        "{} frames, {incomplete} incomplete; to the last datagram: p50 {:.1} p99 {:.1} p99.9 {:.1} max {:.1} ms; {} over 60 ms",
+        frames.len(),
+        at(0.5),
+        at(0.99),
+        at(0.999),
+        at(1.0),
+        times.iter().filter(|ms| **ms > 60.0).count()
+    );
+    println!("lowest estimate {:.1} Mb/s, lowest window {} KB", lowest_estimate as f64 / 1e6, lowest_window / 1024);
+
+    conn.close(0u32.into(), b"done");
+    sender.close().await;
+    receiver.close().await;
 }

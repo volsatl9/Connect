@@ -94,7 +94,7 @@ impl<T: CsvRecord + Copy> CsvStream<T> {
 }
 
 /// How often a [`Spool`] writes out what's new. Far less than a ring takes to fill.
-const SPOOL_EVERY: Duration = Duration::from_secs(5);
+const SPOOL_EVERY: Duration = Duration::from_secs(2);
 
 /// Runs `drain` on a thread of its own every few seconds, away from the video threads, and once
 /// more with `true` at the end.

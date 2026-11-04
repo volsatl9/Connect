@@ -11,7 +11,8 @@ optimised.
 |---|---|
 | Live summary | **Ctrl+Alt+S** in a session. Percentiles over the last second. |
 | Save the viewer's trace | **Ctrl+Alt+E** in a session. CSV files go to `connect-traces` in the folder the app was started from, or to the temp folder if that one isn't writable. |
-| Trace every session, both sides | Set `CONNECT_TRACE` to a directory. Each side streams its CSV files there as the session goes, every 5 seconds. |
+| Session files, on by default in the app | Each PC keeps its last 5 hosted and last 5 viewed sessions in a `session-files` folder (Settings → Session files → Open folder). The viewer sends its files to the host during the session, and the host writes `report-<session>.txt` when it ends. |
+| Trace every session, both sides | Set `CONNECT_TRACE` to a directory. Each side streams its CSV files there as the session goes, every 2 seconds. |
 | Follow every frame | Put both PCs' files in one folder and run `connect trace-report <folder>`. See [Following frames](#following-frames). |
 | Terminal sessions | `connect host --trace DIR` and `connect join <USER-ID> --trace DIR`. These do the same as the setting above. |
 | Turn tracing off | `CONNECT_TRACE=0` (also `off` or `false`). Nothing is recorded; the overlay falls back to the running averages it showed before 0.8. |
@@ -289,7 +290,7 @@ when it reached the screen. QPC ticks convert to µs with `qpc_frequency_hz`.
   only *try*. If an export or the once-a-second summary is reading it at that moment, the record
   is dropped and counted. The overlay shows the count only if it isn't zero.
 - No video thread writes files. With a trace directory, a thread of its own appends new records to
-  the CSV files every 5 seconds, copying them out of the rings under the same lock, for a few
+  the CSV files every 2 seconds, copying them out of the rings under the same lock, for a few
   microseconds. Ctrl+Alt+E saves on its own thread too.
 - With tracing off, each record costs one relaxed atomic load, and nothing is allocated.
 - Memory is bounded:
@@ -301,6 +302,9 @@ when it reached the screen. QPC ticks convert to µs with `qpc_frequency_hz`.
 
 ## Known limitations
 
+- Forwarded viewer files stop a couple of seconds short of the session's end, because they go
+  out after being written and the connection closes first. Files from a viewer older than 0.10.1
+  don't arrive, so there's no report; put both PCs' files in one folder as before.
 - Presentation isn't measured in the app (see PresentMon above).
 - GPU convert isn't measurable on drivers that run the video processor outside the timestamped command stream, including NVIDIA's (see above). It also covers only the colour conversion. The encoder's own GPU time is inside
   "encode", which also includes waiting.

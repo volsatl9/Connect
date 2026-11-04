@@ -9,6 +9,7 @@ mod input;
 mod pages;
 mod prompt;
 mod session;
+pub mod session_files;
 mod settings;
 mod theme;
 mod updates;
@@ -49,7 +50,21 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 /// Set when an update has been installed: the executable to start once this one has exited.
 type Restart = Arc<Mutex<Option<PathBuf>>>;
 
+/// Waiting for the screen's refresh holds a frame back, and under Wayland, where the compositor
+/// already keeps the picture whole, it gains nothing. Elsewhere it's what stops tearing.
+/// `CONNECT_PRESENT=vsync` or `novsync` chooses, to compare the two.
+fn present_mode() -> eframe::wgpu::PresentMode {
+    use eframe::wgpu::PresentMode;
+    match std::env::var("CONNECT_PRESENT").as_deref() {
+        Ok("vsync") => PresentMode::AutoVsync,
+        Ok("novsync") => PresentMode::AutoNoVsync,
+        _ if cfg!(target_os = "linux") && std::env::var_os("WAYLAND_DISPLAY").is_some() => PresentMode::AutoNoVsync,
+        _ => PresentMode::AutoVsync,
+    }
+}
+
 pub fn run(runtime: Runtime, config_dir: PathBuf) -> Result<()> {
+    session_files::start(&config_dir);
     // Lets the UI thread start tasks on the runtime.
     let guard = runtime.enter();
     // An existing account goes straight in; a new install first gets the welcome screen.
@@ -70,8 +85,18 @@ pub fn run(runtime: Runtime, config_dir: PathBuf) -> Result<()> {
             }
         })
         .flatten();
-    let mut wgpu_options =
-        eframe::WgpuConfiguration::default().with_surface_config(eframe::egui_wgpu::SurfaceConfig::LOW_LATENCY);
+    let present_mode = present_mode();
+    let mut wgpu_options = eframe::WgpuConfiguration::default().with_surface_config(eframe::egui_wgpu::SurfaceConfig {
+        present_mode,
+        ..eframe::egui_wgpu::SurfaceConfig::LOW_LATENCY
+    });
+    let env = |name| std::env::var(name).unwrap_or_default();
+    connect_client::set_display(format!(
+        "{} {} present={present_mode:?} shared_gpu={}",
+        env("XDG_SESSION_TYPE"),
+        env("XDG_CURRENT_DESKTOP"),
+        shared_gpu.as_ref().map_or("none", |gpu| gpu.name.as_str()),
+    ));
     if let Some(gpu) = &shared_gpu {
         tracing::info!(gpu = gpu.name, "the window and the video decoder share the graphics card");
         let (instance, adapter, device, queue) = gpu.wgpu();
@@ -408,6 +433,7 @@ impl App {
             HostEvent::SessionEnded { reason, .. } => {
                 self.hosting = None;
                 self.notify(reason, false);
+                session_files::session_ended();
             }
         }
     }

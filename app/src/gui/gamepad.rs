@@ -13,9 +13,9 @@ use std::{
 
 use connect_client::ClientHandle;
 use connect_proto::input::{GamepadState, InputEvent, MAX_GAMEPADS};
-use gilrs::{Axis, Button, EventType, Gamepad, GamepadId, Gilrs};
+use gilrs::{Axis, Button, EventType, Gamepad, GamepadId, Gilrs, MappingSource};
 use serde::{Deserialize, Serialize};
-use tracing::warn;
+use tracing::{info, warn};
 
 /// How long one wait for controller events may block, so stopping and focus changes are
 /// noticed promptly. Controller input itself is forwarded as soon as it happens.
@@ -159,6 +159,26 @@ impl XboxButton {
             XboxButton::DPadRight => Button::DPadRight,
         }
     }
+
+    /// The same for a controller gilrs has no layout for on Linux, where it goes by the names of
+    /// the driver's button codes. Xbox drivers send X as BTN_X, which is the same code as
+    /// BTN_NORTH, and Y as BTN_WEST, though X is the west button and Y the north one.
+    const fn gilrs_unmapped(self) -> Button {
+        match self {
+            XboxButton::X => Button::North,
+            XboxButton::Y => Button::West,
+            other => other.gilrs(),
+        }
+    }
+
+    /// Where a controller without a layout has this trigger: on an axis, not a button.
+    const fn trigger_axis(self) -> Option<Axis> {
+        match self {
+            XboxButton::LeftTrigger => Some(Axis::LeftZ),
+            XboxButton::RightTrigger => Some(Axis::RightZ),
+            _ => None,
+        }
+    }
 }
 
 /// How far each button is pressed, 0–255, by [`XboxButton::index`]. Only the triggers go between.
@@ -285,6 +305,7 @@ fn forward_current(
             Some(&slot) => slot,
             None => {
                 let Some(free) = (0..MAX_GAMEPADS).find(|s| !slots.values().any(|v| v == s)) else { continue };
+                info!(name = pad.name(), vendor = ?pad.vendor_id(), source = ?pad.mapping_source(), "gamepad");
                 slots.insert(id, free);
                 free
             }
@@ -297,13 +318,30 @@ fn forward_current(
     }
 }
 
+/// Whether gilrs is going by the driver's codes, having no layout for this controller.
+fn unmapped(pad: &Gamepad<'_>) -> bool {
+    cfg!(target_os = "linux") && pad.mapping_source() == MappingSource::Driver
+}
+
+/// A trigger on an axis, which runs from -1 at rest to 1 held down, as 0 to 1.
+fn axis_trigger(value: f32) -> f32 {
+    ((value + 1.0) / 2.0).clamp(0.0, 1.0)
+}
+
 fn pressed(pad: &Gamepad<'_>) -> Pressed {
-    XboxButton::ALL.map(|button| match button {
-        XboxButton::LeftTrigger | XboxButton::RightTrigger => {
-            (pad.button_data(button.gilrs()).map_or(0.0, |d| d.value()).clamp(0.0, 1.0) * 255.0).round() as u8
+    let unmapped = unmapped(pad);
+    XboxButton::ALL.map(|button| {
+        let code = if unmapped { button.gilrs_unmapped() } else { button.gilrs() };
+        let value = match button.trigger_axis().filter(|_| unmapped) {
+            // Nothing until the first event: the trigger is at rest, not halfway.
+            Some(axis) => pad.axis_data(axis).map_or(0.0, |d| axis_trigger(d.value())),
+            None => pad.button_data(code).map_or(0.0, |d| d.value()).clamp(0.0, 1.0),
+        };
+        match button {
+            XboxButton::LeftTrigger | XboxButton::RightTrigger => (value * 255.0).round() as u8,
+            _ if pad.is_pressed(code) => 255,
+            _ => 0,
         }
-        _ if pad.is_pressed(button.gilrs()) => 255,
-        _ => 0,
     })
 }
 
@@ -403,6 +441,22 @@ mod tests {
         let bits: Vec<u16> = XboxButton::ALL.iter().filter_map(|b| b.bit()).collect();
         assert_eq!(bits.iter().fold(0, |all, bit| all | bit).count_ones() as usize, bits.len());
         assert!(XboxButton::ALL.iter().enumerate().all(|(i, b)| b.index() == i));
+    }
+
+    #[test]
+    fn a_controller_without_a_layout_keeps_x_and_y_where_they_are() {
+        assert_eq!(XboxButton::X.gilrs_unmapped(), Button::North);
+        assert_eq!(XboxButton::Y.gilrs_unmapped(), Button::West);
+        for button in XboxButton::ALL.into_iter().filter(|b| !matches!(b, XboxButton::X | XboxButton::Y)) {
+            assert_eq!(button.gilrs_unmapped(), button.gilrs(), "{button:?}");
+        }
+    }
+
+    #[test]
+    fn a_trigger_on_an_axis_rests_at_nothing() {
+        assert_eq!(axis_trigger(-1.0), 0.0);
+        assert_eq!(axis_trigger(0.0), 0.5);
+        assert_eq!(axis_trigger(1.0), 1.0);
     }
 
     #[test]

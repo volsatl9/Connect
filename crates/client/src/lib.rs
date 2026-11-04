@@ -9,6 +9,7 @@ mod audio;
 mod clock;
 mod decoder;
 pub mod diagnostics;
+mod forward;
 mod gpu_decode;
 mod latency;
 mod pacing;
@@ -22,7 +23,7 @@ pub use connect_proto::perf::HostPerf;
 pub use decoder::{GpuDecodeSupport, gpu_decode_support};
 pub use gpu_decode::SharedGpu;
 pub use latency::{FrameTiming, Latency};
-pub use trace::FrameStats;
+pub use trace::{FrameStats, set_display};
 
 use std::{
     fmt,
@@ -596,6 +597,12 @@ async fn session(
             let (input_tx, input_rx) = mpsc::unbounded_channel();
             tokio::spawn(write_input(input, input_rx));
             *lock(&shared.input) = Some(input_tx);
+            // After the input stream, so the host can tell them apart. A host from before 0.10.1
+            // never reads it, which only leaves this waiting until the session ends.
+            if let Some(dir) = connect_perf::trace_dir().filter(|_| connect_perf::enabled()) {
+                let files = conn.open_uni().await?;
+                tokio::spawn(forward::forward(files, shared.trace.files(&dir)));
+            }
             events.send(ClientEvent::Accepted { host_name, width, height, permissions }).await;
         }
         Ok(Some(HostMsg::Rejected { reason })) => return Ok(Some(EndReason::Rejected(reason))),

@@ -333,7 +333,7 @@ pub(crate) struct HostTrace {
     /// Remote events host priority has dropped so far.
     pub host_priority_drops: AtomicU64,
     /// When the session started, in Unix seconds, to name its files.
-    session: u64,
+    pub session: u64,
 }
 
 impl HostTrace {

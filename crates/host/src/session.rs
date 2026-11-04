@@ -28,6 +28,7 @@ use crate::{
     input::{self, Unavailable},
     rate::{self, PathSample, RateControl},
     trace::{FrameRecord, HostTrace, LoadRecord, NetworkRecord, Reporter},
+    viewer_files,
 };
 
 /// An unchanged pointer position is sent again this often, so the viewer knows it's current.
@@ -132,12 +133,17 @@ async fn serve(conn: &Connection, shared: &Shared, events: &mpsc::Sender<HostEve
         events.send(HostEvent::SessionStarted { peer, client_name: client_name.clone(), permissions: granted }).await;
 
     let (unavailable_tx, unavailable) = mpsc::unbounded_channel();
+    let (input_taken, taken) = oneshot::channel();
+    let viewer_files = connect_perf::trace_dir()
+        .filter(|_| connect_perf::enabled())
+        .map(|dir| tokio::spawn(viewer_files::collect(conn.clone(), taken, dir, trace.session)));
     let input = tokio::spawn(input::serve(
         conn.clone(),
         shared.permissions.subscribe(),
         shared.input.clone(),
         unavailable_tx,
         trace.clone(),
+        input_taken,
     ));
 
     let desktop = shared.video == VideoSource::Screen;
@@ -155,6 +161,9 @@ async fn serve(conn: &Connection, shared: &Shared, events: &mpsc::Sender<HostEve
         warn!("input took too long to release");
     }
     finish_trace(spool).await;
+    if let Some(files) = viewer_files {
+        let _ = timeout(INPUT_RELEASE, files).await;
+    }
     let _ = events.send(HostEvent::SessionEnded { peer, reason }).await;
     Ok(())
 }

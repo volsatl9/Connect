@@ -40,13 +40,14 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod cli;
+mod crash;
 mod gui;
 mod trace_report;
 mod update;
 
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Mutex};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use connect_client::Stats;
 use connect_net as net;
 use tracing_subscriber::{filter::Targets, prelude::*};
@@ -70,7 +71,15 @@ fn main() -> Result<()> {
     // regex engine, and spans below the level are never created.
     let filter = std::env::var("RUST_LOG").ok().and_then(|value| value.parse::<Targets>().ok());
     let filter = filter.unwrap_or_else(|| "info,iroh=warn,noq=warn".parse().expect("valid default filter"));
-    tracing_subscriber::registry().with(filter).with(tracing_subscriber::fmt::layer()).init();
+    let config_dir = std::env::var_os("CONNECT_CONFIG_DIR").map(PathBuf::from).or(net::default_config_dir().ok());
+    // The window has nowhere to print, so it keeps its log and any crash in the session files.
+    let session_files = config_dir.as_deref().filter(|_| args.is_empty()).map(gui::session_files::folder);
+    let log = session_files.as_deref().and_then(crash::open_log);
+    let log = log.map(|file| tracing_subscriber::fmt::layer().with_ansi(false).with_writer(Mutex::new(file)));
+    tracing_subscriber::registry().with(filter).with(tracing_subscriber::fmt::layer()).with(log).init();
+    if let Some(folder) = session_files {
+        crash::watch(folder);
+    }
     update::clean_up_previous();
 
     if matches!(args.first().map(String::as_str), Some("-h" | "--help" | "help")) {
@@ -78,10 +87,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let config_dir = match std::env::var_os("CONNECT_CONFIG_DIR") {
-        Some(dir) => PathBuf::from(dir),
-        None => net::default_config_dir()?,
-    };
+    let config_dir = config_dir.context("no home directory")?;
     // A few workers are plenty for the network and session tasks (video has threads of its own);
     // one per core only costs memory on many-core PCs.
     let workers = std::thread::available_parallelism().map_or(4, |n| n.get().min(4));

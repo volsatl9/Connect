@@ -12,6 +12,7 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
     sync::atomic::{AtomicU32, Ordering},
+    sync::{Mutex, OnceLock, PoisonError},
     time::Instant,
 };
 
@@ -21,6 +22,7 @@ use connect_perf::{
 };
 use connect_proto::{
     micros_at,
+    perf::TraceFile,
     video::{Fate, FrameMeta},
 };
 
@@ -259,6 +261,13 @@ impl CsvRecord for InputRecord {
     }
 }
 
+static DISPLAY: OnceLock<String> = OnceLock::new();
+
+/// Describes how this app reaches the screen, for the session files.
+pub fn set_display(description: String) {
+    let _ = DISPLAY.set(description);
+}
+
 /// A session's trace.
 pub(crate) struct ViewerTrace {
     pub frames: TraceRing<FrameRecord>,
@@ -269,6 +278,8 @@ pub(crate) struct ViewerTrace {
     session: u64,
     /// Saves made during the session, which number their files.
     saves: AtomicU32,
+    /// What's decoding the video, for the session file.
+    pub decoder: Mutex<String>,
 }
 
 impl ViewerTrace {
@@ -281,6 +292,7 @@ impl ViewerTrace {
             network: TraceRing::new(capacity),
             session: connect_perf::session_stamp(),
             saves: AtomicU32::new(0),
+            decoder: Mutex::new(String::new()),
         }
     }
 
@@ -306,7 +318,8 @@ impl ViewerTrace {
         Ok(files.into())
     }
 
-    fn summary(&self, overrun: u64) -> [SessionRow; 6] {
+    fn summary(&self, overrun: u64) -> [SessionRow; 9] {
+        let decoder = self.decoder.lock().unwrap_or_else(PoisonError::into_inner).replace(',', ";");
         [
             SessionRow("version", env!("CARGO_PKG_VERSION").into()),
             SessionRow("session_unix_s", self.session.to_string()),
@@ -314,7 +327,16 @@ impl ViewerTrace {
             SessionRow("frames_recorded", self.frames.written().to_string()),
             SessionRow("records_overrun", overrun.to_string()),
             SessionRow("records_dropped_busy", self.dropped().to_string()),
+            SessionRow("os", std::env::consts::OS.into()),
+            SessionRow("display", DISPLAY.get().cloned().unwrap_or_default().replace(',', ";")),
+            SessionRow("decoder", decoder),
         ]
+    }
+
+    /// This session's files in `dir`, as [`Self::spool`] writes them.
+    pub fn files(&self, dir: &Path) -> [(TraceFile, PathBuf); 5] {
+        [TraceFile::Session, TraceFile::Frames, TraceFile::Input, TraceFile::Loss, TraceFile::Network]
+            .map(|file| (file, connect_perf::trace_path(dir, "viewer", self.session, file.name())))
     }
 
     /// Starts writing the trace to CSV files in `dir` as it goes.
@@ -324,18 +346,15 @@ impl ViewerTrace {
         let (mut frames, mut inputs) = (CsvStream::new(path("frames")), CsvStream::new(path("input")));
         let (mut losses, mut network) = (CsvStream::new(path("loss")), CsvStream::new(path("network")));
         let trace = self.clone();
-        Spool::start(move |last| {
+        Spool::start(move |_| {
             let written = frames
                 .drain(&trace.frames)
                 .and_then(|()| inputs.drain(&trace.inputs))
                 .and_then(|()| losses.drain(&trace.losses))
                 .and_then(|()| network.drain(&trace.network))
+                // Every time, so a session that ends suddenly still has one.
                 .and_then(|()| {
-                    if last {
-                        connect_perf::write_csv(&session_file, &trace.summary(frames.overrun() + losses.overrun()))
-                    } else {
-                        Ok(())
-                    }
+                    connect_perf::write_csv(&session_file, &trace.summary(frames.overrun() + losses.overrun()))
                 });
             if let Err(error) = written {
                 tracing::warn!("couldn't write the performance trace: {error}");

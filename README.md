@@ -1,5 +1,9 @@
 # Connect
 
+Version 0.10.1 fixes Xbox controllers on Linux, sends the viewer's timing files to the host so one
+PC has both sides of a session, keeps a crash log, and stops waiting for the screen's refresh under
+Wayland.
+
 Version 0.10.0 adds a Gamepad page for changing what your controller's buttons do, per-device
 permissions, a window with its own title bar, an app image, a Windows installer and Linux packages.
 
@@ -204,7 +208,7 @@ connect gpu-check                   check the graphics hardware for sharing and 
 `--test-pattern` shares a generated image (1280×720 at 60 fps, or e.g. `--test-pattern=1920x1080@144`)
 and `--print-input` prints the remote input instead of acting on it, both for development. On Windows the app has no console window, so start these as
 `start /wait connect.exe id` for the terminal to wait for them. `CONNECT_CONFIG_DIR` selects a separate identity, e.g. to run two
-copies on one PC. `CONNECT_GPU_PIPELINE=0` makes a host send frames through memory instead of
+copies on one PC. `CONNECT_PRESENT=vsync` or `novsync` chooses whether the window waits for the screen's refresh; under Wayland it doesn't by default. `CONNECT_GPU_PIPELINE=0` makes a host send frames through memory instead of
 keeping them on the graphics card, for comparison.
 
 ## Third-party components

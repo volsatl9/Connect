@@ -17,6 +17,7 @@ use eframe::egui::{
 use super::{
     App, ClientState, Dialog, Page, icons,
     prompt::permission_toggles,
+    session_files,
     settings::{self, BITRATE_CHOICES_MBPS, KnownDevice},
     theme::{self, Glass},
     window,
@@ -671,6 +672,21 @@ pub fn settings(app: &mut App, ui: &mut Ui) {
         }
     });
     ui.add_space(gap);
+
+    if let Some(folder) = connect_perf::trace_dir() {
+        theme::card(ui, |ui| {
+            theme::section_title(ui, "Session files");
+            ui.label(theme::caption(
+                "Timings from your last 5 sessions, to help track down latency and stutter. They hold no video, \
+                 audio or typing. When you host, the viewer's files arrive here too.",
+            ));
+            ui.add_space(6.0);
+            if ui.add(theme::secondary("Open folder")).clicked() {
+                session_files::open(&folder);
+            }
+        });
+        ui.add_space(gap);
+    }
 
     if VideoSource::SCREEN_SUPPORTED {
         theme::card(ui, |ui| {

@@ -14,7 +14,7 @@ use connect_proto::{
     input::{GamepadState, InputEvent, MAX_MOUSE_STEP, MouseButton, TimedInput},
 };
 use iroh::endpoint::{Connection, RecvStream};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tracing::debug;
 
 use crate::trace::{HostTrace, InputOutcome, InputStamp};
@@ -63,11 +63,13 @@ pub(crate) async fn serve(
     sink: InputSink,
     unavailable: mpsc::UnboundedSender<Unavailable>,
     trace: Arc<HostTrace>,
+    taken: oneshot::Sender<()>,
 ) {
     let recv = match conn.accept_uni().await {
         Ok(recv) => recv,
         Err(e) => return debug!("no input stream: {e}"),
     };
+    let _ = taken.send(());
     // Reading isn't cancel-safe (a half-read message would be lost), so it gets its own task.
     let (event_tx, mut events) = mpsc::channel(256);
     tokio::spawn(read_loop(recv, event_tx));

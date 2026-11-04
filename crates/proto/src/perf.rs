@@ -34,3 +34,35 @@ pub struct HostPerf {
     /// was reading the buffer at that moment.
     pub trace_dropped: u64,
 }
+
+/// One of the viewer's trace files, for the host to keep alongside its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum TraceFile {
+    Session,
+    Frames,
+    Input,
+    Loss,
+    Network,
+}
+
+impl TraceFile {
+    /// The `what` of its file name; see `connect_perf::trace_path`.
+    pub const fn name(self) -> &'static str {
+        match self {
+            TraceFile::Session => "session",
+            TraceFile::Frames => "frames",
+            TraceFile::Input => "input",
+            TraceFile::Loss => "loss",
+            TraceFile::Network => "network",
+        }
+    }
+}
+
+/// Part of a viewer's trace file, on the stream after its input stream. Offsets rather than
+/// appending, because the session file is rewritten as the session goes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TraceChunk {
+    pub file: TraceFile,
+    pub offset: u64,
+    pub data: Vec<u8>,
+}

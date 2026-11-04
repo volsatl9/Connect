@@ -91,6 +91,7 @@ fn hardware_allowed() -> bool {
 fn install(shared: &Shared, decoder: Box<dyn VideoDecoder>) -> Box<dyn VideoDecoder> {
     info!(codec = %decoder.codec(), "{}", decoder.label());
     *lock(&shared.decoder) = decoder.label();
+    *lock(&shared.trace.decoder) = decoder.label();
     shared.gpu_decoding.store(decoder.hardware(), Ordering::Relaxed);
     decoder
 }

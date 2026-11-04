@@ -16,6 +16,7 @@ mod input;
 mod rate;
 mod session;
 mod trace;
+mod viewer_files;
 mod yuv;
 
 use std::{

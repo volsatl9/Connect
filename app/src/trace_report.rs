@@ -72,7 +72,7 @@ impl Cause {
             Cause::HostHeld => "host_held",
             Cause::Encoder => "encoder",
             Cause::ViewerDecode => "viewer_decode",
-            Cause::PresentationDrop => "presentation_drop",
+            Cause::PresentationDrop => "replaced_by_newer",
             Cause::ViewerDraw => "viewer_draw",
             Cause::Unaccounted => "unaccounted",
         }
@@ -346,8 +346,10 @@ fn format_report(a: &Analysis) -> String {
     let mut out = String::new();
     let share = |frames: u32| 100.0 * f64::from(frames) / f64::from(a.host_frames.max(1));
     let ms = |us: i64| us as f64 / 1000.0;
-    let _ =
-        writeln!(out, "{} frames sent. {} ({:.3}%) delivered on time.", a.host_frames, a.delivered, share(a.delivered));
+    let replaced = a.frames.get(Cause::PresentationDrop.name()).copied().unwrap_or(0);
+    let on_time = a.delivered + replaced;
+    let _ = writeln!(out, "{} frames sent. {on_time} ({:.3}%) arrived on time.", a.host_frames, share(on_time));
+    let _ = writeln!(out, "{replaced} of those were replaced by a newer frame before the screen refreshed.");
     let _ = writeln!(out, "\nWhere the other frames went (one reason each):");
     for cause in Cause::ALL {
         let frames = a.frames.get(cause.name()).copied().unwrap_or(0);

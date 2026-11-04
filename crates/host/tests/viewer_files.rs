@@ -82,5 +82,5 @@ async fn a_viewers_files_reach_the_host_even_if_it_sends_no_input() {
     client.disconnect();
     client_ep.close().await;
     host_ep.close().await;
-    std::fs::remove_dir_all(&dir).unwrap();
+    let _ = std::fs::remove_dir_all(&dir); // the session may still be writing its last records
 }

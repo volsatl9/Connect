@@ -51,6 +51,9 @@ pub struct HostConfig {
     pub trusted: HashMap<EndpointId, Permissions>,
     /// Upper bound on the video bitrate, in megabits per second; applies from the next session.
     pub bitrate_mbps: u32,
+    /// Most pictures sent a second, under the screen's refresh rate; 0 for no limit. Applies from
+    /// the next session.
+    pub frame_rate_limit: u32,
     pub video: VideoSource,
     pub input: InputSink,
     pub approval_timeout: Duration,
@@ -63,6 +66,7 @@ impl HostConfig {
             accepting: true,
             trusted: HashMap::new(),
             bitrate_mbps: DEFAULT_BITRATE_MBPS,
+            frame_rate_limit: 0,
             video: VideoSource::default(),
             input: InputSink::default(),
             approval_timeout: APPROVAL_TIMEOUT,
@@ -119,6 +123,7 @@ struct Shared {
     permissions: watch::Sender<Permissions>,
     trusted: RwLock<HashMap<EndpointId, Permissions>>,
     bitrate_mbps: AtomicU32,
+    frame_rate_limit: AtomicU32,
     /// The one connection being asked about or served; anyone else is told the host is busy.
     slot: Mutex<Option<(EndpointId, Connection)>>,
     /// Signalled when the slot empties, i.e. a session has fully ended and released its input.
@@ -136,6 +141,7 @@ pub fn start(endpoint: Endpoint, config: HostConfig) -> (HostHandle, mpsc::Recei
         permissions: watch::Sender::new(Permissions::default()),
         trusted: RwLock::new(config.trusted),
         bitrate_mbps: AtomicU32::new(config.bitrate_mbps),
+        frame_rate_limit: AtomicU32::new(config.frame_rate_limit),
         slot: Mutex::new(None),
         idle: Notify::new(),
         video: config.video,
@@ -179,6 +185,10 @@ impl HostHandle {
     }
 
     /// Caps the video bitrate from the next session on.
+    pub fn set_frame_rate_limit(&self, fps: u32) {
+        self.0.frame_rate_limit.store(fps, Ordering::Relaxed);
+    }
+
     pub fn set_bitrate_mbps(&self, mbps: u32) {
         self.0.bitrate_mbps.store(mbps.max(1), Ordering::Relaxed);
     }

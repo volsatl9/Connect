@@ -82,6 +82,7 @@ struct Control {
     bitrate: AtomicU32,
     codec: Mutex<Codec>,
     stop: AtomicBool,
+    frame_rate_limit: u32,
     backlogged: Backlogged,
 }
 
@@ -96,6 +97,7 @@ impl VideoStream {
         source: VideoSource,
         codec: Codec,
         bitrate_bps: u32,
+        frame_rate_limit: u32,
         backlogged: Backlogged,
         trace: Arc<HostTrace>,
     ) -> Result<Self> {
@@ -106,6 +108,7 @@ impl VideoStream {
             bitrate: AtomicU32::new(bitrate_bps),
             codec: Mutex::new(codec),
             stop: AtomicBool::new(false),
+            frame_rate_limit,
             backlogged,
         });
         let thread = control.clone();
@@ -327,6 +330,11 @@ struct Pipeline {
     encoder: Box<dyn VideoEncoder>,
 }
 
+/// The pictures a second to aim for: the screen's refresh, or the limit if there's one below it.
+fn capped_fps(refresh: u32, limit: u32) -> u32 {
+    if limit == 0 { refresh } else { refresh.min(limit) }
+}
+
 fn run(
     source: &VideoSource,
     tx: &mpsc::Sender<Result<VideoEvent>>,
@@ -334,7 +342,8 @@ fn run(
     trace: &HostTrace,
 ) -> Result<()> {
     let mut capturer = source.open()?;
-    let fps = capturer.refresh_hz().unwrap_or(DEFAULT_FPS).clamp(30, 240);
+    let refresh = capturer.refresh_hz().unwrap_or(DEFAULT_FPS).clamp(30, 240);
+    let fps = capped_fps(refresh, control.frame_rate_limit);
     // Turned off for the rest of the stream once anything on the graphics-card path fails.
     let mut gpu = gpu_pipeline_wanted(source);
     // Codecs that failed here; the stream stays off them even if the session asks again.
@@ -354,8 +363,8 @@ fn run(
     // Why the staged picture hasn't gone yet, for when a newer one replaces it.
     let mut waiting = Replaced::No;
     let mut sent_time_us = 0;
-    // At most one picture per refresh of the host's screen (with a little slack for jitter): a
-    // game presenting faster than that would spend bitrate on pictures the viewer never shows.
+    // At most one picture per refresh of the host's screen or the limit (with a little slack for
+    // jitter): a game presenting faster than that would spend bitrate on pictures nobody sees.
     let frame_interval = Duration::from_secs(1) * 19 / (20 * fps);
     let mut last_sent: Option<Instant> = None;
     let mut last_keyframe = Instant::now();
@@ -650,6 +659,13 @@ fn capture(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_limit_only_ever_lowers_the_frame_rate() {
+        assert_eq!(capped_fps(240, 0), 240);
+        assert_eq!(capped_fps(240, 120), 120);
+        assert_eq!(capped_fps(60, 120), 60);
+    }
     use openh264::{OpenH264API, decoder::Decoder, encoder::Encoder, formats::YUVSource as _};
 
     fn moving_image(width: usize, height: usize, frame: usize) -> Picture {

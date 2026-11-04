@@ -441,6 +441,34 @@ more often: in the model, 4.6 MB sent over the path where 4.1 went before, for 4
 over 39.8. In the test path's drop, the target was back to 80% of the cap 11–13 s after the path, 3
 runs of 3, with 6–11 frames lost and 19–28 skipped.
 
+## Version 0.10.2: fast paths and quiet scenes
+
+The first session from a Linux viewer, on Wi-Fi 7 with a 1.6 ms best round trip, stalled for 1.25 s
+and then 0.5 s with 300 KB queued, sending 4-9 packets per 250 ms. BBR's estimate had fallen to
+0.06 Mb/s in a loading screen, the same collapse 0.9.2 fixed. Path memory didn't step in: it read
+any round trip over 1.5 times the best as a queue and halved the remembered rate each round trip,
+and jitter put 93% of that session's readings over the line. Stray loss protection used the same test.
+
+Inflated now also means at least 15 ms over the best, and the remembered rate halves at most every
+50 ms. Separately, a backlog with nothing lost, within 2 s of quiet video, cuts one step and doesn't
+take the estimate as the path's limit: that's what took the stream from 80 to 2 Mb/s for 20 s.
+
+Replaying the session's first 70 s, 150 Mb/s path, 2 ms of jitter:
+
+| | 1 ms each way, before | after | 22 ms each way, before | after |
+|---|---|---|---|---|
+| Last datagram of a frame, p99 | 27.6 ms | 9.5 ms | 250.8 ms | 36.6 ms |
+| p99.9 | 62.5 ms | 16.7 ms | 279.9 ms | 44.3 ms |
+| Slowest | 75.5 ms | 33.6 ms | 285.0 ms | 67.1 ms |
+| Frames over 60 ms | 6 | 0 | 309 | 1 |
+| Frames incomplete | 0 | 0 | 24 | 0 |
+
+The cost shows on a path that really slows down (40 to 10 Mb/s for 8 s): 26 frames lost against 20,
+worst window 166 ms against 154, and the target starts climbing about a second later.
+
+Replay doesn't reproduce Wi-Fi's own stalls, and the frame rate limit changes nothing here. Both
+need a real session.
+
 ## Build requirement
 
 OpenH264 silently builds its C++ fallback if NASM is unavailable; install NASM so the codec

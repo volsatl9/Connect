@@ -258,7 +258,7 @@ Every frame gets at most one reason:
 | `host_held` | Drawn late, held back before encoding | `held_us` |
 | `encoder` | Drawn late, mostly in the encoder | `encode_us` |
 | `viewer_decode` | The decoder fell behind, or the frame was drawn late from waiting for it or decoding | Loss file: `skipped_decoder_behind`; `decode_queue_us`, `decode_us` |
-| `presentation_drop` | Decoded, but a newer frame replaced it before it could be drawn | `status` is `superseded` |
+| `replaced_by_newer` | Decoded, but a newer frame replaced it before it could be drawn | `status` is `superseded` |
 | `viewer_draw` | Drawn late, mostly in drawing | `render_us` |
 | `unaccounted` | The host sent it and the viewer has no record | The viewer's trace missed it, or that session's trace is incomplete |
 
@@ -269,7 +269,7 @@ The report also lists capture gaps of 50 ms or more, split into stalls (images m
 (nothing new on screen), and what the host's own input was doing when host priority dropped remote
 events. Gaps in capture aren't charged to frames: a frame that was never captured has no number.
 
-`presentation_drop` covers what the app knows. A frame drawn by the app and then dropped on its way
+`replaced_by_newer` covers what the app knows. A frame drawn by the app and then dropped on its way
 to the display is invisible here; only PresentMon sees that (below).
 
 ## Joining with PresentMon (Windows)

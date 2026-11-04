@@ -63,6 +63,11 @@ const VIDEO_SHARE: f64 = 0.80;
 /// about 1% a second.
 const FAST_UNTIL: f64 = 0.90;
 const CREEP: f64 = 1.0025;
+/// The congestion controller's estimate only says what the path carries once video has tested
+/// it: this share of the bitrate, for this long. After a loading screen it says how little was
+/// sent, and taking that for the path cut 80 Mb/s to the floor at a backlog with nothing lost.
+const TESTED_SHARE: f64 = 0.5;
+const TESTED_FOR: Duration = Duration::from_secs(2);
 /// How far over its value at the ceiling the estimate has to be for the path to count as better.
 const BETTER_PATH: f64 = 1.25;
 /// After this long without trouble, the ceiling follows the estimate however little it moved.
@@ -136,6 +141,8 @@ pub(crate) struct RateControl {
     losing: bool,
     started: Instant,
     calm_since: Instant,
+    /// When the video last used less than [`TESTED_SHARE`] of the bitrate.
+    quiet_at: Option<Instant>,
     /// Roughly what the path carried when it last proved too slow, and when.
     ceiling: Option<(u32, Instant)>,
     /// The bandwidth estimate then.
@@ -164,6 +171,7 @@ impl RateControl {
             losing: false,
             started: now,
             calm_since: now,
+            quiet_at: None,
             ceiling: None,
             estimate_at_ceiling: 0,
             loss_at_cut: None,
@@ -219,6 +227,10 @@ impl RateControl {
         // Loss says the path is full if it lasts, or if the video was using all of it.
         let video_bps = path.video_bytes.saturating_sub(self.video_bytes) as f64 * 8.0 / TICK.as_secs_f64();
         self.video_bytes = path.video_bytes;
+        if path.video_bytes > 0 && video_bps < f64::from(before) * TESTED_SHARE {
+            self.quiet_at = Some(now);
+        }
+        let tested = self.quiet_at.is_none_or(|at| now.duration_since(at) >= TESTED_FOR);
         let losing = sent >= MIN_SAMPLE_PACKETS && lost > 0 && sample > LOSS_SOME;
         let filling = !self.learn
             || (losing && self.losing)
@@ -252,6 +264,10 @@ impl RateControl {
         }
         let (after, reason) = if let Some((factor, reason)) = congested {
             self.calm_since = now;
+            // Nothing says the path is slow, only that a burst is queued: a step, not the estimate.
+            if self.learn && reason == Reason::Backlog && !tested && self.loss < LOSS_NOTICED {
+                return self.settle(before, clamp(f64::from(before) * factor), reason);
+            }
             // Where the path gave out: the congestion controller's estimate of what it carries,
             // less room for the rest of the traffic, or failing that, a step under where we were.
             let ceiling = match path.bandwidth_estimate {
@@ -306,6 +322,40 @@ mod tests {
 
     fn sample(sent: u64, lost: u64, queued: usize) -> PathSample {
         PathSample { sent_packets: sent, lost_packets: lost, queued_bytes: queued, ..Default::default() }
+    }
+
+    /// As at the end of a loading screen on Wi-Fi: 80 Mb/s allowed, a trickle of video, an estimate
+    /// that has only seen the trickle, and a burst queued for three ticks with nothing lost.
+    #[test]
+    fn a_burst_after_a_quiet_stretch_costs_a_step_not_the_stream() {
+        let mut rate = RateControl::new(80_000_000);
+        let start = rate.started;
+        let at = |tick: u64| start + TICK * tick as u32;
+        let mut video = 0;
+        let mut quiet = |rate: &mut RateControl, tick: u64, queued, bytes, estimate| {
+            video += bytes;
+            let path = PathSample {
+                sent_packets: tick * 100,
+                queued_bytes: queued,
+                video_bytes: video,
+                bandwidth_estimate: Some(estimate),
+                ..Default::default()
+            };
+            rate.update(at(tick), path)
+        };
+        for tick in 1..=40 {
+            quiet(&mut rate, tick, 0, 2_000, 400_000);
+        }
+        for tick in 41..=43 {
+            quiet(&mut rate, tick, 310_000, 2_000, 400_000);
+        }
+        assert!(rate.bitrate() >= 39_000_000, "only ever a step: {}", rate.bitrate());
+        assert_eq!(rate.ceiling(), None, "no limit learned from an estimate of nothing");
+        // Back to the full 80 Mb/s soon after it clears.
+        for tick in 44..=68 {
+            quiet(&mut rate, tick, 0, 2_000, 36_000_000);
+        }
+        assert_eq!(rate.bitrate(), 80_000_000);
     }
 
     #[test]

@@ -33,6 +33,12 @@ use noq_proto::{
 const REMEMBER: Duration = Duration::from_secs(120);
 /// A round trip this far over the path's best means a queue is building somewhere.
 const RTT_INFLATED: f64 = 1.5;
+/// And this far, at least. On Wi-Fi at 2 ms, ordinary jitter is several times the best round trip:
+/// a share alone read that as a queue nearly all the time, and forgot the path.
+const RTT_INFLATED_BY: Duration = Duration::from_millis(15);
+/// The remembered rate halves at most this often, or once a round trip if that's longer: a
+/// spike of a few milliseconds' round trips is one push back, not several.
+const BACK_OFF_EVERY: Duration = Duration::from_millis(50);
 /// Over this share of what was sent, loss is more than stray.
 const STRAY_LOSS: f64 = 0.05;
 /// Loss is counted over two of these.
@@ -70,7 +76,7 @@ struct Remembering {
     best: Option<Best>,
     rtt: Duration,
     min_rtt: Duration,
-    /// When the remembered rate was last halved: at most once a round trip.
+    /// When the remembered rate was last halved.
     backed_off: Option<Instant>,
     /// The current loss window and when it began, and the one before.
     delivery: Delivery,
@@ -107,7 +113,7 @@ impl Remembering {
     }
 
     fn rtt_inflated(&self) -> bool {
-        self.rtt.as_secs_f64() > self.min_rtt.as_secs_f64() * RTT_INFLATED
+        self.rtt > self.min_rtt.mul_f64(RTT_INFLATED).max(self.min_rtt + RTT_INFLATED_BY)
     }
 
     /// Whether the loss of late is a share too low to mean the path is full.
@@ -135,7 +141,7 @@ impl Remembering {
     /// The path pushed back: it may no longer carry what it did. Halved, not dropped, as one
     /// burst of stray loss doesn't mean it got slower, and a real slowdown soon halves it again.
     fn back_off(&mut self, now: Instant) {
-        if self.backed_off.is_some_and(|at| now.duration_since(at) < self.rtt) {
+        if self.backed_off.is_some_and(|at| now.duration_since(at) < self.rtt.max(BACK_OFF_EVERY)) {
             return;
         }
         self.backed_off = Some(now);
@@ -312,6 +318,37 @@ mod tests {
         assert_eq!(controller.metrics().pacing_rate, Some(9_500_000));
         assert_eq!(controller.window(), 399_000, "one round trip at 76 Mb/s");
         assert_eq!(controller.metrics().bandwidth_estimate, Some(1_600_000), "what was measured");
+    }
+
+    /// Wi-Fi: a 1.6 ms best round trip and 3 ms most of the time, which is no queue.
+    #[test]
+    fn jitter_on_a_fast_path_doesnt_forget_it() {
+        let start = Instant::now();
+        let inner = Scripted::new(100_000_000, 200_000, 12_500_000);
+        let mut controller = Remembering::new(Box::new(inner));
+        (controller.rtt, controller.min_rtt) = (Duration::from_millis(3), Duration::from_micros(1600));
+        controller.observe(start);
+        controller.inner = Box::new(Scripted::new(61_000, 30_000, 8_000));
+        for ms in 1..2000 {
+            controller.observe(start + Duration::from_millis(ms));
+        }
+        assert_eq!(controller.metrics().pacing_rate, Some(12_500_000));
+    }
+
+    /// A real queue on that path still counts, and a spike costs one halving a [`BACK_OFF_EVERY`].
+    #[test]
+    fn a_queue_on_a_fast_path_still_pushes_back() {
+        let start = Instant::now();
+        let inner = Scripted::new(100_000_000, 200_000, 12_500_000);
+        let mut controller = Remembering::new(Box::new(inner));
+        (controller.rtt, controller.min_rtt) = (Duration::from_millis(3), Duration::from_micros(1600));
+        controller.observe(start);
+        controller.inner = Box::new(Scripted::new(61_000, 30_000, 8_000));
+        controller.rtt = Duration::from_millis(30);
+        for ms in 0..120 {
+            controller.observe(start + Duration::from_millis(ms));
+        }
+        assert_eq!(controller.best.unwrap().rate, 12_500_000 / 8, "three pushes back in 120 ms");
     }
 
     #[test]

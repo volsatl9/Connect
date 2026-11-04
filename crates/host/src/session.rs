@@ -114,7 +114,8 @@ async fn serve(conn: &Connection, shared: &Shared, events: &mpsc::Sender<HostEve
     let trace = Arc::new(HostTrace::new());
     let spool = start_trace(&trace);
     let backlog = Box::new(rate.backlog_check(conn.clone()));
-    let mut video = VideoStream::start(shared.video.clone(), codec, rate.bitrate(), backlog, trace.clone())?;
+    let limit = shared.frame_rate_limit.load(Ordering::Relaxed);
+    let mut video = VideoStream::start(shared.video.clone(), codec, rate.bitrate(), limit, backlog, trace.clone())?;
     let (width, height) = match video.next().await {
         Some(Ok(VideoEvent::Format { width, height })) => (width, height),
         Some(Err(e)) => {

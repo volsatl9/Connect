@@ -1,5 +1,8 @@
 # Connect
 
+Version 0.10.2 keeps fast networks like Wi-Fi from stalling after a quiet scene, sends fewer
+controller updates, and adds a frame rate limit to Settings.
+
 Version 0.10.1 fixes Xbox controllers on Linux, sends the viewer's timing files to the host so one
 PC has both sides of a session, keeps a crash log, and stops waiting for the screen's refresh under
 Wayland.

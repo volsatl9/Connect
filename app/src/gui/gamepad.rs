@@ -8,7 +8,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use connect_client::ClientHandle;
@@ -20,6 +20,11 @@ use tracing::{info, warn};
 /// How long one wait for controller events may block, so stopping and focus changes are
 /// noticed promptly. Controller input itself is forwarded as soon as it happens.
 const POLL: Duration = Duration::from_millis(50);
+/// Sticks and triggers are sent at most this often. Buttons go at once. A noisy stick otherwise
+/// sends about 500 updates a second, every one through the stream that carries all input.
+const ANALOG_EVERY: Duration = Duration::from_millis(4);
+/// Stick movement under this, of 32767, is noise.
+const STICK_NOISE: i32 = 64;
 /// How far an analogue trigger goes before it counts as pressing a button, as in XInput.
 const TRIGGER_PRESSED: u8 = 30;
 
@@ -269,11 +274,12 @@ fn run(host: &ClientHandle, map: &ButtonMap, active: &AtomicBool, stop: &AtomicB
         Err(e) => return warn!("gamepads unavailable: {e}"),
     };
     let mut slots: HashMap<GamepadId, u8> = HashMap::new();
-    let mut sent = [None::<GamepadState>; MAX_GAMEPADS as usize];
+    let mut sent = [None::<Sent>; MAX_GAMEPADS as usize];
+    let mut waiting = false;
 
     while !stop.load(Ordering::Relaxed) {
         // Drain everything pending: gilrs only updates its state as events are taken.
-        let mut next = gilrs.next_event_blocking(Some(POLL));
+        let mut next = gilrs.next_event_blocking(Some(if waiting { ANALOG_EVERY } else { POLL }));
         while let Some(event) = next {
             if event.event == EventType::Disconnected
                 && let Some(slot) = slots.remove(&event.id)
@@ -285,21 +291,54 @@ fn run(host: &ClientHandle, map: &ButtonMap, active: &AtomicBool, stop: &AtomicB
             forward_current(host, map, &gilrs, &mut slots, &mut sent, active.load(Ordering::Relaxed));
             next = gilrs.next_event();
         }
-        forward_current(host, map, &gilrs, &mut slots, &mut sent, active.load(Ordering::Relaxed));
+        waiting = forward_current(host, map, &gilrs, &mut slots, &mut sent, active.load(Ordering::Relaxed));
     }
     for slot in slots.into_values() {
         host.send_input(InputEvent::GamepadRemoved { pad: slot });
     }
 }
 
+/// What a pad's host was last sent, and when.
+#[derive(Clone, Copy)]
+struct Sent {
+    state: GamepadState,
+    at: Instant,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Change {
+    None,
+    Analog,
+    Buttons,
+}
+
+fn change(before: &GamepadState, now: &GamepadState) -> Change {
+    let moved = |a: i16, b: i16| b != a && (b == 0 || (i32::from(a) - i32::from(b)).abs() >= STICK_NOISE);
+    if before.buttons != now.buttons {
+        Change::Buttons
+    } else if before.left_trigger != now.left_trigger
+        || before.right_trigger != now.right_trigger
+        || moved(before.left_x, now.left_x)
+        || moved(before.left_y, now.left_y)
+        || moved(before.right_x, now.right_x)
+        || moved(before.right_y, now.right_y)
+    {
+        Change::Analog
+    } else {
+        Change::None
+    }
+}
+
+/// Sends each pad's state if it's worth sending. Whether any is waiting for its turn.
 fn forward_current(
     host: &ClientHandle,
     map: &ButtonMap,
     gilrs: &Gilrs,
     slots: &mut HashMap<GamepadId, u8>,
-    sent: &mut [Option<GamepadState>; MAX_GAMEPADS as usize],
+    sent: &mut [Option<Sent>; MAX_GAMEPADS as usize],
     active: bool,
-) {
+) -> bool {
+    let mut waiting = false;
     for (id, pad) in gilrs.gamepads() {
         let slot = match slots.get(&id) {
             Some(&slot) => slot,
@@ -311,11 +350,26 @@ fn forward_current(
             }
         };
         let state = if active { read(&pad, map) } else { GamepadState::NEUTRAL };
-        if sent[slot as usize] != Some(state) {
-            sent[slot as usize] = Some(state);
+        let now = Instant::now();
+        let last = &mut sent[slot as usize];
+        let due = match last {
+            None => true,
+            Some(last) => match change(&last.state, &state) {
+                Change::None => false,
+                Change::Buttons => true,
+                Change::Analog => {
+                    let due = now.duration_since(last.at) >= ANALOG_EVERY;
+                    waiting |= !due;
+                    due
+                }
+            },
+        };
+        if due {
+            *last = Some(Sent { state, at: now });
             host.send_input(InputEvent::Gamepad { pad: slot, state });
         }
     }
+    waiting
 }
 
 /// Whether gilrs is going by the driver's codes, having no layout for this controller.
@@ -450,6 +504,22 @@ mod tests {
         for button in XboxButton::ALL.into_iter().filter(|b| !matches!(b, XboxButton::X | XboxButton::Y)) {
             assert_eq!(button.gilrs_unmapped(), button.gilrs(), "{button:?}");
         }
+    }
+
+    #[test]
+    fn only_real_changes_are_sent() {
+        let rest = GamepadState::NEUTRAL;
+        let with = |change: fn(&mut GamepadState)| {
+            let mut state = rest;
+            change(&mut state);
+            state
+        };
+        assert_eq!(change(&rest, &rest), Change::None);
+        assert_eq!(change(&with(|s| s.left_x = 1000), &with(|s| s.left_x = 1000 + 40)), Change::None, "noise");
+        assert_eq!(change(&rest, &with(|s| s.left_x = 64)), Change::Analog);
+        assert_eq!(change(&with(|s| s.left_x = 20), &rest), Change::Analog, "back at rest always counts");
+        assert_eq!(change(&rest, &with(|s| s.right_trigger = 1)), Change::Analog);
+        assert_eq!(change(&rest, &with(|s| s.buttons = GamepadState::A)), Change::Buttons);
     }
 
     #[test]

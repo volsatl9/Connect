@@ -18,7 +18,7 @@ use super::{
     App, ClientState, Dialog, Page, icons,
     prompt::permission_toggles,
     session_files,
-    settings::{self, BITRATE_CHOICES_MBPS, KnownDevice},
+    settings::{self, BITRATE_CHOICES_MBPS, FRAME_RATE_CHOICES, KnownDevice},
     theme::{self, Glass},
     window,
 };
@@ -699,6 +699,19 @@ pub fn settings(app: &mut App, ui: &mut Ui) {
             let options = BITRATE_CHOICES_MBPS.map(|mbps| (mbps, format!("{mbps} Mb/s")));
             if theme::dropdown(ui, "stream-quality", &mut app.settings.bitrate_mbps, &options) {
                 app.host.set_bitrate_mbps(app.settings.bitrate_mbps);
+            }
+            ui.add_space(10.0);
+            ui.label(RichText::new("Frame rate limit").font(theme::medium(14.0)));
+            ui.label(theme::caption(
+                "The most frames a second this PC sends. No limit is the most responsive. A limit makes each frame \
+                 sharper at the same stream quality and eases the load on both PCs. Matching the viewer's screen is \
+                 a good choice. Applies from the next connection.",
+            ));
+            ui.add_space(4.0);
+            let options = FRAME_RATE_CHOICES
+                .map(|fps| (fps, if fps == 0 { "No limit".to_owned() } else { format!("{fps} fps") }));
+            if theme::dropdown(ui, "frame-rate-limit", &mut app.settings.frame_rate_limit, &options) {
+                app.host.set_frame_rate_limit(app.settings.frame_rate_limit);
             }
         });
         ui.add_space(gap);

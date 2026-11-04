@@ -11,6 +11,8 @@ use super::gamepad::ButtonMap;
 
 /// Offered caps on the video bitrate when sharing.
 pub const BITRATE_CHOICES_MBPS: [u32; 5] = [10, 20, 35, 50, 80];
+/// 0 is no limit.
+pub const FRAME_RATE_CHOICES: [u32; 5] = [0, 60, 120, 144, 240];
 
 /// Everything the app remembers between runs.
 #[derive(Serialize, Deserialize)]
@@ -23,6 +25,8 @@ pub struct Settings {
     pub permissions: Permissions,
     /// Cap on the video bitrate when sharing.
     pub bitrate_mbps: u32,
+    /// Most frames a second sent when sharing; 0 for no limit.
+    pub frame_rate_limit: u32,
     /// Devices let in without asking, before 0.10.0 kept that with each device. Read once by
     /// [`Self::adopt_trusted`].
     #[serde(skip_serializing)]
@@ -71,6 +75,7 @@ impl Default for Settings {
             accepting: true,
             permissions: Permissions::default(),
             bitrate_mbps: connect_host::DEFAULT_BITRATE_MBPS,
+            frame_rate_limit: 0,
             trusted: Vec::new(),
             computers: Vec::new(),
             sidebar_collapsed: false,

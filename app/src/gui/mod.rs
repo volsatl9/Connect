@@ -369,6 +369,7 @@ impl App {
                 accepting: settings.accepting,
                 trusted: settings.always_allowed(),
                 bitrate_mbps: settings.bitrate_mbps,
+                frame_rate_limit: settings.frame_rate_limit,
                 ..HostConfig::new(settings.device_name.clone())
             },
         );

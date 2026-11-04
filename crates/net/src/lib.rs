@@ -146,9 +146,11 @@ fn configure(builder: Builder, secret_key: SecretKey) -> Builder {
 
 /// How much of the bandwidth-delay product stays in flight while BBR measures the round trip.
 /// BBR's own 0.5 is for flows that can wait. Video at 80% of the path can't: it halved the send
-/// rate every few seconds and queued 300 KB on the host, 80 ms of latency each time. 0.9 is still
-/// under the path's capacity, so no queue stands on it and the measurement stays true.
-const PROBE_RTT_GAIN: f64 = 0.9;
+/// rate every few seconds and queued 300 KB on the host, 80 ms of latency each time. 0.9 wasn't
+/// enough either. The product uses the lowest round trip seen, 37 ms on a path that usually takes
+/// 44, so it comes to less than the video has in flight, and spikes of 38 ms were left. Over 1.0,
+/// the window stays clear of the video and BBR still gets its pause on the same schedule.
+const PROBE_RTT_GAIN: f64 = 1.25;
 
 /// BBR that remembers the path through quiet scenes; `CONNECT_PATH_MEMORY=0` runs plain BBR, and
 /// `CONNECT_PROBE_RTT_GAIN` sets the gain above (0.5 is BBR's own).

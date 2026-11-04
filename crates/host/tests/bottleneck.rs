@@ -14,7 +14,10 @@
 //! `replaying_a_session` sends a real session's frames, sizes and timing from a host trace
 //! (`REPLAY_FRAMES=host-…-frames.csv`, `REPLAY_FROM` and `REPLAY_TO` in seconds), over the same
 //! kind of path with room to spare (`REPLAY_MBPS`), optionally scaled (`REPLAY_SCALE`). Synthetic traffic doesn't make BBR forget the path; a game
-//! does. `CONNECT_PATH_MEMORY=0` shows plain BBR.
+//! does. `CONNECT_PATH_MEMORY=0` shows plain BBR. `REPLAY_DELAY_MS` sets the delay each way.
+//!
+//! Both can wander the path's delay (`PATH_JITTER_MS`) and lose packets whatever is being sent
+//! (`PATH_LOSS_PERCENT`, from `PATH_LOSS_FROM` to `PATH_LOSS_TO` seconds in).
 
 use std::{
     net::SocketAddr,
@@ -41,6 +44,27 @@ struct Path {
     /// When the path gets four times slower, if it does, and when it gets better again.
     slows_at: Option<Duration>,
     back_at: Option<Duration>,
+    /// How far the one-way delay wanders over `delay`: on the internet the lowest round trip
+    /// seen is well under the usual one (37 and 44 ms at Kellu).
+    jitter: Duration,
+    /// When packets go missing on the way, and the share of them, whatever is being sent.
+    stray_loss: Option<(Duration, Duration, f64)>,
+}
+
+/// The stray loss a test's environment asks for, in seconds and percent.
+fn stray_loss_from_env() -> Option<(Duration, Duration, f64)> {
+    let share = env("PATH_LOSS_PERCENT", 0.0f64) / 100.0;
+    (share > 0.0).then(|| {
+        (Duration::from_secs(env("PATH_LOSS_FROM", 0)), Duration::from_secs(env("PATH_LOSS_TO", u64::MAX / 2)), share)
+    })
+}
+
+/// Enough randomness for a test path.
+fn next_random(state: &mut u64) -> f64 {
+    *state ^= *state << 13;
+    *state ^= *state >> 7;
+    *state ^= *state << 17;
+    *state as f64 / u64::MAX as f64
 }
 
 /// What got through the relay.
@@ -85,12 +109,26 @@ async fn bottleneck_relay(host: SocketAddr, path: Path, relayed: Arc<Mutex<Relay
         // When the bottleneck finishes sending what it holds.
         let mut free_at = tokio::time::Instant::now();
         let started = Instant::now();
+        let mut random = 0x9E37_79B9_7F4A_7C15u64;
+        // The delay moves in steps, not per packet: packets stay in order, so the slowest of a
+        // run would otherwise set the delay for all of them.
+        let (mut wander, mut wander_until) = (Duration::ZERO, started);
         loop {
             let Ok((len, _)) = host_side.recv_from(&mut buf).await else { return };
             let slowed = path.slows_at.is_some_and(|at| started.elapsed() >= at)
                 && path.back_at.is_none_or(|at| started.elapsed() < at);
             let bits_per_second = if slowed { path.bits_per_second / 4.0 } else { path.bits_per_second };
             let Some(client) = *client.lock().unwrap() else { continue };
+            if path.stray_loss.is_some_and(|(from, to, share)| {
+                (from..to).contains(&started.elapsed()) && next_random(&mut random) < share
+            }) {
+                relayed.lock().unwrap().dropped += 1;
+                continue;
+            }
+            if Instant::now() >= wander_until {
+                wander = path.jitter.mul_f64(next_random(&mut random));
+                wander_until = Instant::now() + Duration::from_millis(50);
+            }
             let now = tokio::time::Instant::now();
             free_at = free_at.max(now);
             let held = (free_at - now).as_secs_f64() * bits_per_second / 8.0;
@@ -100,7 +138,7 @@ async fn bottleneck_relay(host: SocketAddr, path: Path, relayed: Arc<Mutex<Relay
             }
             free_at += Duration::from_secs_f64(len as f64 * 8.0 / bits_per_second);
             relayed.lock().unwrap().forwarded += 1;
-            let _ = to_client.send((free_at + path.delay, buf[..len].to_vec(), client));
+            let _ = to_client.send((free_at + path.delay + wander, buf[..len].to_vec(), client));
         }
     });
     addr
@@ -141,6 +179,8 @@ async fn video_through_a_bottleneck() {
         delay: Duration::from_millis(20),
         slows_at: seconds_from("BOTTLENECK_DROP_SECS"),
         back_at: seconds_from("BOTTLENECK_BACK_SECS"),
+        jitter: Duration::from_millis(env("PATH_JITTER_MS", 0)),
+        stray_loss: stray_loss_from_env(),
     };
     let seconds = env("BOTTLENECK_SECS", 30u64);
     let fps = env("BOTTLENECK_FPS", 120u32);
@@ -257,9 +297,11 @@ async fn replaying_a_session() {
     let path = Path {
         bits_per_second: env("REPLAY_MBPS", 80.0) * 1e6,
         queue_bytes: 1024 * 1024,
-        delay: Duration::from_millis(20),
+        delay: Duration::from_millis(env("REPLAY_DELAY_MS", 20)),
         slows_at: None,
         back_at: None,
+        jitter: Duration::from_millis(env("PATH_JITTER_MS", 0)),
+        stray_loss: stray_loss_from_env(),
     };
     let sender = net::bind_local_endpoint_at(SecretKey::generate(), "[::1]:0").await.unwrap();
     let relay = bottleneck_relay(*sender.bound_sockets().first().unwrap(), path, Arc::default()).await;

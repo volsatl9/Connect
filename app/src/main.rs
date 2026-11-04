@@ -29,7 +29,8 @@
 //! periodic keyframes; `CONNECT_FRAME_BUFFER=<frames>` changes the encoder's buffer setting (0:
 //! the driver's default); `CONNECT_PEAK_PERCENT=<n>` uses peak-constrained VBR at n% of the mean;
 //! `CONNECT_MIN_QP=<qp>` sets the finest quantizer; `CONNECT_RATE_CEILING=0` runs 0.9.0's rate
-//! controller; `CONNECT_PATH_MEMORY=0` runs plain BBR, which forgets the path in quiet scenes;
+//! controller; `CONNECT_PATH_MEMORY=0` runs plain BBR, which forgets the path in quiet scenes and
+//! backs off on stray loss;
 //! `CONNECT_PROBE_RTT_GAIN=0.5` goes back to BBR's own window while it measures the round trip.
 
 // No console window behind the app. Debug builds keep theirs, for the logs.

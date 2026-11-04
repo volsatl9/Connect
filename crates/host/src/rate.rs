@@ -8,7 +8,9 @@
 //! back quickly to just under that, then only creeps: going over again would overflow the
 //! bottleneck's queue once more, and a full queue drops packets in runs, too many at once for
 //! the recovery data, so whole frames go. The ceiling rises when the path measures faster, and is forgotten
-//! after a long calm.
+//! after a long calm. BBR's estimate only sees a little past what's being sent, so once things
+//! are calm the ceiling follows it: otherwise the two wait for each other, and a low bitrate
+//! stays low on a path that came back long ago.
 //!
 //! A game's video comes in bursts, so what counts as the path giving out needs care. One large
 //! frame queues for a moment on any path, so only a backlog lasting from one tick to the next
@@ -16,6 +18,10 @@
 //! went wrong on the way, not that it was full: sending less wouldn't have helped. Heavy loss,
 //! or loss going on from one tick to the next, counts whatever the bandwidth estimate says, as
 //! that lags when the path really slows down.
+//!
+//! Frames lost to a low share of loss get one step down, which shows whether sending less helps.
+//! If the loss carries on as before, the path is losing packets whatever it's sent: more cuts
+//! would only cost picture, so the bitrate holds and the recovery data takes it from there.
 
 use std::{
     sync::{
@@ -59,6 +65,12 @@ const FAST_UNTIL: f64 = 0.90;
 const CREEP: f64 = 1.0025;
 /// How far over its value at the ceiling the estimate has to be for the path to count as better.
 const BETTER_PATH: f64 = 1.25;
+/// After this long without trouble, the ceiling follows the estimate however little it moved.
+const FOLLOW_ESTIMATE_AFTER: Duration = Duration::from_secs(3);
+/// Loss still over this share of what it was at a cut means the cut didn't help.
+const NO_BETTER: f32 = 0.7;
+/// Less loss than this, smoothed, isn't what cost the viewer its frames.
+const LOSS_NOTICED: f32 = 0.005;
 /// A ceiling not run into again for this long is forgotten.
 const FORGET_CEILING: Duration = Duration::from_secs(20);
 /// Recovery requests this soon after the start are the viewer's first keyframe, not loss.
@@ -92,6 +104,8 @@ pub(crate) enum Reason {
     Climb,
     /// Climbing slowly, near a ceiling the path hit before.
     Creep,
+    /// The viewer lost frames, but the last cut did nothing for the loss: holding.
+    LossHeld,
 }
 
 impl Reason {
@@ -103,6 +117,7 @@ impl Reason {
             Reason::ViewerLoss => "viewer_loss",
             Reason::Climb => "climb",
             Reason::Creep => "creep",
+            Reason::LossHeld => "loss_held",
         }
     }
 }
@@ -125,6 +140,8 @@ pub(crate) struct RateControl {
     ceiling: Option<(u32, Instant)>,
     /// The bandwidth estimate then.
     estimate_at_ceiling: u64,
+    /// The smoothed loss at the last cut made for it, until the loss falls.
+    loss_at_cut: Option<f32>,
     /// Whether to keep a ceiling and count the viewer's losses: off with `CONNECT_RATE_CEILING=0`,
     /// to compare with 0.9.0's controller.
     learn: bool,
@@ -149,6 +166,7 @@ impl RateControl {
             calm_since: now,
             ceiling: None,
             estimate_at_ceiling: 0,
+            loss_at_cut: None,
             learn: std::env::var("CONNECT_RATE_CEILING").map_or(true, |v| v.trim() != "0"),
             reason: Reason::Steady,
         }
@@ -207,6 +225,8 @@ impl RateControl {
             || path.bandwidth_estimate.is_none_or(|estimate| video_bps >= estimate as f64 * VIDEO_SHARE);
         self.losing = losing;
         let clamp = |bps: f64| (bps as u32).clamp(MIN_BPS, self.max_bps);
+        self.loss_at_cut = self.loss_at_cut.filter(|at_cut| self.loss >= at_cut * NO_BETTER);
+        let holding = filling && viewer_lost && self.loss_at_cut.is_some();
         let congested = if lasting && backlog > BACKLOG_HIGH {
             Some((0.7, Reason::Backlog))
         } else if sample > LOSS_HEAVY {
@@ -215,7 +235,7 @@ impl RateControl {
             Some((0.85, Reason::Backlog))
         } else if filling && sample > LOSS_SOME {
             Some((0.85, Reason::Loss))
-        } else if filling && viewer_lost {
+        } else if filling && viewer_lost && !holding {
             Some((0.85, Reason::ViewerLoss))
         } else {
             None
@@ -225,7 +245,8 @@ impl RateControl {
         }
         // The path measures faster than when it last gave out: it has got better.
         if let (None, Some((ceiling, at)), Some(estimate)) = (congested, self.ceiling, path.bandwidth_estimate)
-            && estimate as f64 > self.estimate_at_ceiling as f64 * BETTER_PATH
+            && (estimate as f64 > self.estimate_at_ceiling as f64 * BETTER_PATH
+                || now.duration_since(self.calm_since) >= FOLLOW_ESTIMATE_AFTER)
         {
             self.ceiling = Some((ceiling.max(clamp(estimate as f64 * VIDEO_SHARE)), at));
         }
@@ -242,15 +263,19 @@ impl RateControl {
             }
             self.ceiling = Some((ceiling, now));
             self.estimate_at_ceiling = path.bandwidth_estimate.unwrap_or(u64::MAX);
+            if reason == Reason::ViewerLoss && self.loss >= LOSS_NOTICED {
+                self.loss_at_cut = Some(self.loss);
+            }
             (clamp(f64::from(before) * factor).min(ceiling), reason)
+        } else if holding {
+            self.calm_since = now;
+            (before, Reason::LossHeld)
         } else if now.duration_since(self.calm_since) >= CALM_BEFORE_RAISE && before < self.max_bps {
-            match self.ceiling {
-                Some((ceiling, _)) if f64::from(before) >= f64::from(ceiling) * FAST_UNTIL => {
-                    (clamp(f64::from(before) * CREEP), Reason::Creep)
-                }
-                Some((ceiling, _)) => {
+            match self.ceiling.map(|(ceiling, _)| clamp(f64::from(ceiling) * FAST_UNTIL)) {
+                Some(creep_from) if before >= creep_from => (clamp(f64::from(before) * CREEP), Reason::Creep),
+                Some(creep_from) => {
                     let up = clamp(f64::from(before) * 1.05).max(before.saturating_add(250_000).min(self.max_bps));
-                    (up.min(clamp(f64::from(ceiling) * FAST_UNTIL)).max(before), Reason::Climb)
+                    (up.min(creep_from).max(before), Reason::Climb)
                 }
                 // Up gently: about doubling in four seconds.
                 None => (
@@ -536,7 +561,8 @@ mod tests {
             );
         }
         assert!(new.cuts * 3 <= old.cuts, "{} vs {} cuts", new.cuts, old.cuts);
-        assert!(new.excess_mb * 3.0 <= old.excess_mb, "{:.1} vs {:.1} MB over", new.excess_mb, old.excess_mb);
+        // Creeping does go over in the end: that's how it finds out the path has more room.
+        assert!(new.excess_mb * 2.5 <= old.excess_mb, "{:.1} vs {:.1} MB over", new.excess_mb, old.excess_mb);
         // What's left of the deep queue is each creep finding the ceiling: the backlog that says
         // so (25 ms of video) is itself about 100 KB at 40 Mb/s.
         assert!(
@@ -546,6 +572,115 @@ mod tests {
             old.deep_queue_ticks
         );
         assert!(new.mbps > old.mbps * 0.9, "without giving up much throughput: {:.1} vs {:.1}", new.mbps, old.mbps);
+    }
+
+    /// What the 0.9.3 session got stuck in after a loss: the bitrate at 90% of the ceiling, BBR's
+    /// estimate about 1.6 times the bitrate as it can't see further than what's sent, and the
+    /// path back at 100 Mb/s all along.
+    #[test]
+    fn the_estimate_lifts_the_ceiling_once_the_path_is_calm() {
+        let mut rate = RateControl::new(80_000_000);
+        let start = rate.started;
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let path = |sent: u64, queued, estimate: f64| PathSample {
+            sent_packets: sent,
+            queued_bytes: queued,
+            bandwidth_estimate: Some(estimate as u64),
+            ..Default::default()
+        };
+        rate.bps.store(15_000_000, Ordering::Relaxed);
+        rate.update(at(2750), path(1000, 80_000, 21.4e6));
+        rate.update(at(3000), path(2000, 80_000, 21.4e6));
+        assert!(rate.ceiling().is_some());
+        let mut seconds_back = None;
+        for tick in 0..120u64 {
+            let estimate = (f64::from(rate.bitrate()) * 1.6).min(100e6);
+            rate.update(at(3250 + tick * 250), path(3000 + tick * 1000, 0, estimate));
+            if rate.bitrate() >= 72_000_000 {
+                seconds_back = Some(tick as f64 / 4.0);
+                break;
+            }
+        }
+        let seconds_back = seconds_back.expect("back near the cap");
+        assert!(seconds_back <= 15.0, "{seconds_back} s");
+    }
+
+    /// `ceiling * FAST_UNTIL` is rarely a whole number, and a bitrate is.
+    #[test]
+    fn climbing_reaches_the_ceiling_and_creeps() {
+        let mut rate = RateControl::new(80_000_000);
+        let start = rate.started;
+        rate.bps.store(5_000_000, Ordering::Relaxed);
+        rate.ceiling = Some((13_782_123, start + Duration::from_secs(10)));
+        rate.estimate_at_ceiling = u64::MAX;
+        for tick in 0..60u64 {
+            rate.update(start + Duration::from_millis(10_000 + tick * 250), sample(1000 * (tick + 1), 0, 0));
+        }
+        assert!(rate.bitrate() > 12_403_911, "stopped at 90% of the ceiling: {}", rate.bitrate());
+        assert_eq!(rate.reason(), Reason::Creep);
+    }
+
+    /// The 0.9.3 session: 2-3% lost whatever was sent. One step down tries whether sending less
+    /// helps; when it doesn't, more of them only cost picture.
+    #[test]
+    fn stops_cutting_when_cutting_doesnt_help_the_loss() {
+        let mut rate = RateControl::new(80_000_000);
+        let start = rate.started;
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let path = |tick: u64, requests: u64, estimate: u64| PathSample {
+            sent_packets: tick * 2000,
+            lost_packets: tick * 50,
+            recovery_requests: requests,
+            video_bytes: tick * 2_500_000,
+            bandwidth_estimate: Some(estimate),
+            ..Default::default()
+        };
+        for tick in 1..=8 {
+            rate.update(at(4000 + tick * 250), path(tick, 0, 100_000_000));
+        }
+        assert_eq!(rate.update(at(6250), path(9, 1, 100_000_000)), Some(68_000_000));
+        assert_eq!(rate.reason(), Reason::ViewerLoss);
+        for tick in 10..=20 {
+            rate.update(at(4000 + tick * 250), path(tick, tick, 100_000_000));
+            assert_eq!(rate.bitrate(), 68_000_000, "the loss is the same as before the cut");
+            assert_eq!(rate.reason(), Reason::LossHeld);
+        }
+        // The loss ends and the bitrate climbs back.
+        for tick in 21..=60 {
+            let clean = PathSample { lost_packets: 1000, ..path(tick, 20, 100_000_000) };
+            rate.update(at(4000 + tick * 250), clean);
+        }
+        assert!(rate.bitrate() > 72_000_000, "{}", rate.bitrate());
+    }
+
+    /// Loss that falls when the bitrate does is the path being full: keep going down.
+    #[test]
+    fn keeps_cutting_while_cutting_helps_the_loss() {
+        let mut rate = RateControl::new(80_000_000);
+        let start = rate.started;
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let path = |sent: u64, lost: u64, requests: u64| PathSample {
+            sent_packets: sent,
+            lost_packets: lost,
+            recovery_requests: requests,
+            video_bytes: sent * 1250,
+            bandwidth_estimate: Some(80_000_000),
+            ..Default::default()
+        };
+        let (mut sent, mut lost) = (0, 0);
+        for tick in 1..=16u64 {
+            (sent, lost) = (sent + 2000, lost + 120);
+            rate.update(at(4000 + tick * 250), path(sent, lost, 0));
+        }
+        (sent, lost) = (sent + 2000, lost + 120);
+        assert_eq!(rate.update(at(8250), path(sent, lost, 1)), Some(64_000_000));
+        for tick in 0..16u64 {
+            (sent, lost) = (sent + 2000, lost + 10);
+            rate.update(at(8500 + tick * 250), path(sent, lost, 1));
+        }
+        (sent, lost) = (sent + 2000, lost + 10);
+        assert!(rate.update(at(12_500), path(sent, lost, 2)).is_some(), "a new loss after the last one faded");
+        assert_eq!(rate.reason(), Reason::ViewerLoss);
     }
 
     #[test]

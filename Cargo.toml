@@ -4,7 +4,7 @@ resolver = "3"
 members = ["crates/proto", "crates/net", "crates/host", "crates/client", "crates/gpu-load", "crates/gpu-video", "crates/perf", "app"]
 
 [workspace.package]
-version = "0.9.3"
+version = "0.9.4"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 

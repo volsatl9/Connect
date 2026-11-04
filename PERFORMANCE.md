@@ -319,7 +319,7 @@ That is a model. It hasn't been seen on a real path yet.
   something on the host stalling everything, not at the encoder alone, but it isn't established.
   The bitrate was near its floor at the time, which 0.9.2 should stop, so the link can't be ruled
   out. 0.9.2 traces tell a stalled capture from a game with nothing new to show (METRICS.md).
-- **Repeating network queue events.** Explained, and fixed in 0.9.3: see below.
+- **Repeating network queue events.** Explained: see 0.9.3 and 0.9.4 below.
 - **Host priority.** That session dropped 829 remote events to host priority, in runs around 180 s
   and 280–300 s, with no explanation of what set it off. It's not established that anyone was
   using the host's mouse. 0.9.2 records what the hooks saw (METRICS.md).
@@ -371,6 +371,75 @@ missed. It began and ended within seconds, with no local input at either edge, n
 game's GPU load, and Connect's CPU use going down. Neither PC has a 60 Hz monitor, so it isn't a
 display's refresh. Something else keeping 60 Hz time on the host looks responsible; what isn't
 known. It adds 3–5 ms to the median, and halves the frame rate. 0.9.3 doesn't change this.
+
+## Version 0.9.4: staying sharp through loss
+
+A 19-minute session of 0.9.3 (80 Mb/s over a 44 ms path, both PCs on Ethernet) gave input delay
+p50 55.5, p95 76.7, p99 95.0 ms. That's better than 0.9.2's 59.7, 78.0 and 121.4, but short of the
+71 ms predicted, and the 60 Hz stall that slowed 0.9.2's session didn't happen this time. Three
+things held it back.
+
+**The probe still queued.** Spikes fell from about 80 to about 38 ms over usual, still every
+5–14 s. The bandwidth-delay product uses the lowest round trip seen, about 37 ms, on a path that
+usually takes 44. So the 90% window of 0.9.3 was about 410 KB, which carries 75 Mb/s, and the video
+with its recovery data needs about 90. The replay in 0.9.3 had a steady delay, so it missed this.
+The gain is now 1.25: the window stays clear of the video, and BBR keeps its schedule. It no longer
+empties a queue during the probe, so a queue standing on the path can raise its lowest round trip.
+
+With the delay wandering by 7 ms, 85 s of that session over a 90 Mb/s path:
+
+| To the last datagram | Gain 0.9 | 1.25 |
+|---|---|---|
+| p99 | 38.5 ms | 30.4 ms |
+| Worst | 53.1 ms | 33.5 ms |
+| Lowest estimate | 86.4 Mb/s | 93.9 Mb/s |
+
+Over a 100 Mb/s path, replay showed no spikes at either gain, so it still doesn't reproduce the
+session fully. Only a real session can confirm this one.
+
+**Stray loss took BBR down.** For 16 s the path lost 2–3% of packets whatever was sent, from
+90 Mb/s down to 7, and the round trip stepped from 44 to 52 ms and back. Nothing in the traces says
+why, and the user saw nothing happening. Connect's own loss limit (10%) never fired. BBR did: it
+backs off a step each round trip with any loss, so its estimate fell from 101 to 8 Mb/s, video
+backed up, and the bitrate followed it to 3.8 Mb/s. The same loss halved the path memory away.
+
+Loss now counts as stray while it's at most 5% of the last half second and the round trip is under
+1.5 times its best. BBR is told such loss was spurious, and the memory stays. The bitrate takes one
+15% step down when the viewer loses frames; if the loss carries on as before, it holds there
+(`loss_held` in the trace) and the recovery data does the rest.
+
+2.5% lost for 16 s, 85 s of the same session over a 100 Mb/s path, no recovery data in this test:
+
+| To the last datagram | Plain BBR | 0.9.4 |
+|---|---|---|
+| Lowest estimate | 4.0 Mb/s | 103.1 Mb/s |
+| p99 | 247.7 ms | 29.8 ms |
+| Worst | 281.2 ms | 31.3 ms |
+| Frames over 60 ms | 3,811 | 0 |
+
+Real video through the test path can't show the whole loop. The CPU encoder there makes about
+10 Mb/s, where plain BBR doesn't collapse either. Results matched plain BBR's at that rate: no
+harm, but no proof. The bitrate's side is covered by unit tests, and 80 Mb/s needs a real session.
+
+**The trade-off.** When Connect can't tell a bad moment from another device using the connection,
+it stays sharp. It gives way once loss passes 5% or the round trip passes 1.5 times its best, not
+at the first lost packets. So it gives other traffic room later than BBR alone would. This hasn't
+been tested alongside other traffic.
+
+**Recovery stalled.** Full bitrate came back about 105 s after the loss ended. Two causes:
+
+- `ceiling * 0.9` was rounded down to a whole bitrate and then compared with the unrounded value,
+  so a bitrate climbing from below could never count as having reached it, and creeping never
+  started. 279 of the 360 quarter-seconds from 780 to 870 s sat at exactly 90% of the ceiling.
+- BBR's estimate can't see far past what's sent, about 1.6 times the bitrate here. Held at 90% of
+  a ceiling worth 80% of the estimate, the bitrate lifted the estimate only 1.15 times, and the
+  ceiling needed 1.25. Each waited for the other until the ceiling was forgotten. After 3 s of
+  calm, the ceiling now follows the estimate.
+
+Creeping now works, so on a path that really slowed down, the bitrate finds the limit a little
+more often: in the model, 4.6 MB sent over the path where 4.1 went before, for 41.4 Mb/s delivered
+over 39.8. In the test path's drop, the target was back to 80% of the cap 11–13 s after the path, 3
+runs of 3, with 6–11 frames lost and 19–28 skipped.
 
 ## Build requirement
 

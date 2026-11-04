@@ -1,0 +1,53 @@
+# Debian and Ubuntu (.deb), Fedora (.rpm) and Arch (.pkg.tar.zst) packages, built by
+# packaging/build.sh, which sets VERSION and fills target/dist/stage.
+name: connect
+arch: amd64
+platform: linux
+version: ${VERSION}
+release: "1"
+maintainer: Connect <349223100+volsatl9@users.noreply.github.com>
+description: Low-latency remote desktop for gaming, peer to peer.
+homepage: https://github.com/volsatl9/Connect
+license: MIT OR Apache-2.0
+contents:
+  - src: target/dist/stage/connect
+    dst: /usr/bin/connect
+    file_info:
+      mode: 0755
+  - src: packaging/linux/connect.desktop
+    dst: /usr/share/applications/connect.desktop
+  - src: target/dist/stage/icons
+    dst: /usr/share/icons/hicolor
+    type: tree
+archlinux:
+  packager: Connect <349223100+volsatl9@users.noreply.github.com>
+overrides:
+  deb:
+    depends:
+      - libc6 (>= 2.39)
+      - libstdc++6
+      - libgcc-s1
+      - libudev1
+      - libasound2t64 | libasound2
+      - libcap2
+      - libvulkan1
+      - libxkbcommon-x11-0
+  rpm:
+    depends:
+      - glibc >= 2.39
+      - libstdc++
+      - libgcc
+      - systemd-libs
+      - alsa-lib
+      - libcap
+      - vulkan-loader
+      - libxkbcommon-x11
+  archlinux:
+    depends:
+      - glibc
+      - gcc-libs
+      - systemd-libs
+      - alsa-lib
+      - libcap
+      - vulkan-icd-loader
+      - libxkbcommon-x11

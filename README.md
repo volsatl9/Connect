@@ -1,5 +1,23 @@
 # Connect
 
+Version 0.10.0 adds a Gamepad page for changing what your controller's buttons do, per-device
+permissions, a window with its own title bar, an app image, a Windows installer and Linux packages.
+
+## Install
+
+From the [latest release](https://github.com/volsatl9/Connect/releases):
+
+| System | Download |
+|---|---|
+| Windows | `Connect-Installer.exe` installs for your user, with no administrator rights. It isn't code-signed yet, so Windows may warn about an unknown publisher. |
+| Debian 13+, Ubuntu 24.04+ | `connect_<version>-1_amd64.deb` |
+| Fedora 40+ | `connect-<version>-1.x86_64.rpm` |
+| Arch | `connect-<version>-1-x86_64.pkg.tar.zst` |
+
+`connect.exe` and `connect-linux-x86_64` are the bare programs, which the in-app updater uses. A
+Linux program file can't carry an image, so use a package to get the menu entry and icon. Packaged
+copies update through their package manager, not the app. Linux builds need glibc 2.39 or newer.
+
 Version 0.9.4 holds the picture through small amounts of packet loss, brings the bitrate back
 within seconds of a path recovering, and aims to clear what was left of the latency spikes. See
 PERFORMANCE.md.

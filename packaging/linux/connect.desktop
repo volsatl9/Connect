@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Connect
+Comment=Play on another PC as if you were sitting at it
+Exec=connect
+Icon=connect
+Terminal=false
+Categories=Game;Network;RemoteAccess;
+StartupWMClass=connect

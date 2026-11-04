@@ -19,7 +19,7 @@ mod trace;
 mod yuv;
 
 use std::{
-    collections::HashSet,
+    collections::HashMap,
     sync::{
         Arc, Mutex, MutexGuard, PoisonError, RwLock,
         atomic::{AtomicBool, AtomicU32, Ordering},
@@ -45,11 +45,9 @@ pub struct HostConfig {
     pub host_name: String,
     /// When false, every connection is turned away without asking.
     pub accepting: bool,
-    /// What a trusted device may use, since it isn't asked about; prompted connections get
+    /// User-IDs that are let in without asking, and what each may use. Everyone else gets
     /// whatever the host user picks in [`Decision::Allow`].
-    pub default_permissions: Permissions,
-    /// User-IDs that are let in without asking.
-    pub trusted: HashSet<EndpointId>,
+    pub trusted: HashMap<EndpointId, Permissions>,
     /// Upper bound on the video bitrate, in megabits per second; applies from the next session.
     pub bitrate_mbps: u32,
     pub video: VideoSource,
@@ -62,8 +60,7 @@ impl HostConfig {
         Self {
             host_name: host_name.into(),
             accepting: true,
-            default_permissions: Permissions::default(),
-            trusted: HashSet::new(),
+            trusted: HashMap::new(),
             bitrate_mbps: DEFAULT_BITRATE_MBPS,
             video: VideoSource::default(),
             input: InputSink::default(),
@@ -117,10 +114,9 @@ pub struct HostHandle(Arc<Shared>);
 struct Shared {
     host_name: RwLock<String>,
     accepting: AtomicBool,
-    default_permissions: RwLock<Permissions>,
     /// The running session's permissions; reset when a session starts.
     permissions: watch::Sender<Permissions>,
-    trusted: RwLock<HashSet<EndpointId>>,
+    trusted: RwLock<HashMap<EndpointId, Permissions>>,
     bitrate_mbps: AtomicU32,
     /// The one connection being asked about or served; anyone else is told the host is busy.
     slot: Mutex<Option<(EndpointId, Connection)>>,
@@ -136,8 +132,7 @@ pub fn start(endpoint: Endpoint, config: HostConfig) -> (HostHandle, mpsc::Recei
     let shared = Arc::new(Shared {
         host_name: RwLock::new(config.host_name),
         accepting: AtomicBool::new(config.accepting),
-        default_permissions: RwLock::new(config.default_permissions),
-        permissions: watch::Sender::new(config.default_permissions),
+        permissions: watch::Sender::new(Permissions::default()),
         trusted: RwLock::new(config.trusted),
         bitrate_mbps: AtomicU32::new(config.bitrate_mbps),
         slot: Mutex::new(None),
@@ -182,23 +177,19 @@ impl HostHandle {
         *self.0.permissions.borrow()
     }
 
-    /// What trusted devices, which aren't asked about, may use from their next session.
-    pub fn set_default_permissions(&self, permissions: Permissions) {
-        *self.0.default_permissions.write().unwrap_or_else(PoisonError::into_inner) = permissions;
-    }
-
     /// Caps the video bitrate from the next session on.
     pub fn set_bitrate_mbps(&self, mbps: u32) {
         self.0.bitrate_mbps.store(mbps.max(1), Ordering::Relaxed);
     }
 
-    pub fn set_trusted(&self, peer: EndpointId, trusted: bool) {
-        let mut set = self.0.trusted.write().unwrap_or_else(PoisonError::into_inner);
-        if trusted {
-            set.insert(peer);
-        } else {
-            set.remove(&peer);
-        }
+    /// Lets `peer` in without asking, with these permissions from its next session, or with
+    /// `None` asks again.
+    pub fn set_trusted(&self, peer: EndpointId, permissions: Option<Permissions>) {
+        let mut trusted = self.0.trusted.write().unwrap_or_else(PoisonError::into_inner);
+        match permissions {
+            Some(permissions) => trusted.insert(peer, permissions),
+            None => trusted.remove(&peer),
+        };
     }
 
     /// The peer currently connected or waiting for an answer.
@@ -235,12 +226,8 @@ impl Shared {
         self.host_name.read().unwrap_or_else(PoisonError::into_inner).clone()
     }
 
-    fn default_permissions(&self) -> Permissions {
-        *self.default_permissions.read().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    fn is_trusted(&self, peer: &EndpointId) -> bool {
-        self.trusted.read().unwrap_or_else(PoisonError::into_inner).contains(peer)
+    fn trusted_permissions(&self, peer: &EndpointId) -> Option<Permissions> {
+        self.trusted.read().unwrap_or_else(PoisonError::into_inner).get(peer).copied()
     }
 
     /// Claims the session slot for `conn`, or `None` if another peer holds it.

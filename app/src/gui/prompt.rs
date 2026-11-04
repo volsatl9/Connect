@@ -42,6 +42,13 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
             theme::caption("Desktop audio is shared only if selected. You can change all of these during the session.")
                 .size(11.5),
         );
+        ui.label(
+            theme::caption(
+                "Windows keeps input away from programs running as administrator unless Connect runs as \
+                 administrator too.",
+            )
+            .size(11.5),
+        );
 
         ui.add_space(6.0);
         theme::switch_row(ui, "Always allow this device", &mut request.always_allow);
@@ -61,9 +68,10 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
 
     if let Some(decision) = decision {
         let request = app.requests.pop_front().expect("shown above");
-        if matches!(decision, Decision::Allow(_)) && request.always_allow {
-            app.settings.trust(request.inner.peer, &request.inner.client_name);
-            app.host.set_trusted(request.inner.peer, true);
+        if let Decision::Allow(permissions) = decision {
+            let peer = request.inner.peer;
+            app.settings.remember_guest(peer, &request.inner.client_name, permissions, request.always_allow);
+            app.host.set_trusted(peer, request.always_allow.then_some(permissions));
         }
         request.inner.respond(decision);
     }

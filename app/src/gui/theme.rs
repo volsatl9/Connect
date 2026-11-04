@@ -573,6 +573,18 @@ pub fn switch_row(ui: &mut Ui, label: impl Into<WidgetText>, on: &mut bool) -> R
     .inner
 }
 
+/// A dropdown choosing `value` from `options`. True if it changed.
+pub fn dropdown<T: Copy + PartialEq>(ui: &mut Ui, id: &str, value: &mut T, options: &[(T, String)]) -> bool {
+    let selected = options.iter().find(|(option, _)| option == value).map_or("", |(_, label)| label.as_str());
+    let before = *value;
+    egui::ComboBox::from_id_salt(id).width(190.0).selected_text(selected).show_ui(ui, |ui| {
+        for (option, label) in options {
+            ui.selectable_value(value, *option, label);
+        }
+    });
+    *value != before
+}
+
 /// A toggle in the shape of a pill, filled with the accent while selected.
 pub fn chip(ui: &mut Ui, icon: Option<&str>, label: &str, selected: bool) -> Response {
     let galley = ui.painter().layout_job(with_icon(icon, label, medium(13.0)));

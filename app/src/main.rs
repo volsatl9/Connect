@@ -32,6 +32,9 @@
 //! controller; `CONNECT_PATH_MEMORY=0` runs plain BBR, which forgets the path in quiet scenes and
 //! backs off on stray loss;
 //! `CONNECT_PROBE_RTT_GAIN=0.5` goes back to BBR's own window while it measures the round trip.
+//!
+//! Viewing, for telling a driver's glitches from Connect's: `CONNECT_HARDWARE_DECODING=0` decodes
+//! on the processor, and `CONNECT_ALLOW_H265=0` asks hosts for H.264.
 
 // No console window behind the app. Debug builds keep theirs, for the logs.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]

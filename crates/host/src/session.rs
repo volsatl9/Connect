@@ -97,8 +97,8 @@ async fn serve(conn: &Connection, shared: &Shared, events: &mpsc::Sender<HostEve
         return reject(conn, &mut send, BUSY).await;
     };
 
-    let granted = if shared.is_trusted(&peer) {
-        shared.default_permissions()
+    let granted = if let Some(permissions) = shared.trusted_permissions(&peer) {
+        permissions
     } else {
         match ask(conn, shared, events, &client_name).await {
             Answer::Decided(Decision::Allow(permissions)) => permissions,

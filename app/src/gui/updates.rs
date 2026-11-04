@@ -130,11 +130,15 @@ impl Updater {
                         ui.label(RichText::new("Update available").font(theme::semibold(14.0)).color(theme::ACCENT));
                         ui.label(format!("Connect {} (you have {})", update.version, update::current_version()));
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            let now = ui
-                                .add_enabled(!in_session, theme::primary("Update now").small())
-                                .on_disabled_hover_text("Available once the current session ends.");
-                            if now.clicked() {
-                                action = Some(Action::Download(update.clone()));
+                            if update::installed_by_package() {
+                                ui.hyperlink_to("Download it", &update.notes_url);
+                            } else {
+                                let now = ui
+                                    .add_enabled(!in_session, theme::primary("Update now").small())
+                                    .on_disabled_hover_text("Available once the current session ends.");
+                                if now.clicked() {
+                                    action = Some(Action::Download(update.clone()));
+                                }
                             }
                             if ui.add(theme::secondary("Later").small()).clicked() {
                                 action = Some(Action::Dismiss(update.version.clone()));

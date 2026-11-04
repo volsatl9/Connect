@@ -426,8 +426,7 @@ mod tests {
             HostConfig {
                 video: VideoSource::TestPattern { width: 1280, height: 720, fps: 60 },
                 input: InputSink::Channel(sink),
-                default_permissions: Permissions::ALL.with(DeviceClass::Audio, false),
-                trusted: [client_ep.id()].into_iter().collect(),
+                trusted: [(client_ep.id(), Permissions::ALL.with(DeviceClass::Audio, false))].into(),
                 ..HostConfig::new("Session controls preview")
             },
         );
@@ -448,12 +447,9 @@ mod tests {
             options,
             Box::new(|cc| {
                 theme::apply(&cc.egui_ctx);
-                let mut app = App::new(
-                    &cc.egui_ctx,
-                    client_ep.clone(),
-                    super::super::settings::Settings { accepting: false, ..Default::default() },
-                    Default::default(),
-                );
+                let mut settings = super::super::settings::Settings::default();
+                settings.accepting = false;
+                let mut app = App::new(&cc.egui_ctx, client_ep.clone(), settings, Default::default());
                 let ctx = cc.egui_ctx.clone();
                 let (handle, events) =
                     connect_client::connect(client_ep.clone(), net::local_addr(&host_ep), "Shelf probe", move || {

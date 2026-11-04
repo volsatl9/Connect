@@ -19,6 +19,7 @@ use super::{
     prompt::permission_toggles,
     settings::{self, BITRATE_CHOICES_MBPS, KnownDevice},
     theme::{self, Glass},
+    window,
 };
 
 const SIDEBAR_OPEN: f32 = 184.0;
@@ -59,6 +60,7 @@ pub fn sidebar(app: &mut App, ui: &mut Ui, area: Rect) -> Rect {
     // The name, with the button that shuts the bar. Shut, the logo turns into the button that
     // opens it again while the pointer is over it.
     let header_y = bar.top() + 30.0;
+    window::drag_area(ui, "sidebar", bar.with_max_y(bar.top() + 58.0));
     let logo = Rect::from_center_size(pos2(icon_x, header_y), vec2(22.0, 22.0));
     let toggle = if open > 0.5 {
         Rect::from_center_size(pos2(bar.right() - 24.0, header_y), vec2(26.0, 26.0))
@@ -69,7 +71,8 @@ pub fn sidebar(app: &mut App, ui: &mut Ui, area: Rect) -> Rect {
         ui.interact(toggle, Id::unique("sidebar-toggle"), Sense::click()).on_hover_cursor(CursorIcon::PointingHand);
     let hover = ctx.animate_bool_with_time(Id::unique("sidebar-toggle-hover"), toggle.hovered(), 0.12);
     let logo_shown = if open > 0.5 { 1.0 } else { 1.0 - hover };
-    painter.add(logo_glass(logo_shown).shapes(logo, 7.0));
+    let whole = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+    painter.image(app.logo.id(), logo.expand(2.0), whole, Color32::WHITE.gamma_multiply(logo_shown));
     label(header_y, "Connect", theme::semibold(17.0), theme::TEXT);
     if open > 0.5 {
         let fill = Color32::from_white_alpha((14.0 + 22.0 * hover) as u8).gamma_multiply(labels);
@@ -87,9 +90,11 @@ pub fn sidebar(app: &mut App, ui: &mut Ui, area: Rect) -> Rect {
     }
 
     let mut y = header_y + 44.0;
-    for (page, icon, name) in
-        [(Page::Connect, icons::MONITOR, "Connect"), (Page::Settings, icons::GEAR_SIX, "Settings")]
-    {
+    for (page, icon, name) in [
+        (Page::Connect, icons::MONITOR, "Connect"),
+        (Page::Gamepad, icons::GAME_CONTROLLER, "Gamepad"),
+        (Page::Settings, icons::GEAR_SIX, "Settings"),
+    ] {
         let row = Rect::from_min_max(pos2(bar.left() + 8.0, y), pos2(bar.right() - 8.0, y + 38.0));
         let response =
             ui.interact(row, Id::unique(("nav", name)), Sense::click()).on_hover_cursor(CursorIcon::PointingHand);
@@ -138,20 +143,8 @@ pub fn sidebar(app: &mut App, ui: &mut Ui, area: Rect) -> Rect {
         }
     }
 
-    Rect::from_min_max(pos2(bar.right() + EDGE + 14.0, area.top() + 22.0), pos2(area.right() - 10.0, area.bottom()))
-}
-
-/// The app's mark: a small square of accent-coloured glass.
-fn logo_glass(shown: f32) -> Glass {
-    let fade = |c: Color32| c.gamma_multiply(shown);
-    Glass {
-        base: Color32::TRANSPARENT,
-        top: fade(Color32::from_rgb(140, 150, 255)),
-        bottom: fade(Color32::from_rgb(34, 190, 238)),
-        rim_top: fade(Color32::from_white_alpha(140)),
-        rim_bottom: fade(Color32::from_white_alpha(20)),
-        shadow: egui::Shadow { offset: [0, 2], blur: 12, spread: 0, color: fade(theme::ACCENT.gamma_multiply(0.5)) },
-    }
+    let top = area.top() + window::BAR_HEIGHT;
+    Rect::from_min_max(pos2(bar.right() + EDGE + 14.0, top), pos2(area.right() - 10.0, area.bottom()))
 }
 
 /// The latest notice, as a glass bar that goes away by itself.
@@ -205,6 +198,7 @@ enum Action {
     KeepIt,
     AddComputer,
     Manage,
+    ManageDevice(net::iroh::EndpointId),
 }
 
 pub fn computers(app: &mut App, ui: &mut Ui) {
@@ -248,6 +242,9 @@ pub fn computers(app: &mut App, ui: &mut Ui) {
         }
         Some(Action::AskRemove(id)) => app.confirm_remove = Some(id),
         Some(Action::Remove(id)) => {
+            if let Ok(peer) = id.parse() {
+                app.host.set_trusted(peer, None);
+            }
             app.settings.computers.retain(|d| d.id != id);
             app.confirm_remove = None;
         }
@@ -259,6 +256,7 @@ pub fn computers(app: &mut App, ui: &mut Ui) {
             app.dialog = Some(Dialog::AddComputer);
         }
         Some(Action::Manage) => app.dialog = Some(Dialog::Hosting),
+        Some(Action::ManageDevice(id)) => app.dialog = Some(Dialog::Device(id)),
         None => {}
     }
 }
@@ -380,7 +378,11 @@ fn saved_card(
 
     computer_tile(ui, pos2(rect.center().x, rect.top() + 50.0), theme::ACCENT);
     let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
-    let detail = device.last_used.map_or("Saved".to_owned(), |then| format!("Used {}", settings::days_ago(then, now)));
+    let detail = if device.always_allow {
+        "Always allowed".to_owned()
+    } else {
+        device.last_used.map_or("Saved".to_owned(), |then| format!("Used {}", settings::days_ago(then, now)))
+    };
     let name_rect = card_text(ui, rect, &device.name, &detail, theme::DIM);
     ui.interact(name_rect, id.with("name"), Sense::hover()).on_hover_text(format!(
         "{}\nUser-ID {}",
@@ -399,9 +401,20 @@ fn saved_card(
         *action = Some(Action::Connect(user_id));
     }
 
-    // Remove, in the corner while the pointer is over the card.
+    // Manage and Remove, in the corners while the pointer is over the card.
     let shown = ui.ctx().animate_bool_with_time(id.with("remove"), hovered, 0.15);
     if shown > 0.0 {
+        if VideoSource::SCREEN_SUPPORTED
+            && let Some(user_id) = device.user_id()
+        {
+            let corner = Rect::from_center_size(pos2(rect.left() + 19.0, rect.top() + 19.0), vec2(24.0, 24.0));
+            let mut corner = ui.new_child(UiBuilder::new().max_rect(corner));
+            corner.multiply_opacity(shown);
+            let manage = theme::icon_button(&mut corner, icons::GEAR_SIX, 24.0);
+            if manage.on_hover_text("What it may use on this PC").clicked() {
+                *action = Some(Action::ManageDevice(user_id));
+            }
+        }
         let corner = Rect::from_center_size(pos2(rect.right() - 19.0, rect.top() + 19.0), vec2(24.0, 24.0));
         let mut corner = ui.new_child(UiBuilder::new().max_rect(corner));
         corner.multiply_opacity(shown);
@@ -440,6 +453,7 @@ pub fn dialogs(app: &mut App, ctx: &egui::Context) {
     match app.dialog {
         Some(Dialog::AddComputer) => add_dialog(app, ctx),
         Some(Dialog::Hosting) => hosting_dialog(app, ctx),
+        Some(Dialog::Device(peer)) => device_dialog(app, ctx, peer),
         None => {}
     }
 }
@@ -530,7 +544,9 @@ fn hosting_dialog(app: &mut App, ctx: &egui::Context) {
         app.dialog = None;
         return;
     };
-    let (host, driver) = (&app.host, &mut app.gamepad_driver);
+    let peer = hosting.peer;
+    let mut permissions = hosting.permissions;
+    let driver = &mut app.gamepad_driver;
     let ((disconnect, done), dismissed) = theme::dialog(ctx, "hosting", 440.0, |ui| {
         ui.label(RichText::new(format!("{} is connected", hosting.client_name)).font(theme::semibold(19.0)));
         ui.label(theme::caption(format!(
@@ -540,10 +556,8 @@ fn hosting_dialog(app: &mut App, ctx: &egui::Context) {
         )));
         ui.add_space(10.0);
         theme::section_title(ui, "They can use");
-        if permission_toggles(ui, &mut hosting.permissions) {
-            host.set_permissions(hosting.permissions);
-        }
-        if hosting.permissions.allows(DeviceClass::Gamepad) {
+        permission_toggles(ui, &mut permissions);
+        if permissions.allows(DeviceClass::Gamepad) {
             driver.setup_row(ui);
         }
         ui.add_space(12.0);
@@ -553,10 +567,47 @@ fn hosting_dialog(app: &mut App, ctx: &egui::Context) {
             (disconnect, done)
         })
     });
+    if app.hosting.as_ref().is_some_and(|h| h.permissions != permissions) {
+        let always_allow = app.settings.device(peer).is_some_and(|d| d.always_allow);
+        app.set_device_access(peer, permissions, always_allow);
+    }
     if disconnect {
         app.host.disconnect();
     }
     if disconnect || done || dismissed {
+        app.dialog = None;
+    }
+}
+
+/// What a saved device may use on this PC, whether or not it's connected.
+fn device_dialog(app: &mut App, ctx: &egui::Context, peer: net::iroh::EndpointId) {
+    let Some(device) = app.settings.device(peer) else {
+        app.dialog = None;
+        return;
+    };
+    let name = device.name.clone();
+    let before = (app.settings.permissions_for(peer), device.always_allow);
+    let (mut permissions, mut always_allow) = before;
+    let driver = &mut app.gamepad_driver;
+    let (done, dismissed) = theme::dialog(ctx, "device", 440.0, |ui| {
+        ui.label(RichText::new(name.as_str()).font(theme::semibold(19.0)));
+        ui.label(theme::caption(format!("User-ID {}", short_id(&peer.to_string()))));
+        ui.add_space(10.0);
+        theme::section_title(ui, "Let them use");
+        permission_toggles(ui, &mut permissions);
+        if permissions.allows(DeviceClass::Gamepad) {
+            driver.setup_row(ui);
+        }
+        ui.add_space(6.0);
+        theme::switch_row(ui, "Always allow this device", &mut always_allow);
+        ui.label(theme::caption("When it's off, you're asked each time this device connects.").size(11.5));
+        ui.add_space(12.0);
+        theme::right_row(ui, |ui| ui.add(theme::primary("Done")).clicked())
+    });
+    if (permissions, always_allow) != before {
+        app.set_device_access(peer, permissions, always_allow);
+    }
+    if done || dismissed {
         app.dialog = None;
     }
 }
@@ -607,53 +658,21 @@ pub fn settings(app: &mut App, ui: &mut Ui) {
 
     theme::card(ui, |ui| {
         theme::section_title(ui, "Viewing");
-        let mut hardware = app.settings.hardware_decoding;
-        if theme::switch_row(ui, "Hardware video decoding", &mut hardware).changed() {
-            app.settings.hardware_decoding = hardware;
-            connect_client::set_hardware_decoding(hardware);
-        }
-        ui.label(theme::caption(
-            "Decodes the other PC's screen on your graphics card, which leaves the processor free and keeps up at \
-             high resolutions and frame rates. Connect uses the processor instead where the card can't. Turn this \
-             off if the picture shows glitches. Applies from the next connection.",
-        ));
-        ui.add_space(8.0);
-        ui.label(RichText::new("Video format").font(theme::medium(14.0)));
-        ui.label(theme::caption(
-            "Automatic uses H.265 when both PCs' graphics cards handle it: sharper at the same bandwidth. Choose \
-             H.264 only if the picture shows glitches. Applies from the next connection.",
-        ));
-        ui.add_space(4.0);
-        ui.horizontal_wrapped(|ui| {
-            for (allow, label) in [(true, "Automatic"), (false, "H.264 only")] {
-                if theme::chip(ui, None, label, app.settings.allow_h265 == allow).clicked() {
-                    app.settings.allow_h265 = allow;
-                    connect_client::set_allow_h265(allow);
-                }
-            }
-        });
-        ui.add_space(8.0);
+        ui.add_space(2.0);
         ui.label(RichText::new("Frame pacing").font(theme::medium(14.0)));
         ui.label(theme::caption(
             "Lowest latency shows each frame the moment it arrives. Smooth evens out motion when frames arrive \
              unevenly, by showing them a steady few milliseconds later. Takes effect at once.",
         ));
         ui.add_space(4.0);
-        ui.horizontal_wrapped(|ui| {
-            for (smooth, label) in [(false, "Lowest latency"), (true, "Smooth")] {
-                if theme::chip(ui, None, label, app.settings.smooth_pacing == smooth).clicked() {
-                    app.settings.smooth_pacing = smooth;
-                    connect_client::set_smooth_pacing(smooth);
-                }
-            }
-        });
+        let options = [(false, "Lowest latency".to_owned()), (true, "Smooth".to_owned())];
+        if theme::dropdown(ui, "frame-pacing", &mut app.settings.smooth_pacing, &options) {
+            connect_client::set_smooth_pacing(app.settings.smooth_pacing);
+        }
     });
     ui.add_space(gap);
 
     if VideoSource::SCREEN_SUPPORTED {
-        sharing_card(app, ui);
-        ui.add_space(gap);
-
         theme::card(ui, |ui| {
             theme::section_title(ui, "Stream quality");
             ui.label(theme::caption(
@@ -661,70 +680,15 @@ pub fn settings(app: &mut App, ui: &mut Ui) {
                  120+ fps, but needs a faster upload. Applies from the next connection.",
             ));
             ui.add_space(4.0);
-            ui.horizontal_wrapped(|ui| {
-                for mbps in BITRATE_CHOICES_MBPS {
-                    if theme::chip(ui, None, &format!("{mbps} Mb/s"), app.settings.bitrate_mbps == mbps).clicked() {
-                        app.settings.bitrate_mbps = mbps;
-                        app.host.set_bitrate_mbps(mbps);
-                    }
-                }
-            });
+            let options = BITRATE_CHOICES_MBPS.map(|mbps| (mbps, format!("{mbps} Mb/s")));
+            if theme::dropdown(ui, "stream-quality", &mut app.settings.bitrate_mbps, &options) {
+                app.host.set_bitrate_mbps(app.settings.bitrate_mbps);
+            }
         });
         ui.add_space(gap);
     }
 
     app.updater.settings_card(ui);
-}
-
-fn sharing_card(app: &mut App, ui: &mut Ui) {
-    theme::card(ui, |ui| {
-        theme::section_title(ui, "Sharing");
-        let mut accepting = app.settings.accepting;
-        if theme::switch_row(ui, "Let people ask to connect to this PC", &mut accepting).changed() {
-            app.settings.accepting = accepting;
-            app.host.set_accepting(accepting);
-        }
-        ui.add_space(8.0);
-        ui.label(RichText::new("Allowed by default").font(theme::medium(14.0)));
-        ui.label(theme::caption("Pre-selected when someone asks to connect, and what \"always allowed\" devices get."));
-        if permission_toggles(ui, &mut app.settings.permissions) {
-            app.host.set_default_permissions(app.settings.permissions);
-        }
-        if app.settings.permissions.allows(DeviceClass::Gamepad) {
-            app.gamepad_driver.setup_row(ui);
-        }
-        ui.label(
-            theme::caption(
-                "Windows keeps input away from programs running as administrator unless Connect runs as \
-                 administrator too.",
-            )
-            .size(11.5),
-        );
-
-        ui.add_space(8.0);
-        ui.label(RichText::new("Always allowed").font(theme::medium(14.0)));
-        if app.settings.trusted.is_empty() {
-            ui.label(theme::caption("Devices you tick \"Always allow\" for connect without asking. None yet."));
-        }
-        let mut remove = None;
-        for (i, device) in app.settings.trusted.iter().enumerate() {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(&device.name).font(theme::medium(13.5)));
-                ui.label(RichText::new(short_id(&device.id)).monospace().color(theme::DIM));
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.add(theme::secondary("Remove").small()).clicked() {
-                        remove = Some(i);
-                    }
-                });
-            });
-        }
-        if let Some(i) = remove {
-            let device = app.settings.trusted.remove(i);
-            if let Some(id) = device.user_id() {
-                app.host.set_trusted(id, false);
-            }
-        }
-    });
 }
 
 /// The first and last groups of a User-ID, enough to tell devices apart at a glance.

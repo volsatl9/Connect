@@ -3,6 +3,7 @@
 
 mod driver;
 mod gamepad;
+mod gamepad_page;
 mod icons;
 mod input;
 mod pages;
@@ -13,6 +14,7 @@ mod theme;
 mod updates;
 mod video;
 mod welcome;
+mod window;
 
 use std::{
     collections::VecDeque,
@@ -59,16 +61,15 @@ pub fn run(runtime: Runtime, config_dir: PathBuf) -> Result<()> {
     // renders with the decoder's own device, so decoded pictures go straight to the screen.
     // Otherwise wgpu picks a device itself: Vulkan, or Direct3D 12 (Windows) or OpenGL where
     // Vulkan is missing.
-    let shared_gpu = (Settings::saved().hardware_decoding
-        && std::env::var("CONNECT_RENDERER").as_deref() != Ok("separate"))
-    .then(|| match connect_client::SharedGpu::open() {
-        Ok(gpu) => Some(gpu),
-        Err(e) => {
-            tracing::info!("the window draws on its own device: {e:#}");
-            None
-        }
-    })
-    .flatten();
+    let shared_gpu = (hardware_decoding() && std::env::var("CONNECT_RENDERER").as_deref() != Ok("separate"))
+        .then(|| match connect_client::SharedGpu::open() {
+            Ok(gpu) => Some(gpu),
+            Err(e) => {
+                tracing::info!("the window draws on its own device: {e:#}");
+                None
+            }
+        })
+        .flatten();
     let mut wgpu_options =
         eframe::WgpuConfiguration::default().with_surface_config(eframe::egui_wgpu::SurfaceConfig::LOW_LATENCY);
     if let Some(gpu) = &shared_gpu {
@@ -84,6 +85,9 @@ pub fn run(runtime: Runtime, config_dir: PathBuf) -> Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Connect")
+            .with_app_id("connect")
+            .with_icon(Arc::new(app_image()))
+            .with_decorations(false)
             .with_inner_size([980.0, 640.0])
             .with_min_inner_size([760.0, 520.0]),
         // One frame queued for the screen, not two: a refresh less of delay.
@@ -119,6 +123,17 @@ pub fn run(runtime: Runtime, config_dir: PathBuf) -> Result<()> {
     result
 }
 
+/// The app image, as the window's icon and in the sidebar.
+fn app_image() -> egui::IconData {
+    eframe::icon_data::from_png_bytes(include_bytes!("../../assets/icon/connect-256.png")).expect("a valid PNG")
+}
+
+/// Video decodes on the graphics card wherever it can, falling back to the processor by itself.
+/// `CONNECT_HARDWARE_DECODING=0` is there for telling a driver's glitches from Connect's.
+fn hardware_decoding() -> bool {
+    std::env::var("CONNECT_HARDWARE_DECODING").map_or(true, |v| v.trim() != "0")
+}
+
 /// The welcome screen until an account exists, then the app proper.
 struct Root {
     runtime: Handle,
@@ -141,7 +156,8 @@ impl Root {
     ) -> Self {
         theme::apply(&cc.egui_ctx);
         video::init(cc);
-        let settings: Settings = cc.storage.and_then(|s| eframe::get_value(s, eframe::APP_KEY)).unwrap_or_default();
+        let mut settings: Settings = cc.storage.and_then(|s| eframe::get_value(s, eframe::APP_KEY)).unwrap_or_default();
+        settings.adopt_trusted();
         let screen = match endpoint {
             Some(endpoint) => Screen::Main(Box::new(App::new(&cc.egui_ctx, endpoint, settings, restart.clone()))),
             None => Screen::Welcome(Welcome::new(runtime.clone(), config_dir, settings)),
@@ -160,7 +176,11 @@ impl eframe::App for Root {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         match &mut self.screen {
             Screen::Welcome(welcome) => {
-                if let Some((endpoint, settings, setup_gamepads)) = welcome.show(ui) {
+                let area = ui.max_rect();
+                window::drag_area(ui, "welcome", area.with_max_y(area.top() + window::BAR_HEIGHT));
+                let shown = welcome.show(ui);
+                window::controls(ui, area);
+                if let Some((endpoint, settings, setup_gamepads)) = shown {
                     let mut app = App::new(ui.ctx(), endpoint, settings, self.restart.clone());
                     if setup_gamepads {
                         app.gamepad_driver.install(ui.ctx());
@@ -192,6 +212,7 @@ impl eframe::App for Root {
 enum Page {
     /// This PC and the computers it can connect to.
     Connect,
+    Gamepad,
     Settings,
 }
 
@@ -202,6 +223,8 @@ enum Dialog {
     AddComputer,
     /// Who is using this PC, and what they may use.
     Hosting,
+    /// What a saved device may use on this PC, and whether it's always allowed.
+    Device(EndpointId),
 }
 
 pub struct App {
@@ -210,6 +233,8 @@ pub struct App {
     settings: Settings,
     host: HostHandle,
     host_events: mpsc::UnboundedReceiver<HostEvent>,
+    /// The app image, for the sidebar.
+    logo: egui::TextureHandle,
     /// Whether this PC can give a remote user a gamepad, and setting that up.
     gamepad_driver: driver::GamepadDriver,
     /// Connection requests waiting for Allow/Deny, oldest first.
@@ -228,6 +253,10 @@ pub struct App {
     confirm_remove: Option<String>,
     /// Whether Settings shows this PC's User-ID rather than dots.
     show_user_id: bool,
+    /// The button being changed on the Gamepad page.
+    selected_button: gamepad::XboxButton,
+    /// Watches the controllers while the Gamepad page is open.
+    tester: Option<gamepad::Tester>,
     client: Option<ClientSession>,
     /// The latest thing worth telling the user, such as why a session ended.
     notice: Option<Notice>,
@@ -296,9 +325,9 @@ enum ClientState {
 
 impl App {
     fn new(ctx: &egui::Context, endpoint: Endpoint, settings: Settings, restart: Restart) -> Self {
-        connect_client::set_hardware_decoding(settings.hardware_decoding);
+        connect_client::set_hardware_decoding(hardware_decoding());
         connect_client::set_smooth_pacing(settings.smooth_pacing);
-        connect_client::set_allow_h265(settings.allow_h265);
+        connect_client::set_allow_h265(std::env::var("CONNECT_ALLOW_H265").map_or(true, |v| v.trim() != "0"));
         let online = Arc::new(AtomicBool::new(false));
         tokio::spawn({
             let (endpoint, online, ctx) = (endpoint.clone(), online.clone(), ctx.clone());
@@ -313,8 +342,7 @@ impl App {
             endpoint.clone(),
             HostConfig {
                 accepting: settings.accepting,
-                default_permissions: settings.permissions,
-                trusted: settings.trusted_ids(),
+                trusted: settings.always_allowed(),
                 bitrate_mbps: settings.bitrate_mbps,
                 ..HostConfig::new(settings.device_name.clone())
             },
@@ -326,6 +354,7 @@ impl App {
             settings,
             host,
             host_events: forward_host_events(events, ctx.clone()),
+            logo: logo_texture(ctx),
             gamepad_driver: driver::GamepadDriver::new(),
             requests: VecDeque::new(),
             hosting: None,
@@ -336,6 +365,8 @@ impl App {
             focus_input: false,
             confirm_remove: None,
             show_user_id: false,
+            selected_button: gamepad::XboxButton::A,
+            tester: None,
             client: None,
             notice: None,
             updater: updates::Updater::new(ctx),
@@ -362,12 +393,15 @@ impl App {
 
     fn on_host_event(&mut self, event: HostEvent) {
         match event {
-            HostEvent::Request(inner) => self.requests.push_back(Request {
-                inner,
-                arrived: Instant::now(),
-                always_allow: false,
-                permissions: self.settings.permissions,
-            }),
+            HostEvent::Request(inner) => {
+                let peer = inner.peer;
+                self.requests.push_back(Request {
+                    inner,
+                    arrived: Instant::now(),
+                    always_allow: false,
+                    permissions: self.settings.permissions_for(peer),
+                });
+            }
             HostEvent::SessionStarted { peer, client_name, permissions } => {
                 self.hosting = Some(Hosting { peer, client_name, since: Instant::now(), permissions });
             }
@@ -375,6 +409,19 @@ impl App {
                 self.hosting = None;
                 self.notify(reason, false);
             }
+        }
+    }
+
+    /// Changes what a device may use here, for now if it's connected and from then on.
+    fn set_device_access(&mut self, peer: EndpointId, permissions: Permissions, always_allow: bool) {
+        if let Some(device) = self.settings.device_mut(peer) {
+            device.permissions = Some(permissions);
+            device.always_allow = always_allow;
+        }
+        self.host.set_trusted(peer, always_allow.then_some(permissions));
+        if let Some(hosting) = self.hosting.as_mut().filter(|h| h.peer == peer) {
+            hosting.permissions = permissions;
+            self.host.set_permissions(permissions);
         }
     }
 
@@ -422,7 +469,8 @@ impl App {
                     self.connect_input.clear();
                     client.note(format!("Connected. You can use: {}.", describe(permissions)), 5);
                     client.state = ClientState::Connected { host_name, permissions };
-                    client.gamepads = Some(gamepad::Forwarder::start(client.handle.clone()));
+                    let map = self.settings.button_map.clone();
+                    client.gamepads = Some(gamepad::Forwarder::start(client.handle.clone(), map));
                 }
                 ClientEvent::PermissionsChanged(now) => {
                     if let ClientState::Connected { permissions, .. } = &mut client.state {
@@ -472,6 +520,10 @@ impl App {
         }
         self.poll_client(ctx);
         self.gamepad_driver.poll();
+        // Only one thing at a time watches the controllers: in a session, that's the forwarder.
+        if self.page != Page::Gamepad || self.client.is_some() {
+            self.tester = None;
+        }
         if let Some(exe) = self.updater.poll() {
             *self.restart.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(exe);
             ctx.send_viewport_cmd(ViewportCommand::Close);
@@ -490,11 +542,23 @@ impl App {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui) {
-        if self.client.as_ref().is_some_and(|c| matches!(c.state, ClientState::Connected { .. })) {
-            session::show(self, ui);
+        let area = ui.max_rect();
+        let session = self.client.as_ref().and_then(|c| match &c.state {
+            ClientState::Connected { host_name, .. } => Some(host_name.clone()),
+            _ => None,
+        });
+        if let Some(host_name) = session {
+            if ui.input(|i| i.viewport().fullscreen.unwrap_or(false)) {
+                session::show(self, ui);
+            } else {
+                let bar = area.with_max_y(area.top() + window::BAR_HEIGHT);
+                let video = area.with_min_y(bar.bottom());
+                session::show(self, &mut ui.new_child(egui::UiBuilder::new().max_rect(video)));
+                window::session_bar(ui, area, &host_name);
+            }
         } else {
-            let area = ui.max_rect();
             theme::backdrop(ui.painter(), area);
+            window::drag_area(ui, "page", area.with_max_y(area.top() + window::BAR_HEIGHT));
             let content = pages::sidebar(self, ui, area);
             let mut ui = ui.new_child(egui::UiBuilder::new().max_rect(content));
             let in_session = self.hosting.is_some() || self.client.is_some();
@@ -507,15 +571,24 @@ impl App {
                         theme::fade_in(ui, self.page_since);
                         match self.page {
                             Page::Connect => pages::computers(self, ui),
+                            Page::Gamepad => gamepad_page::show(self, ui),
                             Page::Settings => pages::settings(self, ui),
                         }
                     },
                 );
             });
+            window::controls(&mut ui, area);
             pages::dialogs(self, ui.ctx());
         }
         prompt::show(self, ui.ctx());
     }
+}
+
+fn logo_texture(ctx: &egui::Context) -> egui::TextureHandle {
+    let image = app_image();
+    let size = [image.width as usize, image.height as usize];
+    let image = egui::ColorImage::from_rgba_unmultiplied(size, &image.rgba);
+    ctx.load_texture("app-image", image, egui::TextureOptions::LINEAR)
 }
 
 /// Why a connection ended, in words for people: for a failure, its outermost reason up front and

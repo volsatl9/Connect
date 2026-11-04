@@ -131,12 +131,28 @@ async fn allow_streams_video() {
 async fn trusted_peer_needs_no_prompt() {
     let (host_ep, host, mut host_events) = start_host(config()).await;
     let client_ep = endpoint().await;
-    host.set_trusted(client_ep.id(), true);
+    let gamepad_only = Permissions::VIEW_ONLY.with(DeviceClass::Gamepad, true);
+    host.set_trusted(client_ep.id(), Some(gamepad_only));
     let (_client, mut client_events) =
         connect_client::connect(client_ep.clone(), net::local_addr(&host_ep), "Trusted", || {});
 
     accepted(&mut client_events).await;
-    assert!(matches!(next(&mut host_events).await, HostEvent::SessionStarted { .. }));
+    match next(&mut host_events).await {
+        HostEvent::SessionStarted { permissions, .. } => assert_eq!(permissions, gamepad_only, "its own"),
+        other => panic!("expected the session to start, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_no_longer_trusted_is_asked_about_again() {
+    let (host_ep, host, mut host_events) = start_host(config()).await;
+    let client_ep = endpoint().await;
+    host.set_trusted(client_ep.id(), Some(Permissions::ALL));
+    host.set_trusted(client_ep.id(), None);
+    let (_client, _client_events) =
+        connect_client::connect(client_ep.clone(), net::local_addr(&host_ep), "Was trusted", || {});
+
+    request(&mut host_events).await.respond(Decision::Deny);
 }
 
 #[tokio::test(flavor = "multi_thread")]

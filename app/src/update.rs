@@ -59,6 +59,15 @@ pub fn current_version() -> String {
     std::env::var(VERSION_OVERRIDE).unwrap_or_else(|_| env!("CARGO_PKG_VERSION").to_owned())
 }
 
+/// Whether a Linux package put this copy where only the package manager can change it.
+pub fn installed_by_package() -> bool {
+    std::env::current_exe().is_ok_and(|exe| in_system_folder(&exe))
+}
+
+fn in_system_folder(exe: &Path) -> bool {
+    cfg!(unix) && exe.starts_with("/usr")
+}
+
 /// The newest release above the running version that has a build for this platform.
 pub async fn check() -> Result<Option<Update>> {
     let current = parse_version(&current_version()).context("unreadable app version")?;
@@ -238,6 +247,12 @@ mod tests {
         assert_eq!(parse_version("0.2"), None);
         assert_eq!(parse_version("v0.2.1.4"), None);
         assert!(parse_version("0.10.0") > parse_version("0.9.9"));
+    }
+
+    #[test]
+    fn a_packaged_copy_is_left_to_the_package_manager() {
+        assert_eq!(in_system_folder(Path::new("/usr/bin/connect")), cfg!(unix));
+        assert!(!in_system_folder(Path::new("/home/me/Downloads/connect-linux-x86_64")));
     }
 
     #[test]

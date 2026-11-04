@@ -319,11 +319,58 @@ That is a model. It hasn't been seen on a real path yet.
   something on the host stalling everything, not at the encoder alone, but it isn't established.
   The bitrate was near its floor at the time, which 0.9.2 should stop, so the link can't be ruled
   out. 0.9.2 traces tell a stalled capture from a game with nothing new to show (METRICS.md).
-- **Repeating network queue events.** Every 10–30 s under load, some 30 frames go 50–100 ms over
-  the usual latency: 1.5% of frames, and what the p99 latency is made of. Not yet explained.
+- **Repeating network queue events.** Explained, and fixed in 0.9.3: see below.
 - **Host priority.** That session dropped 829 remote events to host priority, in runs around 180 s
   and 280–300 s, with no explanation of what set it off. It's not established that anyone was
   using the host's mouse. 0.9.2 records what the hooks saw (METRICS.md).
+
+## Version 0.9.3: BBR's round-trip probe
+
+Every 5–13 s under load, latency jumped about 80 ms for a moment, with no loss and a flat round
+trip. BBR was measuring the path's round trip: for 200 ms it holds half the bandwidth-delay product
+in flight. Video at 80 Mb/s needs about 440 KB in flight on a 45 ms path, and got about 240 KB, so
+sending halved and 200–345 KB queued on the host. Every spike in a 20-minute session fits, and it
+was what the p99 input delay of 121 ms was made of (71 ms without them).
+
+BBR now keeps 90% of the bandwidth-delay product during the probe. That stays under the path's
+capacity, so nothing stands in a queue and the measurement still holds. The gain has no setter in
+noq-proto, so `vendor/noq-proto` adds one; nothing else in that copy is changed.
+`CONNECT_PROBE_RTT_GAIN=0.5` goes back to BBR's own.
+
+Replaying 85 s of that session's frames (80 Mb/s video) over a 100 Mb/s path, 40 ms round trip:
+
+| To the last datagram | Gain 0.5 | 0.75 | 0.9 |
+|---|---|---|---|
+| p99 | 100.5 ms | 33.4 ms | 25.7 ms |
+| Worst | 121.6 ms | 42.2 ms | 29.0 ms |
+| Frames over 60 ms | 782 | 0 | 0 |
+
+On a 90 Mb/s path, with video almost filling it, p99 goes from 111.8 to 26.7 ms and frames over
+60 ms from 862 to 0. Scaled down to 35 or 50 Mb/s, the video fits inside the probe's window and has
+no spikes at either gain, which confirms the cause. Drop and recovery is unchanged or better: the
+full cap came back in 3 of 3 runs. Not tested: real hardware, and sharing a path with other traffic,
+where a shallower probe drains a queue others built more slowly.
+
+### The median
+
+What's left of about 60 ms from input to drawn, on a 42 ms round trip, doesn't move much:
+
+- The encoder already runs in low-latency mode with no B-frames, at 2.5 ms.
+- Reassembly (3.2 ms) is a 41 KB frame crossing a path of about 100 Mb/s. Pacing can't beat the
+  bottleneck; only smaller frames can.
+- Held pictures take 0.06 ms at the median, and waiting for the next capture about 2.5 ms, which
+  follows the game's frame rate.
+- Drawing waits for the display (0–2.75 ms) on a surface already set to one queued frame.
+
+### Encoder locked to 60 Hz
+
+For 7 minutes of a 20-minute session (from 510 s to 943 s), every other encode took about 11.6 ms
+instead of 2.5, with frames in step at exactly 16.67 ms. Encoding runs on the capture thread, so
+capture kept up with only about 130 of the game's 230 images a second, and DXGI counted the rest as
+missed. It began and ended within seconds, with no local input at either edge, no change in the
+game's GPU load, and Connect's CPU use going down. Neither PC has a 60 Hz monitor, so it isn't a
+display's refresh. Something else keeping 60 Hz time on the host looks responsible; what isn't
+known. It adds 3–5 ms to the median, and halves the frame rate. 0.9.3 doesn't change this.
 
 ## Build requirement
 

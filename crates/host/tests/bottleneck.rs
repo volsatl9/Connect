@@ -13,7 +13,7 @@
 //!
 //! `replaying_a_session` sends a real session's frames, sizes and timing from a host trace
 //! (`REPLAY_FRAMES=host-…-frames.csv`, `REPLAY_FROM` and `REPLAY_TO` in seconds), over the same
-//! kind of path with room to spare. Synthetic traffic doesn't make BBR forget the path; a game
+//! kind of path with room to spare (`REPLAY_MBPS`), optionally scaled (`REPLAY_SCALE`). Synthetic traffic doesn't make BBR forget the path; a game
 //! does. `CONNECT_PATH_MEMORY=0` shows plain BBR.
 
 use std::{
@@ -244,10 +244,18 @@ async fn replaying_a_session() {
     let session_start = trace[0].0;
     let seconds = |name: &str, default: u64| session_start + env(name, default) * 1_000_000;
     let (from, to) = (seconds("REPLAY_FROM", 0), seconds("REPLAY_TO", 60));
-    let frames: Vec<_> = trace.into_iter().filter(|frame| (from..to).contains(&frame.0)).collect();
+    let scale = env("REPLAY_SCALE", 1.0f64);
+    let frames: Vec<_> = trace
+        .into_iter()
+        .filter(|frame| (from..to).contains(&frame.0))
+        .map(|(at, bytes, datagrams)| {
+            let scaled = |n: usize| ((n as f64 * scale) as usize).max(1);
+            (at, scaled(bytes), scaled(datagrams))
+        })
+        .collect();
 
     let path = Path {
-        bits_per_second: 80e6,
+        bits_per_second: env("REPLAY_MBPS", 80.0) * 1e6,
         queue_bytes: 1024 * 1024,
         delay: Duration::from_millis(20),
         slows_at: None,

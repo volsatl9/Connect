@@ -1,5 +1,9 @@
 # Connect
 
+Version 0.9.3 removes the latency spikes of up to 80 ms that came every few seconds under load.
+BBR halved the send rate to measure the round trip; it now keeps 90% of its window while it does.
+The median latency on a given path doesn't change. See PERFORMANCE.md.
+
 Version 0.9.2 keeps the bitrate through quiet scenes. Connect remembers what the path has carried
 when the congestion controller loses sight of it, cuts the bitrate only for a backlog that lasts,
 and recovers when the path does. Traces now stream to disk, so long sessions keep every frame, and

@@ -28,7 +28,7 @@ const RTT_INFLATED: f64 = 1.5;
 
 /// Builds [`Remembering`] controllers, one per path.
 #[derive(Debug, Default)]
-pub(crate) struct PathMemory(Arc<Bbr3Config>);
+pub(crate) struct PathMemory(pub Arc<Bbr3Config>);
 
 impl ControllerFactory for PathMemory {
     fn build(self: Arc<Self>, now: Instant, current_mtu: u16) -> Box<dyn Controller> {

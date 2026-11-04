@@ -144,12 +144,22 @@ fn configure(builder: Builder, secret_key: SecretKey) -> Builder {
     builder.secret_key(secret_key).alpns(vec![ALPN.to_vec()]).transport_config(transport)
 }
 
-/// BBR that remembers the path through quiet scenes; `CONNECT_PATH_MEMORY=0` runs plain BBR.
+/// How much of the bandwidth-delay product stays in flight while BBR measures the round trip.
+/// BBR's own 0.5 is for flows that can wait. Video at 80% of the path can't: it halved the send
+/// rate every few seconds and queued 300 KB on the host, 80 ms of latency each time. 0.9 is still
+/// under the path's capacity, so no queue stands on it and the measurement stays true.
+const PROBE_RTT_GAIN: f64 = 0.9;
+
+/// BBR that remembers the path through quiet scenes; `CONNECT_PATH_MEMORY=0` runs plain BBR, and
+/// `CONNECT_PROBE_RTT_GAIN` sets the gain above (0.5 is BBR's own).
 fn congestion_controller() -> Arc<dyn noq_proto::congestion::ControllerFactory + Send + Sync> {
+    let gain = std::env::var("CONNECT_PROBE_RTT_GAIN").ok().and_then(|v| v.trim().parse().ok());
+    let mut bbr = noq_proto::congestion::Bbr3Config::default();
+    bbr.probe_rtt_cwnd_gain(gain.unwrap_or(PROBE_RTT_GAIN));
     if std::env::var("CONNECT_PATH_MEMORY").is_ok_and(|v| v.trim() == "0") {
-        Arc::new(noq_proto::congestion::Bbr3Config::default())
+        Arc::new(bbr)
     } else {
-        Arc::new(congestion::PathMemory::default())
+        Arc::new(congestion::PathMemory(Arc::new(bbr)))
     }
 }
 

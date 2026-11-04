@@ -37,6 +37,11 @@ const MAX_PARTIAL_FRAMES: usize = 16;
 const REORDER_WAIT: Duration = Duration::from_millis(12);
 /// Complete frames held back behind a missing one before it counts as lost regardless.
 const REORDER_FRAMES: usize = 4;
+/// Frames given up on stay this long before [`FrameAssembler::take_fates`] hands them out, so
+/// datagrams of theirs that still turn up are counted: late, rather than lost.
+const LATE_WINDOW: Duration = Duration::from_secs(1);
+/// Records of frames gone, and frames skipped while waiting for a keyframe, kept at most.
+const MAX_FATES: usize = 1024;
 /// Recovery chunks a frame gets on a path losing nothing, as a share of its data chunks.
 const BASE_RECOVERY: f32 = 0.08;
 /// Recovery never exceeds this share of the data, however lossy the path.
@@ -223,6 +228,7 @@ fn parse(datagram: Bytes) -> Result<Chunk> {
 struct Partial {
     meta: FrameMeta,
     first_seen: Instant,
+    last_seen: Instant,
     frame_len: usize,
     data_count: usize,
     chunks: Vec<Option<Bytes>>,
@@ -234,6 +240,7 @@ impl Partial {
         Self {
             meta: chunk.meta,
             first_seen: Instant::now(),
+            last_seen: Instant::now(),
             frame_len: chunk.frame_len,
             data_count: chunk.data_count,
             chunks: vec![None; chunk.data_count + chunk.recovery_count],
@@ -301,6 +308,56 @@ impl Partial {
     }
 }
 
+/// Why a frame never reached the decoder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gone {
+    /// Lost: some of its chunks came, too few to rebuild it, and later frames couldn't wait.
+    Incomplete,
+    /// Lost: none of its datagrams came.
+    NeverSeen,
+    /// Lost: too many frames were arriving at once, and it was the oldest unfinished one.
+    Evicted,
+    /// Skipped: complete (or arriving), but it built on a lost frame, so video waited for the
+    /// next keyframe instead.
+    AfterLoss,
+    /// Skipped: the decoder was too far behind, or failed, and video started over from a keyframe.
+    DecoderBehind,
+}
+
+impl Gone {
+    pub fn name(self) -> &'static str {
+        match self {
+            Gone::Incomplete => "incomplete",
+            Gone::NeverSeen => "never_seen",
+            Gone::Evicted => "evicted",
+            Gone::AfterLoss => "skipped_after_loss",
+            Gone::DecoderBehind => "skipped_decoder_behind",
+        }
+    }
+
+    /// Lost on the way, rather than skipped here.
+    pub fn lost(self) -> bool {
+        matches!(self, Gone::Incomplete | Gone::NeverSeen | Gone::Evicted)
+    }
+}
+
+/// What became of a frame that never reached the decoder, for the trace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fate {
+    pub seq: u32,
+    pub gone: Gone,
+    pub keyframe: bool,
+    /// Chunks that had come, and how many it needed (0: not known).
+    pub chunks: u16,
+    pub needed: u16,
+    pub first_seen: Option<Instant>,
+    pub last_seen: Option<Instant>,
+    pub given_up: Instant,
+    /// Its datagrams that came after it was given up on: a frame with some was late, not lost.
+    pub late: u16,
+    pub last_late: Option<Instant>,
+}
+
 /// Counters for the stats overlay.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct AssemblerStats {
@@ -323,8 +380,13 @@ pub struct FrameAssembler {
     ready: VecDeque<EncodedFrame>,
     /// The last frame handed out or given up on; anything at or below it is stale.
     last_seq: Option<u32>,
-    /// The newest frame passed over while waiting for a keyframe.
-    last_skipped: Option<u32>,
+    /// Frames already counted as skipped while waiting for a keyframe, so the keyframe doesn't
+    /// count them again as lost.
+    skipped_waiting: std::collections::BTreeSet<u32>,
+    /// What partial frames looked like when too many arrived at once and they were dropped.
+    evicted: BTreeMap<u32, (u16, u16, Instant, Instant, bool)>,
+    /// Frames gone, by sequence number, waiting out [`LATE_WINDOW`].
+    fates: BTreeMap<u32, Fate>,
     awaiting_keyframe: bool,
     /// Set when a frame is lost, until [`Self::take_keyframe_request`] collects it.
     keyframe_wanted: bool,
@@ -345,7 +407,9 @@ impl FrameAssembler {
             held_since: None,
             ready: VecDeque::new(),
             last_seq: None,
-            last_skipped: None,
+            skipped_waiting: Default::default(),
+            evicted: BTreeMap::new(),
+            fates: BTreeMap::new(),
             // The decoder needs SPS/PPS + IDR before anything else.
             awaiting_keyframe: true,
             keyframe_wanted: false,
@@ -363,9 +427,94 @@ impl FrameAssembler {
         self.awaiting_keyframe = true;
         self.keyframe_wanted = true;
         self.stats.frames_skipped += (self.held.len() + self.ready.len()) as u64;
+        let now = Instant::now();
+        let dropped: Vec<(u32, bool)> =
+            self.held.values().chain(&self.ready).map(|f| (f.meta.seq, f.meta.keyframe)).collect();
+        for (seq, keyframe) in dropped {
+            self.record(Fate { keyframe, ..self.fate(seq, Gone::DecoderBehind, now) });
+        }
         self.held.clear();
         self.ready.clear();
         self.held_since = None;
+    }
+
+    /// Counts and records `frame`, handed out but thrown away by the caller (its decoder too far
+    /// behind), as skipped.
+    pub fn skipped(&mut self, frame: &EncodedFrame) {
+        self.stats.frames_skipped += 1;
+        let fate =
+            Fate { keyframe: frame.meta.keyframe, ..self.fate(frame.meta.seq, Gone::DecoderBehind, Instant::now()) };
+        self.record(fate);
+    }
+
+    /// Frames gone that are done waiting for late datagrams; all of them with `all`, e.g. when
+    /// the session ends.
+    pub fn take_fates(&mut self, now: Instant, all: bool) -> Vec<Fate> {
+        if self.fates.is_empty() {
+            return Vec::new();
+        }
+        let due: Vec<u32> = self
+            .fates
+            .values()
+            .filter(|f| all || now.saturating_duration_since(f.given_up) >= LATE_WINDOW)
+            .map(|f| f.seq)
+            .collect();
+        due.into_iter().filter_map(|seq| self.fates.remove(&seq)).collect()
+    }
+
+    /// A record of `seq` gone for `gone` now, from what came of it.
+    fn fate(&self, seq: u32, gone: Gone, now: Instant) -> Fate {
+        let mut fate = Fate {
+            seq,
+            gone,
+            keyframe: false,
+            chunks: 0,
+            needed: 0,
+            first_seen: None,
+            last_seen: None,
+            given_up: now,
+            late: 0,
+            last_late: None,
+        };
+        if let Some(partial) = self.partial.get(&seq) {
+            fate.keyframe = partial.meta.keyframe;
+            fate.chunks = partial.received.min(u16::MAX as usize) as u16;
+            fate.needed = partial.data_count.min(u16::MAX as usize) as u16;
+            (fate.first_seen, fate.last_seen) = (Some(partial.first_seen), Some(partial.last_seen));
+        } else if let Some(&(chunks, needed, first, last, keyframe)) = self.evicted.get(&seq) {
+            (fate.chunks, fate.needed, fate.first_seen, fate.last_seen, fate.keyframe) =
+                (chunks, needed, Some(first), Some(last), keyframe);
+        }
+        fate
+    }
+
+    fn record(&mut self, fate: Fate) {
+        if self.fates.len() >= MAX_FATES {
+            self.fates.pop_first();
+        }
+        self.fates.insert(fate.seq, fate);
+    }
+
+    /// Counts and records the frames from `from` up to `to` (exclusive) that never came
+    /// together: lost, unless already counted as skipped while waiting for a keyframe.
+    fn missing(&mut self, from: u32, to: u32, now: Instant) {
+        for seq in from..to {
+            if self.skipped_waiting.remove(&seq) || self.held.contains_key(&seq) {
+                continue;
+            }
+            self.stats.frames_lost += 1;
+            let gone = if self.partial.contains_key(&seq) {
+                Gone::Incomplete
+            } else if self.evicted.contains_key(&seq) {
+                Gone::Evicted
+            } else {
+                Gone::NeverSeen
+            };
+            let fate = self.fate(seq, gone, now);
+            self.record(fate);
+        }
+        self.skipped_waiting = self.skipped_waiting.split_off(&to);
+        self.evicted = self.evicted.split_off(&to);
     }
 
     /// True once after video was lost: the host should be asked for a keyframe.
@@ -389,15 +538,28 @@ impl FrameAssembler {
         let chunk = parse(datagram)?;
         let seq = chunk.meta.seq;
         if self.last_seq.is_some_and(|last| seq <= last) || self.held.contains_key(&seq) {
-            return Ok(()); // a frame already handed out, given up on, or complete
+            // A frame already handed out, given up on, or complete. If it was given up on as
+            // lost, this shows it was late instead.
+            if let Some(fate) = self.fates.get_mut(&seq).filter(|f| f.gone.lost()) {
+                fate.late = fate.late.saturating_add(1);
+                fate.last_late = Some(Instant::now());
+            }
+            return Ok(());
         }
         if self.awaiting_keyframe && !chunk.meta.keyframe {
             // Undecodable until the next keyframe anyway. Frames still coming without one
             // mean the keyframe went missing too: ask (again; the caller paces requests).
-            if self.last_skipped.is_none_or(|last| seq > last) {
-                self.last_skipped = Some(seq);
+            if self.skipped_waiting.len() < MAX_FATES && self.skipped_waiting.insert(seq) {
                 self.stats.frames_skipped += 1;
                 self.keyframe_wanted = true;
+                let now = Instant::now();
+                self.record(Fate {
+                    keyframe: false,
+                    first_seen: Some(now),
+                    last_seen: Some(now),
+                    needed: chunk.data_count.min(u16::MAX as usize) as u16,
+                    ..self.fate(seq, Gone::AfterLoss, now)
+                });
             }
             return Ok(());
         }
@@ -409,9 +571,22 @@ impl FrameAssembler {
             *slot = Some(chunk.body);
             partial.received += 1;
         }
+        partial.last_seen = Instant::now();
         if partial.received < partial.data_count {
-            if self.partial.len() > MAX_PARTIAL_FRAMES {
-                self.partial.pop_first();
+            if self.partial.len() > MAX_PARTIAL_FRAMES
+                && let Some((seq, oldest)) = self.partial.pop_first()
+            {
+                let clip = |n: usize| n.min(u16::MAX as usize) as u16;
+                let info = (
+                    clip(oldest.received),
+                    clip(oldest.data_count),
+                    oldest.first_seen,
+                    oldest.last_seen,
+                    oldest.meta.keyframe,
+                );
+                if self.evicted.len() < MAX_PARTIAL_FRAMES * 4 {
+                    self.evicted.insert(seq, info);
+                }
             }
             return Ok(());
         }
@@ -426,18 +601,26 @@ impl FrameAssembler {
         let seq = frame.meta.seq;
         let next = self.last_seq.map_or(seq, |last| last + 1);
         if frame.meta.keyframe {
-            // A keyframe needs nothing before it: anything still missing is lost, and complete
+            // A keyframe needs nothing before it: anything still missing is lost (unless it
+            // was already counted as skipped while waiting for this keyframe), and complete
             // frames held for it are now useless.
             if seq > next {
-                let held = self.held.range(..seq).count() as u64;
-                self.stats.frames_lost += (seq - next) as u64 - held;
-                self.stats.frames_skipped += held;
+                let now = Instant::now();
+                let held: Vec<(u32, bool)> = self.held.range(..seq).map(|(&s, f)| (s, f.meta.keyframe)).collect();
+                self.stats.frames_skipped += held.len() as u64;
+                for (held, keyframe) in held {
+                    self.record(Fate { keyframe, ..self.fate(held, Gone::AfterLoss, now) });
+                }
+                self.missing(next, seq, now);
                 self.held = self.held.split_off(&seq);
             }
+            self.skipped_waiting = self.skipped_waiting.split_off(&seq);
             self.awaiting_keyframe = false;
             self.hand_out(frame);
         } else if self.awaiting_keyframe {
             self.stats.frames_skipped += 1;
+            let fate = self.fate(seq, Gone::AfterLoss, Instant::now());
+            self.record(fate);
             self.last_seq = Some(seq);
         } else if seq == next {
             self.hand_out(frame);
@@ -480,10 +663,16 @@ impl FrameAssembler {
             return;
         }
         let first = *self.held.keys().next().expect("held frames exist while waiting");
-        let next = self.last_seq.map_or(first, |last| last + 1);
-        self.stats.frames_lost += (first - next) as u64;
         let newest = *self.held.keys().next_back().expect("non-empty");
-        self.stats.frames_skipped += self.held.len() as u64;
+        let next = self.last_seq.map_or(first, |last| last + 1);
+        // Every frame up to the newest complete one that isn't among them is lost (gaps between
+        // held frames too); the held ones are skipped, as they build on what's missing.
+        self.missing(next, newest + 1, now);
+        let held: Vec<(u32, bool)> = self.held.iter().map(|(&s, f)| (s, f.meta.keyframe)).collect();
+        self.stats.frames_skipped += held.len() as u64;
+        for (seq, keyframe) in held {
+            self.record(Fate { keyframe, ..self.fate(seq, Gone::AfterLoss, now) });
+        }
         self.held.clear();
         self.held_since = None;
         self.last_seq = Some(newest);
@@ -571,6 +760,73 @@ mod tests {
         let held = out[1].arrival.unwrap();
         assert!(held.released.duration_since(held.completed) >= Duration::from_millis(2), "{held:?}");
         assert_eq!(held.rebuilt_chunks, 0);
+    }
+
+    /// One frame lost on the network: the frames that complete behind it are skipped, and so
+    /// are those that come while video waits for the keyframe. Only that one frame is lost.
+    #[test]
+    fn one_lost_frame_counts_once() {
+        let mut asm = FrameAssembler::new();
+        assert_eq!(seqs(&feed(&mut asm, chunks(0, true, 3000, 1))), [0]);
+        // Frame 1 never arrives; 2-5 complete behind it, and then it counts as lost.
+        for seq in 2..2 + REORDER_FRAMES as u32 {
+            assert!(feed(&mut asm, chunks(seq, false, 3000, 1)).is_empty());
+        }
+        assert_eq!((asm.stats.frames_lost, asm.stats.frames_skipped), (1, REORDER_FRAMES as u64));
+        // While the keyframe is on its way, more frames come, undecodable without it.
+        for seq in 6..10 {
+            assert!(feed(&mut asm, chunks(seq, false, 3000, 1)).is_empty());
+        }
+        // The keyframe ends it: still the one frame lost, and every other one skipped once.
+        assert_eq!(seqs(&feed(&mut asm, chunks(10, true, 3000, 1))), [10]);
+        assert_eq!((asm.stats.frames_lost, asm.stats.frames_skipped), (1, 8), "{:?}", asm.stats);
+    }
+
+    /// Each frame that never reaches the decoder gets a record saying why, and datagrams that
+    /// come after a frame was given up on mark it late rather than lost.
+    #[test]
+    fn records_why_frames_went_and_spots_late_ones() {
+        let mut asm = FrameAssembler::new();
+        feed(&mut asm, chunks(0, true, 3000, 1));
+        // Frame 1 is held up on the way: one chunk arrives, the rest only after 2-5.
+        let mut late = chunks(1, false, 3000, 1);
+        let rest = late.split_off(1);
+        feed(&mut asm, late);
+        for seq in 2..6 {
+            feed(&mut asm, chunks(seq, false, 3000, 1));
+        }
+        feed(&mut asm, rest);
+        feed(&mut asm, chunks(6, false, 3000, 1)); // waiting for a keyframe
+        feed(&mut asm, chunks(7, true, 3000, 1));
+        assert!(asm.take_fates(Instant::now(), false).is_empty(), "held a moment for late datagrams");
+        let fates = asm.take_fates(Instant::now() + LATE_WINDOW, false);
+        let summary: Vec<(u32, Gone, u16)> = fates.iter().map(|f| (f.seq, f.gone, f.late)).collect();
+        assert_eq!(summary[0], (1, Gone::Incomplete, 3), "late, not lost: its other chunks came after");
+        assert_eq!(fates[0].chunks, 1);
+        assert!(fates[0].needed > 1);
+        assert!(summary[1..5].iter().all(|&(seq, gone, _)| (2..6).contains(&seq) && gone == Gone::AfterLoss));
+        assert_eq!(summary[5], (6, Gone::AfterLoss, 0));
+        assert_eq!((asm.stats.frames_lost, asm.stats.frames_skipped), (1, 5));
+        assert!(asm.take_fates(Instant::now(), true).is_empty());
+
+        // A frame none of whose datagrams come, and the decoder falling behind.
+        feed(&mut asm, chunks(8, false, 3000, 1));
+        for seq in 10..14 {
+            feed(&mut asm, chunks(seq, false, 3000, 1));
+        }
+        let fates = asm.take_fates(Instant::now(), true);
+        assert_eq!(fates.iter().find(|f| f.seq == 9).map(|f| f.gone), Some(Gone::NeverSeen));
+        feed(&mut asm, chunks(14, true, 3000, 1));
+        for chunk in chunks(15, false, 3000, 1).into_iter().chain(chunks(16, false, 3000, 1)) {
+            asm.push(chunk).unwrap();
+        }
+        // The decoder can't take 15; 16 is still waiting.
+        let frame = asm.next_frame().unwrap();
+        asm.skipped(&frame);
+        asm.request_keyframe();
+        let fates = asm.take_fates(Instant::now(), true);
+        let behind: Vec<u32> = fates.iter().filter(|f| f.gone == Gone::DecoderBehind).map(|f| f.seq).collect();
+        assert_eq!(behind, [15, 16]);
     }
 
     #[test]

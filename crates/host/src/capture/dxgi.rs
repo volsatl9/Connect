@@ -81,7 +81,11 @@ impl DxgiCapturer {
                 latest: None,
                 mapped: false,
                 refresh_hz: None,
-                timing: CaptureTiming { acquired: std::time::Instant::now(), present_to_capture: None },
+                timing: CaptureTiming {
+                    acquired: std::time::Instant::now(),
+                    present_to_capture: None,
+                    accumulated: None,
+                },
                 width: 0,
                 height: 0,
             };
@@ -244,7 +248,8 @@ impl DxgiCapturer {
                 .then(|| now.saturating_sub(info.LastPresentTime))
                 .filter(|&ticks| frequency > 0 && ticks >= 0)
                 .map(|ticks| Duration::from_secs_f64(ticks as f64 / frequency as f64));
-        self.timing = CaptureTiming { acquired: std::time::Instant::now(), present_to_capture };
+        let accumulated = Some(info.AccumulatedFrames);
+        self.timing = CaptureTiming { acquired: std::time::Instant::now(), present_to_capture, accumulated };
         let texture = match resource.context("no desktop image").and_then(|r| Ok(r.cast::<ID3D11Texture2D>()?)) {
             Ok(texture) => texture,
             Err(e) => {

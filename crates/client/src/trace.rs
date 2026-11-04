@@ -10,12 +10,19 @@
 use std::{
     fmt::Write as _,
     path::{Path, PathBuf},
+    sync::Arc,
     sync::atomic::{AtomicU32, Ordering},
     time::Instant,
 };
 
-use connect_perf::{CsvRecord, Percentiles, Spread, TraceRing, cell, percentiles, spread};
-use connect_proto::{micros_at, video::FrameMeta};
+use connect_net::PathKind;
+use connect_perf::{
+    CsvRecord, CsvStream, Percentiles, SessionRow, Spool, Spread, TraceRing, cell, percentiles, spread,
+};
+use connect_proto::{
+    micros_at,
+    video::{Fate, FrameMeta},
+};
 
 use crate::{ClockOffset, FrameTiming};
 
@@ -158,6 +165,78 @@ network_est_us,total_est_us";
     }
 }
 
+/// A frame that never reached the decoder, and why: lost on the way (and whether its datagrams
+/// were merely late), or skipped here.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LossRecord {
+    pub fate: Fate,
+}
+
+impl CsvRecord for LossRecord {
+    const HEADER: &'static str = "seq,keyframe,reason,lost,chunks_received,chunks_needed,viewer_first_seen_us,\
+viewer_last_seen_us,viewer_given_up_us,late_datagrams,viewer_last_late_us";
+
+    fn write_row(&self, out: &mut String) {
+        let f = &self.fate;
+        let _ = write!(out, "{},{},{},{},{},", f.seq, f.keyframe as u8, f.gone.name(), f.gone.lost() as u8, f.chunks);
+        cell(out, (f.needed > 0).then_some(f.needed));
+        cell(out, f.first_seen.map(micros_at));
+        cell(out, f.last_seen.map(micros_at));
+        let _ = write!(out, "{},{},", micros_at(f.given_up), f.late);
+        if let Some(late) = f.last_late {
+            let _ = write!(out, "{}", micros_at(late));
+        }
+    }
+}
+
+/// The connection as this side saw it, once a stats window (about a second).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct NetworkRecord {
+    pub time_us: u64,
+    pub path: PathKind,
+    pub rtt_us: Option<u32>,
+    pub mbps: f32,
+    pub fps: f32,
+    /// Running totals.
+    pub frames_lost: u64,
+    pub frames_skipped: u64,
+    pub frames_recovered: u64,
+    pub frames_superseded: u64,
+    pub host_kbps: Option<u32>,
+    pub loss_permille: Option<u32>,
+    pub clock: Option<ClockOffset>,
+    pub gpu: Option<connect_gpu_load::GpuLoad>,
+}
+
+impl CsvRecord for NetworkRecord {
+    const HEADER: &'static str = "viewer_time_us,path,rtt_us,mbps,fps,frames_lost,frames_skipped,frames_repaired,\
+frames_superseded,host_target_kbps,host_loss_permille,clock_offset_us,clock_uncertainty_us,gpu_graphics_percent,\
+gpu_decode_percent";
+
+    fn write_row(&self, out: &mut String) {
+        let path = match self.path {
+            PathKind::Direct => "direct",
+            PathKind::Relay => "relay",
+            PathKind::Unknown => "unknown",
+        };
+        let _ = write!(out, "{},{path},", self.time_us);
+        cell(out, self.rtt_us);
+        let _ = write!(
+            out,
+            "{:.2},{:.1},{},{},{},{},",
+            self.mbps, self.fps, self.frames_lost, self.frames_skipped, self.frames_recovered, self.frames_superseded
+        );
+        cell(out, self.host_kbps);
+        cell(out, self.loss_permille);
+        cell(out, self.clock.map(|c| c.offset_us));
+        cell(out, self.clock.map(|c| c.uncertainty_us));
+        cell(out, self.gpu.map(|g| g.graphics));
+        if let Some(decode) = self.gpu.and_then(|g| g.decode) {
+            let _ = write!(out, "{decode}");
+        }
+    }
+}
+
 /// One input event sent to the host.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct InputRecord {
@@ -184,6 +263,8 @@ impl CsvRecord for InputRecord {
 pub(crate) struct ViewerTrace {
     pub frames: TraceRing<FrameRecord>,
     pub inputs: TraceRing<InputRecord>,
+    pub losses: TraceRing<LossRecord>,
+    pub network: TraceRing<NetworkRecord>,
     /// When the session started, in Unix seconds, to name its files.
     session: u64,
     /// Saves made during the session, which number their files.
@@ -196,47 +277,70 @@ impl ViewerTrace {
         Self {
             frames: TraceRing::new(capacity),
             inputs: TraceRing::new(capacity),
+            losses: TraceRing::new(capacity),
+            network: TraceRing::new(capacity),
             session: connect_perf::session_stamp(),
             saves: AtomicU32::new(0),
         }
     }
 
     pub fn dropped(&self) -> u64 {
-        self.frames.dropped_busy() + self.inputs.dropped_busy()
+        self.frames.dropped_busy()
+            + self.inputs.dropped_busy()
+            + self.losses.dropped_busy()
+            + self.network.dropped_busy()
     }
 
-    /// Writes the trace to `dir` as CSV; returns the files written. Blocks on file I/O. Saves
-    /// during the session are numbered (`viewer-<session>-save1-frames.csv`), so the files
-    /// written when it ends don't replace them.
-    pub fn write(&self, dir: &Path, during_session: bool) -> std::io::Result<Vec<PathBuf>> {
-        let save = during_session.then(|| self.saves.fetch_add(1, Ordering::Relaxed) + 1);
-        let path = |what: &str| match save {
-            Some(n) => connect_perf::trace_path(dir, "viewer", self.session, &format!("save{n}-{what}")),
-            None => connect_perf::trace_path(dir, "viewer", self.session, what),
-        };
-        let files = [path("frames"), path("input"), path("session")];
+    /// Writes what the rings hold to `dir` as CSV; returns the files written. Blocks on file
+    /// I/O. These saves are numbered (`viewer-<session>-save1-frames.csv`), apart from the files
+    /// streamed as the session goes, which [`Self::spool`] writes.
+    pub fn save(&self, dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+        let save = self.saves.fetch_add(1, Ordering::Relaxed) + 1;
+        let path = |what: &str| connect_perf::trace_path(dir, "viewer", self.session, &format!("save{save}-{what}"));
+        let files = [path("frames"), path("input"), path("loss"), path("network"), path("session")];
         connect_perf::write_csv(&files[0], &self.frames.snapshot())?;
         connect_perf::write_csv(&files[1], &self.inputs.snapshot())?;
-        let session = [
+        connect_perf::write_csv(&files[2], &self.losses.snapshot())?;
+        connect_perf::write_csv(&files[3], &self.network.snapshot())?;
+        connect_perf::write_csv(&files[4], &self.summary(0))?;
+        Ok(files.into())
+    }
+
+    fn summary(&self, overrun: u64) -> [SessionRow; 6] {
+        [
             SessionRow("version", env!("CARGO_PKG_VERSION").into()),
             SessionRow("session_unix_s", self.session.to_string()),
             SessionRow("qpc_frequency_hz", connect_perf::qpc_frequency().to_string()),
             SessionRow("frames_recorded", self.frames.written().to_string()),
-            SessionRow("frames_kept", self.frames.capacity().min(self.frames.written() as usize).to_string()),
+            SessionRow("records_overrun", overrun.to_string()),
             SessionRow("records_dropped_busy", self.dropped().to_string()),
-        ];
-        connect_perf::write_csv(&files[2], &session)?;
-        Ok(files.into())
+        ]
     }
-}
 
-struct SessionRow(&'static str, String);
-
-impl CsvRecord for SessionRow {
-    const HEADER: &'static str = "key,value";
-
-    fn write_row(&self, out: &mut String) {
-        let _ = write!(out, "{},{}", self.0, self.1);
+    /// Starts writing the trace to CSV files in `dir` as it goes.
+    pub fn spool(self: &Arc<Self>, dir: &Path) -> std::io::Result<Spool> {
+        let path = |what| connect_perf::trace_path(dir, "viewer", self.session, what);
+        let session_file = path("session");
+        let (mut frames, mut inputs) = (CsvStream::new(path("frames")), CsvStream::new(path("input")));
+        let (mut losses, mut network) = (CsvStream::new(path("loss")), CsvStream::new(path("network")));
+        let trace = self.clone();
+        Spool::start(move |last| {
+            let written = frames
+                .drain(&trace.frames)
+                .and_then(|()| inputs.drain(&trace.inputs))
+                .and_then(|()| losses.drain(&trace.losses))
+                .and_then(|()| network.drain(&trace.network))
+                .and_then(|()| {
+                    if last {
+                        connect_perf::write_csv(&session_file, &trace.summary(frames.overrun() + losses.overrun()))
+                    } else {
+                        Ok(())
+                    }
+                });
+            if let Err(error) = written {
+                tracing::warn!("couldn't write the performance trace: {error}");
+            }
+        })
     }
 }
 
@@ -465,5 +569,53 @@ mod tests {
         let mut row = String::new();
         InputRecord { seq: 1, kind: "key", sent_us: 5, clock: None }.write_row(&mut row);
         assert_eq!(row.split(',').count(), InputRecord::HEADER.split(',').count(), "{row}");
+        let now = Instant::now();
+        let fate = connect_proto::video::Fate {
+            seq: 3,
+            gone: connect_proto::video::Gone::NeverSeen,
+            keyframe: false,
+            chunks: 0,
+            needed: 0,
+            first_seen: None,
+            last_seen: None,
+            given_up: now,
+            late: 0,
+            last_late: None,
+        };
+        for fate in [
+            fate,
+            connect_proto::video::Fate {
+                needed: 9,
+                first_seen: Some(now),
+                last_seen: Some(now),
+                late: 2,
+                last_late: Some(now),
+                ..fate
+            },
+        ] {
+            row.clear();
+            LossRecord { fate }.write_row(&mut row);
+            assert_eq!(row.split(',').count(), LossRecord::HEADER.split(',').count(), "{row}");
+        }
+        for clock in [None, Some(OFFSET)] {
+            row.clear();
+            let network = NetworkRecord {
+                time_us: 1,
+                path: PathKind::Direct,
+                rtt_us: clock.map(|_| 42_000),
+                mbps: 30.0,
+                fps: 240.0,
+                frames_lost: 1,
+                frames_skipped: 2,
+                frames_recovered: 3,
+                frames_superseded: 4,
+                host_kbps: clock.map(|_| 80_000),
+                loss_permille: None,
+                clock,
+                gpu: None,
+            };
+            network.write_row(&mut row);
+            assert_eq!(row.split(',').count(), NetworkRecord::HEADER.split(',').count(), "{row}");
+        }
     }
 }

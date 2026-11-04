@@ -15,49 +15,56 @@ use connect_proto::Permissions;
 use iroh::SecretKey;
 use tokio::{net::UdpSocket, time::timeout};
 
-/// Forwards UDP between the client and `host`, dropping `loss` of the packets each way and
-/// holding back about one in fifty by a couple of milliseconds, so they arrive out of order.
+/// Forwards UDP between the client (IPv4) and `host` (IPv6), dropping `loss` of the packets
+/// each way and holding back about one in fifty by a couple of milliseconds, so they arrive out
+/// of order. Neither end can reach the other's own address, so nothing goes round the relay
+/// (before 0.9.1 the endpoints found a direct path once connected, and the loss stopped).
 async fn lossy_relay(host: SocketAddr, loss: f64) -> SocketAddr {
-    let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-    let addr = socket.local_addr().unwrap();
+    let client_side = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let host_side = Arc::new(UdpSocket::bind("[::1]:0").await.unwrap());
+    let addr = client_side.local_addr().unwrap();
     let client: Arc<Mutex<Option<SocketAddr>>> = Arc::default();
-    tokio::spawn(async move {
-        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
-        let mut buf = vec![0; 65_536];
-        loop {
-            let Ok((len, from)) = socket.recv_from(&mut buf).await else { return };
-            let to = if from == host {
-                match *client.lock().unwrap() {
-                    Some(client) => client,
-                    None => continue,
+    // Client → host, then host → client.
+    for (towards_host, from, to) in [(true, client_side.clone(), host_side.clone()), (false, host_side, client_side)] {
+        let client = client.clone();
+        tokio::spawn(async move {
+            let mut seed = if towards_host { 0x9E37_79B9_7F4A_7C15u64 } else { 0x2545_F491_4F6C_DD1Du64 };
+            let mut buf = vec![0; 65_536];
+            loop {
+                let Ok((len, sender)) = from.recv_from(&mut buf).await else { return };
+                let target = if towards_host {
+                    *client.lock().unwrap() = Some(sender);
+                    host
+                } else {
+                    match *client.lock().unwrap() {
+                        Some(client) => client,
+                        None => continue,
+                    }
+                };
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                if (seed % 10_000) as f64 / 10_000.0 < loss {
+                    continue;
                 }
-            } else {
-                *client.lock().unwrap() = Some(from);
-                host
-            };
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            if (seed % 10_000) as f64 / 10_000.0 < loss {
-                continue;
+                let packet = buf[..len].to_vec();
+                if seed % 50 == 1 {
+                    let to = to.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(2)).await;
+                        let _ = to.send_to(&packet, target).await;
+                    });
+                } else {
+                    let _ = to.send_to(&packet, target).await;
+                }
             }
-            let packet = buf[..len].to_vec();
-            if seed % 50 == 1 {
-                let socket = socket.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(Duration::from_millis(2)).await;
-                    let _ = socket.send_to(&packet, to).await;
-                });
-            } else {
-                let _ = socket.send_to(&packet, to).await;
-            }
-        }
-    });
+        });
+    }
     addr
 }
 
 async fn session_over(loss: f64) -> (Stats, u64) {
-    let host_ep = net::bind_local_endpoint(SecretKey::generate()).await.unwrap();
+    let host_ep = net::bind_local_endpoint_at(SecretKey::generate(), "[::1]:0").await.unwrap();
     let config = HostConfig {
         video: VideoSource::TestPattern { width: 1280, height: 720, fps: 120 },
         ..HostConfig::new("Lossy host")

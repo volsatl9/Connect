@@ -11,15 +11,18 @@ optimised.
 |---|---|
 | Live summary | **Ctrl+Alt+S** in a session. Percentiles over the last second. |
 | Save the viewer's trace | **Ctrl+Alt+E** in a session. CSV files go to `connect-traces` in the folder the app was started from, or to the temp folder if that one isn't writable. |
-| Trace every session, both sides | Set `CONNECT_TRACE` to a directory. Each side writes its CSV files there when the session ends. |
+| Trace every session, both sides | Set `CONNECT_TRACE` to a directory. Each side streams its CSV files there as the session goes, every 5 seconds. |
+| Follow every frame | Put both PCs' files in one folder and run `connect trace-report <folder>`. See [Following frames](#following-frames). |
 | Terminal sessions | `connect host --trace DIR` and `connect join <USER-ID> --trace DIR`. These do the same as the setting above. |
 | Turn tracing off | `CONNECT_TRACE=0` (also `off` or `false`). Nothing is recorded; the overlay falls back to the running averages it showed before 0.8. |
 
 Tracing is on by default; the overlay's percentiles need it. Without a trace directory, each
 buffer keeps the last 4,096 records (about 17 s at 240 fps), so Ctrl+Alt+E saves the most recent
-stretch. With a trace directory, each buffer keeps 65,536 records (about 4.5 minutes at 240 fps).
-Older records are overwritten. To capture a longer run, keep sessions under that length or save
-with Ctrl+Alt+E during the run.
+stretch, and older records are overwritten. With a trace directory, each buffer keeps 65,536
+records (about 4.5 minutes at 240 fps, what Ctrl+Alt+E saves), and everything also goes to the CSV
+files as the session runs, so a session of any length keeps every record, and a crash loses at most
+the last few seconds. `records_overrun` in the session files says if any were missed. Allow about
+200 MB an hour for the viewer's files and 120 MB for the host's at 240 fps; half that at 120.
 
 ## Clocks
 
@@ -62,7 +65,7 @@ capture, encode, and sent after. Only the host's own trace records the rest.
 |---|---|---|
 | present→capture | Windows putting the image on screen (DXGI `LastPresentTime`) → capture acquiring it | 0/empty when Windows doesn't report it (e.g. no new present, only a pointer move) and with the test pattern. |
 | capture | Image acquired → staged for the encoder | CPU time: the copy out of the duplication surface and *submitting* the colour conversion. GPU work still pending isn't included; see GPU convert. |
-| GPU convert | The BGRA→NV12 conversion's run time on the graphics card | D3D11 timestamp queries around `VideoProcessorBlt`, read back a frame or two later without waiting. Only on the GPU-only path. Up to four in flight. A conversion whose slot is still busy goes untimed, as does one where the GPU clock changed frequency (disjoint). Joined to frames by `capture_index`. **Not available on every driver.** Some run the video processor outside the command stream that timestamps mark, so start and end land almost together. On an RTX 5060 (driver 621.01), every conversion read 0 µs. Readings under 5 µs can't be a real conversion and are dropped. A timer that gives nothing else in its first 32 readings is switched off for the stream, and the stage shows "–". The conversion's cost then lands in *encode*, which waits for it. |
+| GPU convert (µs in the overlay) | The BGRA→NV12 conversion's run time on the graphics card | D3D11 timestamp queries around the conversion's draws, read back a frame or two later without waiting. Only on the GPU-only path. Up to four in flight. A conversion whose slot is still busy goes untimed, as does one where the GPU clock changed frequency (disjoint). Joined to frames by `capture_index`. Since 0.9 the conversion is two pixel shaders, which timestamps time on every driver. **The video-processor fallback can't always be timed.** Some drivers run the video processor outside the command stream that timestamps mark, so start and end land almost together. On an RTX 5060 (driver 621.01), every conversion read 0 µs. Readings under 2 µs can't be a real conversion and are dropped. A timer that gives nothing else in its first 32 readings is switched off for the stream, and the stage shows "–". The conversion's cost then lands in *encode*, which waits for it. |
 | held | Staged → the encoder starting on it | Waiting for the network backlog to clear, or for the frame's slot at the screen's refresh rate. Re-sent pictures (a requested keyframe of an unchanged screen) record 0 and are left out of percentiles. |
 | encode | The encoder call | Includes waiting for the GPU conversion to finish, as the hardware encoder reads its result, and the encoder's own synchronous wait. |
 | queue | Encoder done → the session task picking the frame up | The 2-frame channel to the network task, and the task being scheduled. |
@@ -90,9 +93,9 @@ The viewer's clock, except for the estimates.
 | Figure | Meaning | Limits |
 |---|---|---|
 | fps | Frames decoded per second | |
-| lost | Frames never completed: more chunks lost than recovery covered, or too late | Running total. Each one costs a keyframe request. |
+| lost | Frames that never came together on the way: chunks missing beyond what recovery covered (or late past the wait), or none of their datagrams arrived | Running total. Each loss costs a keyframe request. Before 0.9.1 this also counted, a second time, the frames skipped while waiting for that keyframe, so one lost frame could read as five. `viewer-*-loss.csv` says why each one went, and whether its datagrams turned up later. |
 | repaired | Frames rebuilt from recovery chunks | Running total. |
-| skipped | Complete frames thrown away because one they depended on was lost | Running total. |
+| skipped | Frames thrown away here, not lost: they built on a lost frame (so video waited for the next keyframe), or the decoder was too far behind | Running total. Before 0.9.1, frames the decoder's full queue turned away weren't counted at all. |
 | superseded | Decoded, then replaced by a newer frame before being drawn | Running total in the first line, per window in `dropped`. Normal when the host sends faster than the display shows. |
 | dropped | Lost + skipped + superseded, last second | |
 | repeated (est.) | Extra frame times a picture stayed on screen, beyond what the host's own gap between frames explains | Counted against the stream's cadence: the median gap between captures or between draws, whichever is slower. A static screen sends nothing and isn't counted. This is an estimate from draw times, not display flips. |
@@ -134,9 +137,8 @@ The overlay shows CPU as a share of all cores, like Task Manager, and as cores i
 ## CSV files
 
 Files are named `<role>-<session>-<what>.csv`, where `<session>` is the session's start in Unix
-seconds. Ctrl+Alt+E saves are numbered, `viewer-<session>-save<n>-<what>.csv`, so the files
-written at the end of the session don't replace them. Empty cells mean "not measured". All times
-are µs.
+seconds. Ctrl+Alt+E saves are numbered, `viewer-<session>-save<n>-<what>.csv`, apart from the
+files streamed as the session goes. Empty cells mean "not measured". All times are µs.
 
 **`host-*-frames.csv`**, one row per frame sent:
 - `seq`, `keyframe`, `codec`, `resent`, `capture_index`, `bytes`
@@ -148,6 +150,43 @@ are µs.
 
 **`host-*-convert.csv`**: `capture_index`, `convert_gpu_us`. Join to frames on `capture_index`;
 captures replaced before encoding have no frame.
+
+**`host-*-capture.csv`**, one row per image captured from the screen, encoded or not (since 0.9.2):
+- `capture_index`: joins to frames and conversions. An index with no frame was replaced before
+  encoding.
+- `time_us`, `capture_us`, `present_to_capture_us`
+- `accumulated_frames`: images that reached the screen since the last capture (DXGI's count). A gap
+  before a row with 1 here means nothing new reached the screen: the game. Over 1 means images came
+  and capture missed them: a capture stall.
+- `previous_replaced`: if the image before this one was never encoded, why: `turn` (at most one
+  picture goes per refresh of the host's screen) or `backlog` (held while the network caught up)
+
+**`host-*-load.csv`**, about once a second (since 0.9.2): `time_us`, `connect_cpu_percent`,
+`gpu_graphics_percent`, `gpu_encode_percent`. A stall that lines up with a full graphics card came
+from the load.
+
+**`host-*-session.csv`**: `key,value` rows: version, session stamp, frames recorded, and records
+missed or dropped.
+
+**`host-*-network.csv`**, every 250 ms (since 0.9.1):
+- `time_us`
+- `sent_packets`, `lost_packets`: on the path since the last row (QUIC's count)
+- `queued_bytes`: datagrams waiting to be sent
+- `bandwidth_estimate_bps`, `cwnd_bytes`, `rtt_us`, `congestion_events`: the congestion
+  controller's (BBR's) view of the path
+- `path`: `direct` or `relay`
+- `recovery_requests`: keyframe requests from the viewer since the last row, each a loss
+- `bitrate_kbps`, `ceiling_kbps`, `reason`: the encoder's target after this tick, the ceiling the
+  rate controller keeps under, and why it changed (`steady`, `backlog`, `loss`, `viewer_loss`,
+  `climb`, `creep`, `loss_held`: the viewer lost frames, but the last cut did nothing for
+  the loss, so the bitrate holds)
+- `video_bytes`: video handed to the network since the last row
+- `local_mouse_moves`, `local_mouse_pixels`, `local_mouse_tagged`, `local_mouse_buttons`,
+  `local_keys`: what the host's own mouse and keyboard did since the last row, as the low-level
+  hooks saw it, without injected input. This is what sets host priority off. Pixels tell a hand
+  (hundreds) from a jittery sensor (a few). Tagged events came from something that marked them, as
+  mouse software does. (since 0.9.2)
+- `host_priority_drops`: remote events dropped for host priority since the last row (since 0.9.2)
 
 **`host-*-input.csv`**: `seq`, `kind`, then the times:
 - `client_time_us_viewer_clock` (the viewer's clock; don't compare it with the others)
@@ -170,14 +209,67 @@ and `outcome`: `injected`, `refused` (Windows blocked it, e.g. an elevated windo
 - `clock_offset_us`, `clock_uncertainty_us`: the estimate when the frame was recorded
 - `network_est_us`, `total_est_us`
 
+**`viewer-*-loss.csv`**, one row per frame that never reached the decoder (since 0.9.1):
+- `seq`, `keyframe`
+- `reason`: `incomplete`, `never_seen` or `evicted` (lost: `lost` is 1), or `skipped_after_loss` or
+  `skipped_decoder_behind`
+- `chunks_received`, `chunks_needed` (data chunks; empty if none came)
+- `viewer_first_seen_us`, `viewer_last_seen_us`: its first and last datagram before it was given up
+- `viewer_given_up_us`
+- `late_datagrams`, `viewer_last_late_us`: its datagrams that came after it was given up on, within
+  a second. A lost frame with late datagrams was delayed, not dropped by the network.
+
+Join to the host's frames on `seq` for its size and when it was sent.
+
+**`viewer-*-network.csv`**, once a second: `viewer_time_us`, `path` (`direct` or `relay`), `rtt_us`,
+`mbps`, `fps`, the running totals `frames_lost`, `frames_skipped`, `frames_repaired` and
+`frames_superseded`, the host's `host_target_kbps` and `host_loss_permille`, the clock estimate,
+and `gpu_graphics_percent` and `gpu_decode_percent` (since 0.9.2). A change of `path` mid-session
+shows here.
+
 **`viewer-*-input.csv`**: `seq`, `kind`, `viewer_sent_us`, `clock_offset_us`,
 `clock_uncertainty_us`. Join to the host's input file on `seq`. The one-way estimate is
 `received_us + clock_offset_us − viewer_sent_us`.
 
 **`viewer-*-session.csv`**: `key,value` rows. They hold the version, the session stamp,
-`qpc_frequency_hz`, frames recorded and kept, and records dropped.
+`qpc_frequency_hz`, frames recorded, and records missed (`records_overrun`) or dropped.
 
 Join the two frames files on `seq`. Within a session it counts up by one per frame encoded.
+
+## Following frames
+
+`seq` identifies a frame from the moment it's encoded: it's in `host-*-frames.csv`, and travels with
+the frame to `viewer-*-frames.csv` (frames decoded) and `viewer-*-loss.csv` (frames that weren't).
+`capture_index` goes back further, to the capture, in `host-*-capture.csv`. `connect trace-report
+<folder>` joins them for the newest session in the folder. It writes `report-<session>.txt`, and
+`report-<session>-events.csv` with every run of frames in trouble: when, why, and from which `seq`
+to which.
+
+Every frame gets at most one reason:
+
+| Reason | What it means | Evidence |
+|---|---|---|
+| `network_loss` | Its datagrams never came, or too few to rebuild it | Loss file: `incomplete`, `never_seen` or `evicted`. Compare `lost_packets` in the host's network file. |
+| `network_late` | Its datagrams came, after the viewer gave up on it | Loss file: `late_datagrams` above 0 |
+| `skipped_after_loss` | Arrived, but built on a lost frame | Loss file |
+| `network_queue` | Drawn late, mostly lost on the way | Network estimate, reassembly and the host's send stages over their usual. Not always the network itself: it includes BBR's pacing on the host. `queued_bytes` shows what waited on the host; a rising `rtt_us` means a queue on the path. |
+| `host_capture` | Drawn late, mostly before staging | `present_to_capture_us`, `capture_us` |
+| `host_held` | Drawn late, held back before encoding | `held_us` |
+| `encoder` | Drawn late, mostly in the encoder | `encode_us` |
+| `viewer_decode` | The decoder fell behind, or the frame was drawn late from waiting for it or decoding | Loss file: `skipped_decoder_behind`; `decode_queue_us`, `decode_us` |
+| `presentation_drop` | Decoded, but a newer frame replaced it before it could be drawn | `status` is `superseded` |
+| `viewer_draw` | Drawn late, mostly in drawing | `render_us` |
+| `unaccounted` | The host sent it and the viewer has no record | The viewer's trace missed it, or that session's trace is incomplete |
+
+A frame counts as late over 16 ms above the session's median latency; the stage to blame is the one
+furthest over its own median. Latency here is `total_est_us`, so it's as good as the clock estimate.
+
+The report also lists capture gaps of 50 ms or more, split into stalls (images missed) and quiet
+(nothing new on screen), and what the host's own input was doing when host priority dropped remote
+events. Gaps in capture aren't charged to frames: a frame that was never captured has no number.
+
+`presentation_drop` covers what the app knows. A frame drawn by the app and then dropped on its way
+to the display is invisible here; only PresentMon sees that (below).
 
 ## Joining with PresentMon (Windows)
 
@@ -196,8 +288,9 @@ when it reached the screen. QPC ticks convert to µs with `qpc_frequency_hz`.
 - Writing a record never waits. Each buffer is a preallocated ring behind a lock that writers
   only *try*. If an export or the once-a-second summary is reading it at that moment, the record
   is dropped and counted. The overlay shows the count only if it isn't zero.
-- The trace never writes files while streaming. CSV files are written when a session ends (on a
-  background task) or on Ctrl+Alt+E (on its own thread).
+- No video thread writes files. With a trace directory, a thread of its own appends new records to
+  the CSV files every 5 seconds, copying them out of the rings under the same lock, for a few
+  microseconds. Ctrl+Alt+E saves on its own thread too.
 - With tracing off, each record costs one relaxed atomic load, and nothing is allocated.
 - Memory is bounded:
   - Default: 4,096 records per ring, about 0.6 MB for the viewer's frames.

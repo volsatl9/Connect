@@ -97,3 +97,34 @@ impl VideoEncoder for OpenH264 {
         Ok(vec![Encoded { data: Bytes::from(data), keyframe: encoded.frame_type() == FrameType::IDR, capture_time_us }])
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        capture::{Capturer, test_pattern::TestPattern},
+        yuv::{Layout, Picture},
+    };
+
+    /// How closely OpenH264 follows its bitrate on busy content, the noisy test pattern.
+    #[test]
+    #[ignore = "a few seconds of encoding; prints frame sizes against targets"]
+    fn follows_its_bitrate_on_busy_content() {
+        for bitrate in [2_000_000, 5_000_000, 10_000_000, 20_000_000, 40_000_000] {
+            let mut encoder = OpenH264::new(bitrate, 60).unwrap();
+            let mut source = TestPattern::new(1280, 720, 1000, true);
+            let mut picture = Picture::new(Layout::I420, 1280, 720);
+            let mut bytes = 0;
+            for frame in 0..240u64 {
+                let image = source.next_frame(std::time::Duration::from_secs(1)).unwrap().unwrap();
+                picture.convert_from_bgra(image.bgra, image.stride);
+                let out = encoder.encode(Input::Picture(&picture), frame * 16_667, frame == 0).unwrap();
+                if frame >= 120 {
+                    bytes += out.iter().map(|f| f.data.len()).sum::<usize>();
+                }
+            }
+            // 120 frames at 60 fps: two seconds.
+            println!("target {:5.1} Mb/s: {:5.1} Mb/s out", bitrate as f64 / 1e6, bytes as f64 * 8.0 / 2e6);
+        }
+    }
+}

@@ -47,7 +47,7 @@ use windows::{
                 CallNextHookEx, GetMessageW, HC_ACTION, KBDLLHOOKSTRUCT, LLKHF_INJECTED, LLKHF_LOWER_IL_INJECTED,
                 LLMHF_INJECTED, LLMHF_LOWER_IL_INJECTED, MSG, MSLLHOOKSTRUCT, PM_NOREMOVE, PeekMessageW,
                 PostThreadMessageW, SW_HIDE, SetWindowsHookExW, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL,
-                WM_QUIT, WM_USER,
+                WM_KEYDOWN, WM_MOUSEMOVE, WM_QUIT, WM_SYSKEYDOWN, WM_USER,
             },
         },
     },
@@ -189,6 +189,7 @@ pub(super) fn run(
             other => {
                 let host_has_it = local.as_ref().is_some_and(|l| l.recently_used(other.device()));
                 if host_has_it && !is_release(&other) {
+                    trace.host_priority_drops.fetch_add(1, Ordering::Relaxed);
                     InputOutcome::HostPriority
                 } else {
                     held.note(&other);
@@ -290,6 +291,25 @@ fn submit(inputs: &[INPUT]) -> bool {
 /// `GetTickCount64` milliseconds. Written by the hooks, which can only reach statics.
 static LOCAL_MOUSE_AT: AtomicU64 = AtomicU64::new(0);
 static LOCAL_KEYBOARD_AT: AtomicU64 = AtomicU64::new(0);
+/// What the hooks saw, as running totals, so the trace can show what set host priority off.
+static LOCAL_MOUSE_MOVES: AtomicU64 = AtomicU64::new(0);
+static LOCAL_MOUSE_PIXELS: AtomicU64 = AtomicU64::new(0);
+static LOCAL_MOUSE_TAGGED: AtomicU64 = AtomicU64::new(0);
+static LOCAL_MOUSE_BUTTONS: AtomicU64 = AtomicU64::new(0);
+static LOCAL_KEYS: AtomicU64 = AtomicU64::new(0);
+/// Where the mouse last was, as x << 32 | y.
+static LOCAL_MOUSE_POINT: AtomicU64 = AtomicU64::new(0);
+
+pub(super) fn local_activity() -> super::LocalActivity {
+    let read = |total: &AtomicU64| total.load(Ordering::Relaxed);
+    super::LocalActivity {
+        mouse_moves: read(&LOCAL_MOUSE_MOVES),
+        mouse_pixels: read(&LOCAL_MOUSE_PIXELS),
+        mouse_tagged: read(&LOCAL_MOUSE_TAGGED),
+        mouse_buttons: read(&LOCAL_MOUSE_BUTTONS),
+        keys: read(&LOCAL_KEYS),
+    }
+}
 
 /// Low-level mouse and keyboard hooks on their own thread, for the length of a session.
 struct LocalInput {
@@ -353,6 +373,20 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
         let info = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
         if info.flags & (LLMHF_INJECTED | LLMHF_LOWER_IL_INJECTED) == 0 {
             LOCAL_MOUSE_AT.store(unsafe { GetTickCount64() }, Ordering::Relaxed);
+            if wparam.0 as u32 == WM_MOUSEMOVE {
+                let point = (u64::from(info.pt.x as u32) << 32) | u64::from(info.pt.y as u32);
+                let last = LOCAL_MOUSE_POINT.swap(point, Ordering::Relaxed);
+                let moved = (info.pt.x as i64 - i64::from((last >> 32) as u32 as i32)).unsigned_abs()
+                    + (info.pt.y as i64 - i64::from(last as u32 as i32)).unsigned_abs();
+                LOCAL_MOUSE_MOVES.fetch_add(1, Ordering::Relaxed);
+                LOCAL_MOUSE_PIXELS.fetch_add(moved, Ordering::Relaxed);
+            } else {
+                LOCAL_MOUSE_BUTTONS.fetch_add(1, Ordering::Relaxed);
+            }
+            // Mouse software tags what it sends; a mouse in someone's hand has nothing here.
+            if info.dwExtraInfo != 0 {
+                LOCAL_MOUSE_TAGGED.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
     unsafe { CallNextHookEx(None, code, wparam, lparam) }
@@ -363,6 +397,9 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
         let info = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
         if info.flags.0 & (LLKHF_INJECTED.0 | LLKHF_LOWER_IL_INJECTED.0) == 0 {
             LOCAL_KEYBOARD_AT.store(unsafe { GetTickCount64() }, Ordering::Relaxed);
+            if matches!(wparam.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN) {
+                LOCAL_KEYS.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
     unsafe { CallNextHookEx(None, code, wparam, lparam) }

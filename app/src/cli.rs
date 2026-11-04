@@ -22,7 +22,7 @@ pub async fn host(key: SecretKey, args: &[String]) -> Result<()> {
         match arg.as_str() {
             "--trace" => trace_into(args.next().context("--trace needs a directory")?)?,
             "--test-pattern" => video = VideoSource::TEST_PATTERN,
-            // e.g. --test-pattern=1920x1080@144
+            // e.g. --test-pattern=1920x1080@144, or …@144,noise for one the encoder can't compress
             spec if spec.starts_with("--test-pattern=") => video = test_pattern(&spec["--test-pattern=".len()..])?,
             "--print-input" => {
                 let (tx, mut events) = mpsc::unbounded_channel();
@@ -106,15 +106,20 @@ fn trace_into(dir: &str) -> Result<()> {
 
 fn test_pattern(spec: &str) -> Result<VideoSource> {
     let parse = || -> Option<VideoSource> {
+        let (spec, noise) = match spec.strip_suffix(",noise") {
+            Some(spec) => (spec, true),
+            None => (spec, false),
+        };
         let (size, fps) = spec.split_once('@')?;
         let (width, height) = size.split_once('x')?;
-        Some(VideoSource::TestPattern {
-            width: width.parse().ok()?,
-            height: height.parse().ok()?,
-            fps: fps.parse().ok()?,
+        let (width, height, fps) = (width.parse().ok()?, height.parse().ok()?, fps.parse().ok()?);
+        Some(if noise {
+            VideoSource::NoisyTestPattern { width, height, fps }
+        } else {
+            VideoSource::TestPattern { width, height, fps }
         })
     };
-    parse().with_context(|| format!("expected WIDTHxHEIGHT@FPS, like 1920x1080@144, not {spec:?}"))
+    parse().with_context(|| format!("expected WIDTHxHEIGHT@FPS[,noise], like 1920x1080@144, not {spec:?}"))
 }
 
 pub async fn join(key: SecretKey, args: &[String]) -> Result<()> {
@@ -208,6 +213,13 @@ fn stdin_lines() -> mpsc::UnboundedReceiver<String> {
 
 /// Checks what this PC's graphics hardware offers for sharing and viewing, runs the GPU paths
 /// briefly, and saves the report for pasting.
+pub fn trace_report(dir: Option<&str>) -> Result<()> {
+    let dir = std::path::Path::new(dir.context("trace-report needs the folder with the trace files")?);
+    let (report, path) = crate::trace_report::write(dir)?;
+    println!("{report}\nSaved to {}", path.display());
+    Ok(())
+}
+
 pub fn gpu_check() -> Result<()> {
     let mut report = Vec::new();
     let mut out = |line: String| {

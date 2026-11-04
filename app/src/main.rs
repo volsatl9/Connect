@@ -8,6 +8,7 @@
 //! connect join <USER-ID> [--seconds N] [--trace DIR]
 //! connect id                          print this PC's User-ID
 //! connect gpu-check                   check what the graphics hardware offers, and test it
+//! connect trace-report <DIR>           follow every frame through a session's traces
 //! ```
 //!
 //! Only Windows can host; other platforms can only connect. `--test-pattern` hosts a generated
@@ -22,12 +23,22 @@
 //! `CONNECT_RENDERER=separate` to keep the window off the video decoder's graphics device.
 //! `CONNECT_TRACE=DIR` (or `--trace DIR`) writes each session's performance trace there as CSV;
 //! `CONNECT_TRACE=0` turns tracing off. See METRICS.md.
+//!
+//! Hosting, for comparisons: `CONNECT_GPU_CONVERT=video-processor` converts colours with the
+//! driver's video processor instead of Connect's shaders; `CONNECT_INTRA_REFRESH=0` goes back to
+//! periodic keyframes; `CONNECT_FRAME_BUFFER=<frames>` changes the encoder's buffer setting (0:
+//! the driver's default); `CONNECT_PEAK_PERCENT=<n>` uses peak-constrained VBR at n% of the mean;
+//! `CONNECT_MIN_QP=<qp>` sets the finest quantizer; `CONNECT_RATE_CEILING=0` runs 0.9.0's rate
+//! controller; `CONNECT_PATH_MEMORY=0` runs plain BBR, which forgets the path in quiet scenes and
+//! backs off on stray loss;
+//! `CONNECT_PROBE_RTT_GAIN=0.5` goes back to BBR's own window while it measures the round trip.
 
 // No console window behind the app. Debug builds keep theirs, for the logs.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod cli;
 mod gui;
+mod trace_report;
 mod update;
 
 use std::path::PathBuf;
@@ -43,7 +54,8 @@ usage: connect                        open the app
                                       share this PC from the terminal (Windows)
        connect join <USER-ID> [--seconds N] [--trace DIR]
        connect id                     print this PC's User-ID
-       connect gpu-check              check this PC's graphics hardware and save a report";
+       connect gpu-check              check this PC's graphics hardware and save a report
+       connect trace-report <DIR>     follow every frame through a session's traces from both PCs";
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -79,6 +91,7 @@ fn main() -> Result<()> {
         Some("host") => runtime.block_on(cli::host(key()?, &args[1..])),
         Some("join") => runtime.block_on(cli::join(key()?, &args[1..])),
         Some("gpu-check") => cli::gpu_check(),
+        Some("trace-report") => cli::trace_report(args.get(1).map(String::as_str)),
         Some("id") => {
             println!("{}", net::format_user_id(&key()?.public()));
             Ok(())
@@ -120,9 +133,22 @@ pub(crate) fn stats_line(s: &Stats) -> String {
         s.frames_superseded,
     );
     let ms = |us: i64| format!("{:.1}", us as f64 / 1000.0);
-    let p50 = |p: Option<connect_client::Percentiles>| p.map_or("–".into(), |p| ms(p.p50));
+    // A stage's time with its unit: µs below a millisecond, where tenths of a millisecond read 0.0.
+    let time = |us: i64| if us.abs() < 1000 { format!("{us} µs") } else { format!("{:.1} ms", us as f64 / 1000.0) };
+    let p50 = |p: Option<connect_client::Percentiles>| p.map_or("–".into(), |p| time(p.p50));
     if let Some(f) = &s.frames {
-        text += &format!(" · last second: dropped {}, repeated ~{}", s.dropped, f.repeated);
+        text += &format!(" · last second: dropped {}, repeated ~{}, keyframes {}", s.dropped, f.repeated, f.keyframes);
+        if let Some(bytes) = f.frame_bytes {
+            // What actually arrived, not the encoder's setting.
+            let kb = |b: i64| format!("{:.0}", b as f64 / 1000.0);
+            text += &format!(
+                " · frames received p50 {} · p95 {} · p99 {} · max {} KB",
+                kb(bytes.p50),
+                kb(bytes.p95),
+                kb(bytes.p99),
+                kb(bytes.max)
+            );
+        }
         if let (Some(time), Some(interval)) = (f.frame_time, f.frame_interval) {
             text += &format!(" · frame time {:.1} ± {:.1} ms (p99 {})", time.mean, time.stddev, ms(interval.p99));
         }
@@ -151,14 +177,14 @@ pub(crate) fn stats_line(s: &Stats) -> String {
             None => format!("send wait {}", p50(f.host_wait)),
         };
         text += &format!(
-            "\n  p50 host: screen→capture {} · capture {} · GPU convert {} · encode {} · {send} ms",
+            "\n  p50 host: screen→capture {} · capture {} · GPU convert {} · encode {} · {send}",
             p50(f.present_to_capture),
             p50(from_host(|h| h.capture).or(f.capture)),
             p50(from_host(|h| h.convert_gpu)),
             p50(from_host(|h| h.encode).or(f.encode)),
         );
         text += &format!(
-            "\n  p50 here: network {} (est.) · reassembly {} · decode queue {} · decode {} on {} · draw {} ms",
+            "\n  p50 here: network {} (est.) · reassembly {} · decode queue {} · decode {} on {} · draw {}",
             p50(f.network),
             p50(f.reassembly),
             p50(f.decode_queue),
@@ -191,7 +217,7 @@ pub(crate) fn stats_line(s: &Stats) -> String {
     let inject = s.host_perf.and_then(|h| h.input_inject);
     if let Some(one_way) = s.input_one_way() {
         text += &format!(
-            "\nInput to host (est.): p50 {} · p95 {} · p99 {} ms · injecting {} ms",
+            "\nInput to host (est.): p50 {} · p95 {} · p99 {} ms · injecting {}",
             ms(one_way.p50),
             ms(one_way.p95),
             ms(one_way.p99),

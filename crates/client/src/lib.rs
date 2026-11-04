@@ -310,7 +310,7 @@ struct Shared {
     stats: Mutex<Stats>,
     counters: Counters,
     latency: Mutex<latency::LatencyWindow>,
-    trace: trace::ViewerTrace,
+    trace: Arc<trace::ViewerTrace>,
     /// Numbers input events for the trace.
     input_seq: AtomicU32,
     host_gpu: Mutex<Option<GpuLoad>>,
@@ -384,7 +384,7 @@ pub fn connect(
         gpu_decoding: AtomicBool::new(false),
         stats: Mutex::new(Stats::default()),
         latency: Mutex::new(latency::LatencyWindow::default()),
-        trace: trace::ViewerTrace::new(),
+        trace: Arc::new(trace::ViewerTrace::new()),
         input_seq: AtomicU32::new(0),
         host_gpu: Mutex::new(None),
         host_perf: Mutex::new(None),
@@ -406,13 +406,14 @@ pub fn connect(
     let (host, client_name) = (host.into(), client_name.into());
     let task_shared = shared.clone();
     tokio::spawn(async move {
+        let spool = connect_perf::trace_dir()
+            .filter(|_| connect_perf::enabled())
+            .and_then(|dir| task_shared.trace.spool(&dir).ok());
         let reason = run(&endpoint, host, &client_name, &task_shared, &events).await;
         debug!("session ended: {reason}");
-        if let Some(dir) = connect_perf::trace_dir().filter(|_| connect_perf::enabled()) {
-            let shared = task_shared.clone();
-            match tokio::task::spawn_blocking(move || shared.trace.write(&dir, false)).await {
-                Ok(Ok(files)) => info!(files = ?files, "performance trace written"),
-                Ok(Err(error)) => warn!("couldn't write the performance trace: {error}"),
+        if let Some(spool) = spool {
+            match tokio::task::spawn_blocking(move || spool.finish()).await {
+                Ok(()) => info!("performance trace written"),
                 Err(error) => warn!("writing the performance trace stopped: {error}"),
             }
         }
@@ -450,7 +451,7 @@ impl ClientHandle {
     /// Writes the session's performance trace so far into `dir` as CSV files, returning them.
     /// Blocks on file I/O, so call it off the UI thread.
     pub fn export_trace(&self, dir: &Path) -> std::io::Result<Vec<PathBuf>> {
-        self.0.trace.write(dir, true)
+        self.0.trace.save(dir)
     }
 
     /// What is decoding the video, e.g. "Decoder: GPU · AMD Radeon RX 7600"; empty until
@@ -827,6 +828,28 @@ impl StatsWindow {
         let (bytes, decoded) = (c.bytes.load(Ordering::Relaxed), c.frames_decoded.load(Ordering::Relaxed));
         let (path, rtt) = net::selected_path(conn);
         let latency = lock(&shared.latency).take();
+        let host_kbps = match c.host_kbps.load(Ordering::Relaxed) {
+            u32::MAX => None,
+            kbps => Some(kbps),
+        };
+        let gpu = self.gpu.as_mut().and_then(connect_gpu_load::Monitor::sample);
+        if connect_perf::enabled() {
+            shared.trace.network.push(trace::NetworkRecord {
+                time_us: now_micros(),
+                path,
+                rtt_us: rtt.map(|r| r.as_micros().min(u128::from(u32::MAX)) as u32),
+                mbps: (bytes - self.bytes) as f32 * 8.0 / secs / 1e6,
+                fps: (decoded - self.frames) as f32 / secs,
+                frames_lost: c.frames_lost.load(Ordering::Relaxed),
+                frames_skipped: c.frames_skipped.load(Ordering::Relaxed),
+                frames_recovered: c.frames_recovered.load(Ordering::Relaxed),
+                frames_superseded: c.frames_superseded.load(Ordering::Relaxed),
+                host_kbps,
+                loss_permille: host_kbps.map(|_| c.loss_permille.load(Ordering::Relaxed)),
+                clock: c.clock(),
+                gpu,
+            });
+        }
         let frames = connect_perf::enabled().then(|| {
             let (records, mark) = shared.trace.frames.since(self.mark);
             self.mark = mark;
@@ -856,7 +879,7 @@ impl StatsWindow {
             latency_ms: latency.and_then(|latency| latency.total),
             latency,
             host_gpu: *lock(&shared.host_gpu),
-            gpu: self.gpu.as_mut().and_then(connect_gpu_load::Monitor::sample),
+            gpu,
             frames: frames.flatten(),
             host_perf: *lock(&shared.host_perf),
             process: self.process.sample(),

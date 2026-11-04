@@ -1,9 +1,10 @@
 [workspace]
+exclude = ["vendor"]
 resolver = "3"
 members = ["crates/proto", "crates/net", "crates/host", "crates/client", "crates/gpu-load", "crates/gpu-video", "crates/perf", "app"]
 
 [workspace.package]
-version = "0.8.2"
+version = "0.9.4"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 
@@ -40,3 +41,7 @@ debug = 1
 # Video encode/decode is unusably slow unoptimised; optimise deps even in dev builds.
 [profile.dev.package."*"]
 opt-level = 3
+
+# noq-proto with one addition, a setter for BBR's ProbeRTT window gain. See vendor/noq-proto.
+[patch.crates-io]
+noq-proto = { path = "vendor/noq-proto" }

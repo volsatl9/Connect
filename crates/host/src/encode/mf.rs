@@ -34,7 +34,18 @@ const MAX_BITSTREAM: usize = 16 * 1024 * 1024;
 const MAX_RAW_BYTES: usize = 128 * 1024 * 1024;
 const FRAME_TIMEOUT: Duration = Duration::from_millis(500);
 const START_TIMEOUT: Duration = Duration::from_secs(2);
-const GOP_FRAMES: u64 = 600;
+/// With intra refresh, each frame recodes a band of the picture from scratch, so the whole
+/// picture is renewed this often without a full keyframe; keyframes then go out only when the
+/// viewer asks for one. `CONNECT_INTRA_REFRESH=0` turns it off.
+const INTRA_REFRESH: Duration = Duration::from_millis(500);
+/// The encoder's buffer (its HRD/VBV), in frames at the target bitrate: about how far beyond the
+/// average one frame may go. Two keeps keyframes and scene cuts from becoming bursts many times
+/// the usual frame, which take tens of milliseconds to get through the network. Override with
+/// `CONNECT_FRAME_BUFFER=<frames>`; 0 leaves the driver's default.
+const BUFFER_FRAMES: u32 = 2;
+/// Without intra refresh, the encoder's own keyframe interval, as a time; the video thread
+/// forces one this often too (`encode::KEYFRAME_PERIOD`).
+const GOP_SECONDS: u32 = 30;
 /// How long to wait between looks at a hardware encoder that isn't ready yet: short, as a
 /// frame takes only a few milliseconds and every one waited past adds to the delay.
 const WAIT_STEP: Duration = Duration::from_micros(200);
@@ -76,6 +87,7 @@ pub(crate) struct HardwareEncoder {
     last_timestamp: Option<i64>,
     /// Whether the driver has already turned down a bitrate change, so it isn't asked again.
     fixed_bitrate: bool,
+    burst: BurstControls,
     video_codec: Codec,
     bitstream: Bitstream,
     // Declared last: all COM interfaces are released before MF/COM shutdown.
@@ -147,8 +159,13 @@ fn subtype(codec: Codec) -> &'static GUID {
 }
 
 impl HardwareEncoder {
-    /// Opens a hardware `codec` encoder. Given `device`, it reads NV12 textures on that device
-    /// (see [`Input::Texture`]); otherwise NV12 pictures in memory.
+    /// What the driver took of the burst controls.
+    pub fn burst(&self) -> BurstControls {
+        self.burst
+    }
+
+    /// Opens a hardware `codec` encoder with the session's settings. Given `device`, it reads
+    /// NV12 textures on that device (see [`Input::Texture`]); otherwise NV12 pictures in memory.
     pub fn new(
         codec: Codec,
         width: u32,
@@ -156,6 +173,20 @@ impl HardwareEncoder {
         bitrate_bps: u32,
         fps: u32,
         device: Option<&ID3D11Device>,
+    ) -> Result<Self> {
+        Self::with_settings(codec, width, height, bitrate_bps, fps, device, &EncoderSettings::from_env())
+    }
+
+    /// Like [`Self::new`], with `settings` for keeping frame sizes in check: `gpu-check` tries
+    /// several, to measure what each actually does on this driver.
+    pub fn with_settings(
+        codec: Codec,
+        width: u32,
+        height: u32,
+        bitrate_bps: u32,
+        fps: u32,
+        device: Option<&ID3D11Device>,
+        settings: &EncoderSettings,
     ) -> Result<Self> {
         ensure!(codec != Codec::Av1, "Connect doesn't drive hardware {codec} encoders yet");
         ensure!(
@@ -172,15 +203,16 @@ impl HardwareEncoder {
         for activation in activations {
             let name = attribute_string(&activation.0, &MFT_FRIENDLY_NAME_Attribute)
                 .unwrap_or_else(|_| "unnamed hardware H.264 MFT".into());
-            match Self::configure(&activation, codec, width, height, bitrate_bps, fps, manager.as_ref()) {
-                Ok((transform, controls, events, input_id, output_id)) => {
+            match Self::configure(&activation, codec, width, height, bitrate_bps, fps, manager.as_ref(), settings) {
+                Ok((transform, controls, events, input_id, output_id, burst)) => {
+                    tracing::info!(%codec, encoder = %name, %burst, "hardware encoder settings");
                     return Ok(Self {
                         transform,
                         manager,
                         codec: controls,
                         events,
                         _activation: activation,
-                        name: format!("GPU: {name}"),
+                        name: format!("GPU: {name} · {burst}"),
                         width: width as usize,
                         height: height as usize,
                         fps,
@@ -191,6 +223,7 @@ impl HardwareEncoder {
                         frames: 0,
                         last_timestamp: None,
                         fixed_bitrate: false,
+                        burst,
                         video_codec: codec,
                         bitstream: Bitstream::new(codec),
                         _runtime: runtime,
@@ -209,6 +242,7 @@ impl HardwareEncoder {
         )
     }
 
+    #[expect(clippy::too_many_arguments)]
     fn configure(
         activation: &Activation,
         video_codec: Codec,
@@ -217,7 +251,8 @@ impl HardwareEncoder {
         bitrate: u32,
         fps: u32,
         manager: Option<&IMFDXGIDeviceManager>,
-    ) -> Result<(IMFTransform, ICodecAPI, Option<IMFMediaEventGenerator>, u32, u32)> {
+        settings: &EncoderSettings,
+    ) -> Result<(IMFTransform, ICodecAPI, Option<IMFMediaEventGenerator>, u32, u32, BurstControls)> {
         unsafe {
             // Both the enumeration flag and hardware registration are required. Never instantiate
             // the Microsoft software encoder as an alternative within this module.
@@ -267,11 +302,37 @@ impl HardwareEncoder {
                 supports(&codec, &CODECAPI_AVEncVideoForceKeyFrame)?,
                 "hardware encoder cannot request recovery keyframes"
             );
-            set_u32(&codec, &CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_CBR.0 as u32)?;
+            let mut burst = BurstControls::default();
+            match settings.peak_percent {
+                Some(percent)
+                    if set_u32(
+                        &codec,
+                        &CODECAPI_AVEncCommonRateControlMode,
+                        eAVEncCommonRateControlMode_PeakConstrainedVBR.0 as u32,
+                    )
+                    .is_ok() =>
+                {
+                    set_u32(
+                        &codec,
+                        &CODECAPI_AVEncCommonMaxBitRate,
+                        (u64::from(bitrate) * u64::from(percent) / 100).min(u64::from(u32::MAX)) as u32,
+                    )?;
+                    burst.peak_percent = Some(percent);
+                }
+                _ => set_u32(&codec, &CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_CBR.0 as u32)?,
+            }
             set_u32(&codec, &CODECAPI_AVEncCommonMeanBitRate, bitrate)?;
-            // Explicit periodic force-IDR below also covers drivers without a GOP size control.
+            burst.apply(&codec, bitrate, fps, settings, false);
             if supports(&codec, &CODECAPI_AVEncMPVGOPSize)? {
-                set_u32(&codec, &CODECAPI_AVEncMPVGOPSize, GOP_FRAMES as u32)?;
+                // With intra refresh, no keyframe unless asked for: an hour's worth of frames.
+                // Without, one every GOP_SECONDS. Drivers that cap the length get the longest of
+                // these they take; 600 frames is what Connect asked for before 0.9.
+                let wanted = if burst.intra_refresh_frames.is_some() { fps * 3600 } else { fps * GOP_SECONDS };
+                [wanted, 60_000, 600]
+                    .into_iter()
+                    .filter(|&gop| gop <= wanted)
+                    .find(|&gop| set_u32(&codec, &CODECAPI_AVEncMPVGOPSize, gop).is_ok())
+                    .context("hardware encoder refuses every keyframe interval")?;
             }
             let (mut inputs, mut outputs) = (0, 0);
             transform.GetStreamCount(&mut inputs, &mut outputs)?;
@@ -297,6 +358,13 @@ impl HardwareEncoder {
             input.SetUINT32(&MF_MT_SAMPLE_SIZE, width * height * 3 / 2)?;
             input.SetUINT32(&MF_MT_FIXED_SIZE_SAMPLES, 1)?;
             transform.SetInputType(input_id, &input, 0).context("setting hardware NV12 input type")?;
+            // Some drivers take settings only once the stream's format is known.
+            if settings.intra_refresh && burst.intra_refresh_frames.is_none() {
+                burst.apply(&codec, bitrate, fps, settings, true);
+                if burst.intra_refresh_frames.is_some() {
+                    let _ = set_u32(&codec, &CODECAPI_AVEncMPVGOPSize, fps * 3600);
+                }
+            }
             // Verify the negotiated profile, as it is our guarantee when a driver omits B control.
             let actual = transform.GetOutputCurrentType(output_id)?;
             ensure!(
@@ -306,7 +374,7 @@ impl HardwareEncoder {
             );
             transform.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)?;
             transform.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)?;
-            Ok((transform, codec, events, input_id, output_id))
+            Ok((transform, codec, events, input_id, output_id, burst))
         }
     }
 
@@ -336,7 +404,7 @@ impl HardwareEncoder {
                 pause(waiting);
             }
         }
-        let keyframe_requested = force_keyframe || self.frames.is_multiple_of(GOP_FRAMES);
+        let keyframe_requested = force_keyframe;
         if keyframe_requested {
             set_u32(&self.codec, &CODECAPI_AVEncVideoForceKeyFrame, 1).context("requesting hardware IDR frame")?;
         }
@@ -539,7 +607,14 @@ impl VideoEncoder for HardwareEncoder {
         if self.manager.is_some() { InputKind::Texture } else { InputKind::Picture(Layout::Nv12) }
     }
 
+    fn intra_refresh(&self) -> bool {
+        self.burst.intra_refresh_frames.is_some()
+    }
+
     /// Changes the target bitrate for the frames that follow, if the driver allows it mid-stream.
+    /// The buffer cap stays as it was set at the start (for the starting bitrate, the highest):
+    /// changing it mid-stream may make a driver start over with a keyframe, the very burst it's
+    /// there to prevent.
     fn set_bitrate(&mut self, _from: u32, to: u32) {
         if self.fixed_bitrate {
             return;
@@ -561,6 +636,254 @@ impl VideoEncoder for HardwareEncoder {
             })
             .collect())
     }
+}
+
+/// How the encoder is asked to keep frame sizes in check. Sessions use [`Self::from_env`];
+/// `gpu-check` tries several, to measure what each actually does on the driver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EncoderSettings {
+    /// Peak-constrained VBR, its peak this percentage of the mean bitrate, instead of CBR.
+    pub peak_percent: Option<u32>,
+    /// The encoder's buffer (HRD/VBV) in frames at the target bitrate; `None` leaves the
+    /// driver's default. A setting, not a limit: drivers needn't keep every frame within it.
+    pub buffer_frames: Option<u32>,
+    /// The finest quantizer the encoder may use: a floor on how many bits one frame can take.
+    pub min_qp: Option<u32>,
+    /// Whether to ask for intra refresh.
+    pub intra_refresh: bool,
+}
+
+impl EncoderSettings {
+    /// Sessions' settings: CBR, a two-frame buffer and intra refresh, unless
+    /// `CONNECT_FRAME_BUFFER` (frames; 0 = the driver's default), `CONNECT_MIN_QP`,
+    /// `CONNECT_PEAK_PERCENT` or `CONNECT_INTRA_REFRESH=0` say otherwise.
+    pub fn from_env() -> Self {
+        let number = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<u32>().ok());
+        Self {
+            peak_percent: number("CONNECT_PEAK_PERCENT").filter(|&p| p >= 100),
+            buffer_frames: match number("CONNECT_FRAME_BUFFER") {
+                Some(0) => None,
+                Some(frames) => Some(frames),
+                None => Some(BUFFER_FRAMES),
+            },
+            min_qp: number("CONNECT_MIN_QP").filter(|&qp| qp <= 51),
+            intra_refresh: std::env::var("CONNECT_INTRA_REFRESH").map_or(true, |v| v.trim() != "0"),
+        }
+    }
+}
+
+/// What the driver took of the settings that keep frames from coming in bursts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct BurstControls {
+    /// Frames over which intra refresh renews the whole picture, if it's on.
+    pub intra_refresh_frames: Option<u32>,
+    /// The encoder's buffer setting in frames and bytes, if it took one.
+    pub buffer_frames: Option<u32>,
+    pub buffer_bytes: Option<u32>,
+    pub min_qp: Option<u32>,
+    pub peak_percent: Option<u32>,
+}
+
+impl BurstControls {
+    /// Sets what the driver offers of `settings`; anything it refuses is left at its default.
+    /// Runs before the media types are set, and again after (`after_types`) for intra refresh,
+    /// which some drivers only take then.
+    fn apply(&mut self, codec: &ICodecAPI, bitrate: u32, fps: u32, settings: &EncoderSettings, after_types: bool) {
+        if settings.intra_refresh && supports(codec, &CODECAPI_AVEncVideoGradualIntraRefresh).unwrap_or(false) {
+            let (frames, tried) = try_intra_refresh(codec, fps);
+            if frames.is_none() {
+                tracing::info!(after_types, tried = %tried, "hardware encoder took no intra refresh setting");
+            }
+            self.intra_refresh_frames = frames;
+        }
+        if after_types {
+            return;
+        }
+        if let Some(frames) = settings.buffer_frames
+            && supports(codec, &CODECAPI_AVEncCommonBufferSize).unwrap_or(false)
+        {
+            let bytes = buffer_bytes(bitrate, fps, frames);
+            match set_u32(codec, &CODECAPI_AVEncCommonBufferSize, bytes) {
+                Ok(()) => {
+                    self.buffer_frames = Some(frames);
+                    self.buffer_bytes = Some(read_u32(codec, &CODECAPI_AVEncCommonBufferSize).unwrap_or(bytes));
+                }
+                Err(error) => tracing::info!("hardware encoder refused a buffer setting: {error:#}"),
+            }
+        }
+        if let Some(qp) = settings.min_qp
+            && supports(codec, &CODECAPI_AVEncVideoMinQP).unwrap_or(false)
+            && set_u32(codec, &CODECAPI_AVEncVideoMinQP, qp).is_ok()
+        {
+            self.min_qp = Some(qp);
+        }
+    }
+}
+
+/// Sets intra refresh to the half second's worth of frames wanted, within the range the driver
+/// reports if it reports one, else trying shorter waves. The frames set, and what was tried.
+fn try_intra_refresh(codec: &ICodecAPI, fps: u32) -> (Option<u32>, String) {
+    let wanted = intra_refresh_frames(fps);
+    let mut candidates = match parameter_range(codec, &CODECAPI_AVEncVideoGradualIntraRefresh) {
+        Some((min, max, step)) if max >= min && max > 0 => {
+            let step = step.max(1);
+            let clamped = wanted.clamp(min.max(1), max);
+            vec![min.max(1) + (clamped - min.max(1)) / step * step]
+        }
+        _ => Vec::new(),
+    };
+    candidates.extend([wanted, fps / 4, 30, 16, 8, 4, 2, 1]);
+    candidates.retain(|&frames| frames > 0);
+    candidates.dedup();
+    let mut tried = Vec::new();
+    for frames in candidates {
+        match set_u32(codec, &CODECAPI_AVEncVideoGradualIntraRefresh, frames) {
+            Ok(()) => {
+                let frames = read_u32(codec, &CODECAPI_AVEncVideoGradualIntraRefresh).unwrap_or(frames);
+                return ((frames > 0).then_some(frames), tried.join(", "));
+            }
+            Err(_) => tried.push(frames.to_string()),
+        }
+    }
+    (None, tried.join(", "))
+}
+
+/// The range a driver reports for a numeric setting: lowest, highest and step.
+fn parameter_range(codec: &ICodecAPI, key: &GUID) -> Option<(u32, u32, u32)> {
+    let (mut min, mut max, mut step) = (VARIANT::default(), VARIANT::default(), VARIANT::default());
+    unsafe { codec.GetParameterRange(key, &mut min, &mut max, &mut step) }.ok()?;
+    Some((u32::try_from(&min).ok()?, u32::try_from(&max).ok()?, u32::try_from(&step).unwrap_or(1)))
+}
+
+impl std::fmt::Display for BurstControls {
+    /// For the encoder's name as the viewer sees it, e.g. "intra refresh · buffer 83 KB". The
+    /// buffer is the encoder's setting, not a limit every frame keeps to.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.intra_refresh_frames.is_some() { "intra refresh" } else { "keyframes" })?;
+        if let Some(percent) = self.peak_percent {
+            write!(f, " · peak VBR {percent}%")?;
+        }
+        match self.buffer_bytes {
+            Some(bytes) => write!(f, " · buffer {} KB", bytes.div_ceil(1000))?,
+            None => f.write_str(" · driver's buffer")?,
+        }
+        if let Some(qp) = self.min_qp {
+            write!(f, " · min QP {qp}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Describes what a hardware `codec` encoder offers of the settings that shape frame sizes and
+/// keyframes, and which values it takes: for `gpu-check`, so supported configurations come from
+/// the driver rather than guesses.
+pub(crate) fn probe_controls(codec: Codec, width: u32, height: u32, bitrate: u32, fps: u32) -> Result<Vec<String>> {
+    let _runtime = Runtime::new()?;
+    let activation = hardware_encoders(subtype(codec))?.into_iter().next().context("no hardware encoder")?;
+    let mut lines = Vec::new();
+    unsafe {
+        let transform: IMFTransform = activation.0.ActivateObject().context("activating hardware MFT")?;
+        let api: ICodecAPI = transform.cast().context("no codec controls")?;
+        let _ = set_value(&api, &CODECAPI_AVLowLatencyMode, &VARIANT::from(true));
+        let _ = set_u32(&api, &CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_CBR.0 as u32);
+        let _ = set_u32(&api, &CODECAPI_AVEncCommonMeanBitRate, bitrate);
+        let controls: [(&str, &GUID); 12] = [
+            ("GradualIntraRefresh", &CODECAPI_AVEncVideoGradualIntraRefresh),
+            ("CommonBufferSize", &CODECAPI_AVEncCommonBufferSize),
+            ("CommonMaxBitRate", &CODECAPI_AVEncCommonMaxBitRate),
+            ("CommonRateControlMode", &CODECAPI_AVEncCommonRateControlMode),
+            ("VideoMinQP", &CODECAPI_AVEncVideoMinQP),
+            ("VideoMaxQP", &CODECAPI_AVEncVideoMaxQP),
+            ("CommonQualityVsSpeed", &CODECAPI_AVEncCommonQualityVsSpeed),
+            ("MPVGOPSize", &CODECAPI_AVEncMPVGOPSize),
+            ("VideoNumGOPsPerIDR", &CODECAPI_AVEncVideoNumGOPsPerIDR),
+            ("VideoLTRBufferControl", &CODECAPI_AVEncVideoLTRBufferControl),
+            ("SliceControlMode", &CODECAPI_AVEncSliceControlMode),
+            ("VideoEncodeFrameTypeQP", &CODECAPI_AVEncVideoEncodeFrameTypeQP),
+        ];
+        for (name, key) in controls {
+            lines.push(format!("{name}: {}", describe(&api, key)));
+        }
+        let (frames, tried) = try_intra_refresh(&api, fps);
+        lines.push(format!(
+            "Intra refresh before the stream format: {}",
+            frames.map_or(format!("refused every value tried ({tried})"), |f| format!(
+                "took {f} frames (refused: {tried})"
+            ))
+        ));
+        // Again once the stream's format is set, as some drivers only take it then.
+        let (mut input_ids, mut output_ids) = ([0], [0]);
+        let _ = transform.GetStreamIDs(&mut input_ids, &mut output_ids);
+        let output = video_type(width, height, fps, subtype(codec))?;
+        output.SetUINT32(&MF_MT_AVG_BITRATE, bitrate)?;
+        if transform.SetOutputType(output_ids[0], &output, 0).is_ok() {
+            let input = video_type(width, height, fps, &MFVideoFormat_NV12)?;
+            let _ = transform.SetInputType(input_ids[0], &input, 0);
+            let (frames, tried) = try_intra_refresh(&api, fps);
+            lines.push(format!(
+                "Intra refresh after the stream format: {}",
+                frames.map_or(format!("refused every value tried ({tried})"), |f| format!(
+                    "took {f} frames (refused: {tried})"
+                ))
+            ));
+            lines.push(format!(
+                "GradualIntraRefresh after the stream format: {}",
+                describe(&api, &CODECAPI_AVEncVideoGradualIntraRefresh)
+            ));
+        }
+    }
+    Ok(lines)
+}
+
+/// Whether the driver offers a setting, and what it says about its values.
+fn describe(api: &ICodecAPI, key: &GUID) -> String {
+    match supports(api, key) {
+        Ok(true) => {}
+        Ok(false) => return "not offered".into(),
+        Err(error) => return format!("can't tell ({error:#})"),
+    }
+    let mut parts = Vec::new();
+    let modifiable = unsafe { api.IsModifiable(key) };
+    parts.push(if modifiable == S_OK { "modifiable".to_owned() } else { format!("not modifiable ({modifiable})") });
+    if let Ok(value) = unsafe { api.GetDefaultValue(key) } {
+        parts.push(format!("default {value}"));
+    }
+    if let Ok(value) = unsafe { api.GetValue(key) } {
+        parts.push(format!("now {value}"));
+    }
+    let (mut min, mut max, mut step) = (VARIANT::default(), VARIANT::default(), VARIANT::default());
+    if unsafe { api.GetParameterRange(key, &mut min, &mut max, &mut step) }.is_ok() {
+        parts.push(format!("range {min}..{max} step {step}"));
+    }
+    let (mut values, mut count) = (std::ptr::null_mut(), 0u32);
+    if unsafe { api.GetParameterValues(key, &mut values, &mut count) }.is_ok() && !values.is_null() {
+        // SAFETY: the driver handed over `count` VARIANTs in memory from CoTaskMemAlloc.
+        unsafe {
+            let list = std::slice::from_raw_parts_mut(values, count as usize);
+            parts.push(format!("values [{}]", list.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")));
+            for value in list.iter_mut() {
+                std::ptr::drop_in_place(value);
+            }
+            CoTaskMemFree(Some(values.cast()));
+        }
+    }
+    parts.join(", ")
+}
+
+/// Frames for one intra refresh wave at `fps`.
+pub(crate) fn intra_refresh_frames(fps: u32) -> u32 {
+    (INTRA_REFRESH.as_millis() as u32 * fps / 1000).max(8)
+}
+
+/// `frames` frames' worth of bytes at `bitrate` (bits per second) and `fps`.
+pub(crate) fn buffer_bytes(bitrate: u32, fps: u32, frames: u32) -> u32 {
+    (u64::from(bitrate) / 8 * u64::from(frames) / u64::from(fps.max(1))).clamp(1, u64::from(u32::MAX)) as u32
+}
+
+/// A codec property's value, if the driver reports it.
+fn read_u32(codec: &ICodecAPI, key: &GUID) -> Option<u32> {
+    let value = unsafe { codec.GetValue(key) }.ok()?;
+    u32::try_from(&value).ok()
 }
 
 /// A Media Foundation device manager sharing `device` with encoders.

@@ -2,7 +2,7 @@
 
 #[cfg(windows)]
 pub(crate) mod dxgi;
-mod test_pattern;
+pub(crate) mod test_pattern;
 
 use std::time::{Duration, Instant};
 
@@ -16,6 +16,10 @@ pub enum VideoSource {
     Screen,
     /// A generated moving pattern, for testing without a display.
     TestPattern { width: u32, height: u32, fps: u32 },
+    /// The test pattern with a band of random-coloured blocks across the middle, new every
+    /// frame: the video uses all the bitrate it's given, as a busy game does. For testing how the
+    /// stream copes with a path slower than that.
+    NoisyTestPattern { width: u32, height: u32, fps: u32 },
 }
 
 impl VideoSource {
@@ -32,7 +36,10 @@ impl VideoSource {
             #[cfg(not(windows))]
             VideoSource::Screen => anyhow::bail!("screen capture is only supported on Windows hosts"),
             VideoSource::TestPattern { width, height, fps } => {
-                Ok(Box::new(test_pattern::TestPattern::new(width, height, fps)))
+                Ok(Box::new(test_pattern::TestPattern::new(width, height, fps, false)))
+            }
+            VideoSource::NoisyTestPattern { width, height, fps } => {
+                Ok(Box::new(test_pattern::TestPattern::new(width, height, fps, true)))
             }
         }
     }
@@ -53,6 +60,9 @@ pub(crate) struct CaptureTiming {
     pub acquired: Instant,
     /// From the image reaching the screen to capture getting it, where the source knows.
     pub present_to_capture: Option<Duration>,
+    /// Images that reached the screen since the last capture, where the source knows: over 1
+    /// means capture came late and some were never seen.
+    pub accumulated: Option<u32>,
 }
 
 pub(crate) trait Capturer {

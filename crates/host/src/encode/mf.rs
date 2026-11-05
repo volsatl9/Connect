@@ -43,6 +43,9 @@ const INTRA_REFRESH: Duration = Duration::from_millis(500);
 /// the usual frame, which take tens of milliseconds to get through the network. Override with
 /// `CONNECT_FRAME_BUFFER=<frames>`; 0 leaves the driver's default.
 const BUFFER_FRAMES: u32 = 2;
+/// Those frames at no more than this rate: a game under the screen's refresh has bigger frames to
+/// fit, which the bitrate is raised to allow (`encode::FrameRateScale`).
+const BUFFER_FPS: u32 = 120;
 /// Without intra refresh, the encoder's own keyframe interval, as a time; the video thread
 /// forces one this often too (`encode::KEYFRAME_PERIOD`).
 const GOP_SECONDS: u32 = 30;
@@ -87,6 +90,11 @@ pub(crate) struct HardwareEncoder {
     last_timestamp: Option<i64>,
     /// Whether the driver has already turned down a bitrate change, so it isn't asked again.
     fixed_bitrate: bool,
+    /// The bitrate it started on, and the most it may be asked for once it turned down more.
+    start_bitrate: u32,
+    most_bitrate: u32,
+    /// How long the last frame waited for the encoder to ask for it.
+    input_wait_us: u32,
     burst: BurstControls,
     video_codec: Codec,
     bitstream: Bitstream,
@@ -223,6 +231,9 @@ impl HardwareEncoder {
                         frames: 0,
                         last_timestamp: None,
                         fixed_bitrate: false,
+                        start_bitrate: bitrate_bps,
+                        most_bitrate: u32::MAX,
+                        input_wait_us: 0,
                         burst,
                         video_codec: codec,
                         bitstream: Bitstream::new(codec),
@@ -404,6 +415,7 @@ impl HardwareEncoder {
                 pause(waiting);
             }
         }
+        self.input_wait_us = waiting.elapsed().as_micros().min(u128::from(u32::MAX)) as u32;
         let keyframe_requested = force_keyframe;
         if keyframe_requested {
             set_u32(&self.codec, &CODECAPI_AVEncVideoForceKeyFrame, 1).context("requesting hardware IDR frame")?;
@@ -619,10 +631,22 @@ impl VideoEncoder for HardwareEncoder {
         if self.fixed_bitrate {
             return;
         }
-        if let Err(error) = set_u32(&self.codec, &CODECAPI_AVEncCommonMeanBitRate, to) {
+        let to = to.min(self.most_bitrate);
+        let mut result = set_u32(&self.codec, &CODECAPI_AVEncCommonMeanBitRate, to);
+        // More than it started on may be over a limit of the driver's: lower ones can still go.
+        if result.is_err() && to > self.start_bitrate {
+            tracing::info!(to, "hardware encoder takes no more than its starting bitrate");
+            self.most_bitrate = self.start_bitrate;
+            result = set_u32(&self.codec, &CODECAPI_AVEncCommonMeanBitRate, self.start_bitrate);
+        }
+        if let Err(error) = result {
             tracing::info!("hardware encoder keeps its bitrate: {error:#}");
             self.fixed_bitrate = true;
         }
+    }
+
+    fn input_wait_us(&self) -> u32 {
+        self.input_wait_us
     }
 
     fn encode(&mut self, input: Input<'_>, capture_time_us: u64, force_keyframe: bool) -> Result<Vec<Encoded>> {
@@ -702,7 +726,7 @@ impl BurstControls {
         if let Some(frames) = settings.buffer_frames
             && supports(codec, &CODECAPI_AVEncCommonBufferSize).unwrap_or(false)
         {
-            let bytes = buffer_bytes(bitrate, fps, frames);
+            let bytes = buffer_bytes(bitrate, fps.min(BUFFER_FPS), frames);
             match set_u32(codec, &CODECAPI_AVEncCommonBufferSize, bytes) {
                 Ok(()) => {
                     self.buffer_frames = Some(frames);

@@ -1,5 +1,9 @@
 # Connect
 
+Version 0.10.5 sends the bitrate you set when a game runs under the screen's refresh rate, settles
+under a slow upload instead of overfilling it every few seconds, and records more about the encoder
+stall that keeps 60 Hz time.
+
 Version 0.10.4 stops a crash on connecting, seen on an RTX 5060 PC, and no longer lowers the bitrate
 for a short rise in the round trip.
 

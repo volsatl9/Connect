@@ -24,6 +24,7 @@
 //! would only cost picture, so the bitrate holds and the recovery data takes it from there.
 
 use std::{
+    collections::VecDeque,
     sync::{
         Arc,
         atomic::{AtomicU32, Ordering},
@@ -68,6 +69,13 @@ const CREEP: f64 = 1.0025;
 /// sent, and taking that for the path cut 80 Mb/s to the floor at a backlog with nothing lost.
 const TESTED_SHARE: f64 = 0.5;
 const TESTED_FOR: Duration = Duration::from_secs(2);
+/// So has video that stays near the estimate for as long, however far under the bitrate: on an
+/// upload slower than half the bitrate, the video never reaches that share.
+const STEADY_TICKS: usize = 8;
+/// How long to stay under the ceiling after raising the bitrate into trouble, doubling each time
+/// up to the most: trying is how a better path is found, and on an upload already full each try
+/// is a burst of delay.
+const MOST_RETRY_WAIT: Duration = Duration::from_secs(120);
 /// How far over its value at the ceiling the estimate has to be for the path to count as better.
 const BETTER_PATH: f64 = 1.25;
 /// After this long without trouble, the ceiling follows the estimate however little it moved.
@@ -143,12 +151,16 @@ pub(crate) struct RateControl {
     calm_since: Instant,
     /// When the video last used less than [`TESTED_SHARE`] of the bitrate.
     quiet_at: Option<Instant>,
+    /// The video's rate over the last [`STEADY_TICKS`] ticks.
+    recent_video: VecDeque<f64>,
     /// Roughly what the path carried when it last proved too slow, and when.
     ceiling: Option<(u32, Instant)>,
     /// The bandwidth estimate then.
     estimate_at_ceiling: u64,
     /// The smoothed loss at the last cut made for it, until the loss falls.
     loss_at_cut: Option<f32>,
+    /// How long to keep under the ceiling before trying over it again.
+    retry_wait: Duration,
     /// Whether to keep a ceiling and count the viewer's losses: off with `CONNECT_RATE_CEILING=0`,
     /// to compare with 0.9.0's controller.
     learn: bool,
@@ -172,9 +184,11 @@ impl RateControl {
             started: now,
             calm_since: now,
             quiet_at: None,
+            recent_video: VecDeque::with_capacity(STEADY_TICKS + 1),
             ceiling: None,
             estimate_at_ceiling: 0,
             loss_at_cut: None,
+            retry_wait: CALM_BEFORE_RAISE,
             learn: std::env::var("CONNECT_RATE_CEILING").map_or(true, |v| v.trim() != "0"),
             reason: Reason::Steady,
         }
@@ -234,7 +248,16 @@ impl RateControl {
         if path.video_bytes > 0 && video_bps < f64::from(before) * TESTED_SHARE {
             self.quiet_at = Some(now);
         }
-        let tested = self.quiet_at.is_none_or(|at| now.duration_since(at) >= TESTED_FOR);
+        if path.video_bytes > 0 {
+            self.recent_video.push_back(video_bps);
+            if self.recent_video.len() > STEADY_TICKS {
+                self.recent_video.pop_front();
+            }
+        }
+        let steady = self.recent_video.len() == STEADY_TICKS
+            && self.recent_video.iter().all(|&bps| bps >= video_bps * TESTED_SHARE)
+            && path.bandwidth_estimate.is_some_and(|estimate| video_bps >= estimate as f64 * TESTED_SHARE);
+        let tested = steady || self.quiet_at.is_none_or(|at| now.duration_since(at) >= TESTED_FOR);
         let losing = sent >= MIN_SAMPLE_PACKETS && lost > 0 && sample > LOSS_SOME;
         let filling = !self.learn
             || (losing && self.losing)
@@ -256,7 +279,10 @@ impl RateControl {
         } else {
             None
         };
-        if self.ceiling.is_some_and(|(_, at)| now.duration_since(at) >= FORGET_CEILING) {
+        // A ceiling hit again stays: over it, only creeping, as a climb would overshoot.
+        if self.retry_wait == CALM_BEFORE_RAISE
+            && self.ceiling.is_some_and(|(_, at)| now.duration_since(at) >= FORGET_CEILING)
+        {
             self.ceiling = None;
         }
         // The path measures faster than when it last gave out: it has got better.
@@ -264,6 +290,9 @@ impl RateControl {
             && (estimate as f64 > self.estimate_at_ceiling as f64 * BETTER_PATH
                 || now.duration_since(self.calm_since) >= FOLLOW_ESTIMATE_AFTER)
         {
+            if estimate as f64 > self.estimate_at_ceiling as f64 * BETTER_PATH {
+                self.retry_wait = CALM_BEFORE_RAISE;
+            }
             self.ceiling = Some((ceiling.max(clamp(estimate as f64 * VIDEO_SHARE)), at));
         }
         let (after, reason) = if let Some((factor, reason)) = congested {
@@ -281,6 +310,9 @@ impl RateControl {
             if !self.learn {
                 return self.settle(before, clamp(f64::from(before) * factor), reason);
             }
+            if matches!(self.reason, Reason::Climb | Reason::Creep) {
+                self.retry_wait = (self.retry_wait * 2).min(MOST_RETRY_WAIT);
+            }
             self.ceiling = Some((ceiling, now));
             self.estimate_at_ceiling = path.bandwidth_estimate.unwrap_or(u64::MAX);
             if reason == Reason::ViewerLoss && self.loss >= LOSS_NOTICED {
@@ -292,7 +324,10 @@ impl RateControl {
             (before, Reason::LossHeld)
         } else if now.duration_since(self.calm_since) >= CALM_BEFORE_RAISE && before < self.max_bps {
             match self.ceiling.map(|(ceiling, _)| clamp(f64::from(ceiling) * FAST_UNTIL)) {
-                Some(creep_from) if before >= creep_from => (clamp(f64::from(before) * CREEP), Reason::Creep),
+                Some(creep_from) if before >= creep_from => {
+                    let waited = now.duration_since(self.calm_since) >= self.retry_wait;
+                    if waited { (clamp(f64::from(before) * CREEP), Reason::Creep) } else { (before, Reason::Steady) }
+                }
                 Some(creep_from) => {
                     let up = clamp(f64::from(before) * 1.05).max(before.saturating_add(250_000).min(self.max_bps));
                     (up.min(creep_from).max(before), Reason::Climb)
@@ -360,6 +395,41 @@ mod tests {
             quiet(&mut rate, tick, 0, 2_000, 36_000_000);
         }
         assert_eq!(rate.bitrate(), 80_000_000);
+    }
+
+    /// As from the Ethernet upload of a PC hosting: it carries 38 Mb/s and the game would send 60,
+    /// so video is steady at what the upload takes, under half of the 80 Mb/s allowed.
+    #[test]
+    fn steady_video_finds_a_slow_upload() {
+        let mut rate = RateControl::new(80_000_000);
+        let start = rate.started;
+        let (capacity, game, seconds) = (38e6, 60e6, TICK.as_secs_f64());
+        let (mut queued_bits, mut video, mut sent) = (0.0f64, 0u64, 0u64);
+        let (mut cuts, mut worst_queue, mut bitrate_sum) = (0, 0.0f64, 0.0);
+        for tick in 1..=1200u32 {
+            let made = f64::from(rate.bitrate()).min(game);
+            let going = (queued_bits + made * seconds).min(capacity * seconds);
+            queued_bits = (queued_bits + made * seconds - going).max(0.0);
+            video += (going / 8.0) as u64;
+            sent += (going / 8.0 / 1200.0) as u64;
+            let path = PathSample {
+                sent_packets: sent,
+                video_bytes: video,
+                queued_bytes: (queued_bits / 8.0) as usize,
+                bandwidth_estimate: Some(40_000_000),
+                ..Default::default()
+            };
+            rate.update(start + TICK * tick, path);
+            if tick > 80 {
+                cuts += usize::from(rate.reason() == Reason::Backlog);
+                worst_queue = worst_queue.max(queued_bits / capacity * 1000.0);
+                bitrate_sum += f64::from(rate.bitrate());
+            }
+        }
+        let mbps = bitrate_sum / 1120.0 / 1e6;
+        println!("{mbps:.0} Mb/s, {cuts} cuts after the first 20 s, queue up to {worst_queue:.0} ms");
+        assert!((28.0..38.0).contains(&mbps), "{mbps:.0} Mb/s");
+        assert!(worst_queue < 60.0 && cuts <= 8, "{cuts} cuts, {worst_queue:.0} ms");
     }
 
     /// As in a session on Wi-Fi: video queued, nothing going out, for three seconds.

@@ -510,6 +510,36 @@ at the median and 13 ms at p99, against 2.8 and 5.3 for video coming the other w
 same session on Linux, with the same video and 360 inputs a second, added 1.2 ms at the median and
 2.2 at p99. So the rest is the viewer's upload or something on Windows; which isn't known.
 
+## Version 0.10.5: the bitrate you set, on the upload you have
+
+0.10.4 ran both ways between two PCs 43 ms apart, with no crashes. Kellu hosting: 99.8% of frames on
+time, p95 29.4 ms. The 3070 Ti PC hosting: 72.9%, p95 129.1 ms, with the round trip going from 44
+to about 110 ms every 4-8 s.
+
+- **Output was the target times the frame rate over 240.** Hardware encoders budget a frame as the
+  bitrate over the rate they were told, which is the screen's: 80 Mb/s came to 33 at 103 fps and 47
+  at 145. The encoder is now told more, by up to 3 times, from the frame rate measured
+  every 500 ms. If the driver refuses more than it started on, it stays at that. The encoder's
+  buffer is two frames at no more than 120 fps, so those frames fit. At 240 fps that lets a scene
+  cut reach about 166 KB at 80 Mb/s, up from 84.
+- **A slow upload was never learned.** That PC's upload carries about 35-40 Mb/s, under half of
+  80, so each backlog counted as a burst after quiet video: one step down, no ceiling, and straight
+  back up. Video that has been steady for 2 s and is at least half the estimate now tests the path,
+  whatever the bitrate.
+- **A ceiling hit again stays.** The wait before trying over it doubles, from 2 s up to 120 s, and
+  only creeping goes past it. A better estimate starts the wait over.
+
+In a model of a 38 Mb/s upload under a game wanting 60, the bitrate settles at 33 Mb/s, with 5 cuts
+in 280 s and at most 36 ms queued. The real path test (40 Mb/s falling to 10 and back) matches
+0.10.4, within its spread between runs: 21 lost, worst window 186 ms, against 19 and 173. Its CPU
+encoder ignores low targets, so it can't show the new behaviour. None of this has run on NVENC.
+
+The input delay is that PC's upload: 6.8 ms over its fastest at the median from there, 1.7 ms from
+Kellu, same app. The 60 Hz stall ran for all of the 3070 Ti PC's session, even at 6% graphics load,
+so it isn't a heavy game. It's still unexplained. `host-*-frames.csv` now splits the wait for the
+encoder to take a picture from the wait for it to come out, and the session file lists the displays
+in use with their refresh rates.
+
 ## Build requirement
 
 OpenH264 silently builds its C++ fallback if NASM is unavailable; install NASM so the codec

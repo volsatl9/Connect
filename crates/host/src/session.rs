@@ -503,6 +503,7 @@ fn send_frame(
             capture_us: meta.capture_us,
             held_us: stamp.held_us,
             encode_us: meta.encode_time_us,
+            encoder_input_wait_us: stamp.input_wait_us,
             queue_us: micros(started.saturating_duration_since(stamp.encoded)),
             packetize_us: micros(packetized - started),
             send_us: micros(packetized.elapsed()),

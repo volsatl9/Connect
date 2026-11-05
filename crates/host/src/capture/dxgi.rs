@@ -33,6 +33,40 @@ use windows::{
 
 use super::{CaptureTiming, Capturer, Frame};
 
+/// `\\.\DISPLAY1 1920x1080 240 Hz; …`, for each display in use.
+pub(crate) fn displays() -> String {
+    use windows::{
+        Win32::Graphics::Gdi::{
+            DEVMODEW, DISPLAY_DEVICE_ACTIVE, DISPLAY_DEVICEW, ENUM_CURRENT_SETTINGS, EnumDisplayDevicesW,
+            EnumDisplaySettingsW,
+        },
+        core::PCWSTR,
+    };
+    let mut found = Vec::new();
+    for index in 0.. {
+        let mut device = DISPLAY_DEVICEW { cb: size_of::<DISPLAY_DEVICEW>() as u32, ..Default::default() };
+        if !unsafe { EnumDisplayDevicesW(PCWSTR::null(), index, &mut device, 0) }.as_bool() {
+            break;
+        }
+        if !device.StateFlags.contains(DISPLAY_DEVICE_ACTIVE) {
+            continue;
+        }
+        let mut mode = DEVMODEW { dmSize: size_of::<DEVMODEW>() as u16, ..Default::default() };
+        let name = PCWSTR(device.DeviceName.as_ptr());
+        if unsafe { EnumDisplaySettingsW(name, ENUM_CURRENT_SETTINGS, &mut mode) }.as_bool() {
+            let length = device.DeviceName.iter().position(|&c| c == 0).unwrap_or(device.DeviceName.len());
+            found.push(format!(
+                "{} {}x{} {} Hz",
+                String::from_utf16_lossy(&device.DeviceName[..length]),
+                mode.dmPelsWidth,
+                mode.dmPelsHeight,
+                mode.dmDisplayFrequency
+            ));
+        }
+    }
+    found.join("; ")
+}
+
 pub(crate) struct DxgiCapturer {
     device: ID3D11Device,
     context: ID3D11DeviceContext,

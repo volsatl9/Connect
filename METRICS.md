@@ -148,6 +148,8 @@ files streamed as the session goes. Empty cells mean "not measured". All times a
   `send_us`, `sent_after_us`
 - `datagrams`, `recovery_datagrams`, `queued_bytes`, `bitrate_kbps`
 - `dropped`: 1 if the path's datagram size shrank and the frame was dropped
+- `encoder_input_wait_us`: of `encode_us`, the wait for a hardware encoder to ask for the picture;
+  the rest is the wait for the frame to come out (since 0.10.5)
 
 **`host-*-convert.csv`**: `capture_index`, `convert_gpu_us`. Join to frames on `capture_index`;
 captures replaced before encoding have no frame.
@@ -166,8 +168,8 @@ captures replaced before encoding have no frame.
 `gpu_graphics_percent`, `gpu_encode_percent`. A stall that lines up with a full graphics card came
 from the load.
 
-**`host-*-session.csv`**: `key,value` rows: version, session stamp, frames recorded, and records
-missed or dropped.
+**`host-*-session.csv`**: `key,value` rows: version, session stamp, frames recorded, records missed
+or dropped, and on Windows the displays in use with their refresh rates (`displays`, since 0.10.5).
 
 **`host-*-network.csv`**, every 250 ms (since 0.9.1):
 - `time_us`

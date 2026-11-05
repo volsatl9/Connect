@@ -869,7 +869,7 @@ dependencies = [
 
 [[package]]
 name = "connect"
-version = "0.10.4"
+version = "0.10.5"
 dependencies = [
  "anyhow",
  "connect-client",
@@ -898,7 +898,7 @@ dependencies = [
 
 [[package]]
 name = "connect-client"
-version = "0.10.4"
+version = "0.10.5"
 dependencies = [
  "anyhow",
  "connect-gpu-load",
@@ -917,7 +917,7 @@ dependencies = [
 
 [[package]]
 name = "connect-gpu-load"
-version = "0.10.4"
+version = "0.10.5"
 dependencies = [
  "serde",
  "windows",
@@ -925,7 +925,7 @@ dependencies = [
 
 [[package]]
 name = "connect-host"
-version = "0.10.4"
+version = "0.10.5"
 dependencies = [
  "anyhow",
  "bytes",
@@ -947,7 +947,7 @@ dependencies = [
 
 [[package]]
 name = "connect-net"
-version = "0.10.4"
+version = "0.10.5"
 dependencies = [
  "anyhow",
  "connect-proto",
@@ -961,7 +961,7 @@ dependencies = [
 
 [[package]]
 name = "connect-perf"
-version = "0.10.4"
+version = "0.10.5"
 dependencies = [
  "serde",
  "windows",
@@ -969,7 +969,7 @@ dependencies = [
 
 [[package]]
 name = "connect-proto"
-version = "0.10.4"
+version = "0.10.5"
 dependencies = [
  "anyhow",
  "bytes",

@@ -34,6 +34,8 @@ pub(crate) struct FrameRecord {
     /// Staged until the encoder started on it.
     pub held_us: u32,
     pub encode_us: u32,
+    /// Of `encode_us`, the wait for the encoder to take the picture.
+    pub encoder_input_wait_us: u32,
     /// From the encoder finishing to the session starting to send it.
     pub queue_us: u32,
     pub packetize_us: u32,
@@ -53,7 +55,7 @@ pub(crate) struct FrameRecord {
 impl CsvRecord for FrameRecord {
     const HEADER: &'static str = "seq,keyframe,codec,resent,capture_index,bytes,capture_time_us,present_to_capture_us,\
 capture_us,held_us,encode_us,queue_us,packetize_us,send_us,sent_after_us,datagrams,recovery_datagrams,\
-queued_bytes,bitrate_kbps,dropped";
+queued_bytes,bitrate_kbps,dropped,encoder_input_wait_us";
 
     fn write_row(&self, out: &mut String) {
         let _ = write!(
@@ -70,7 +72,7 @@ queued_bytes,bitrate_kbps,dropped";
         cell(out, (self.present_to_capture_us > 0).then_some(self.present_to_capture_us));
         let _ = write!(
             out,
-            "{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{}",
             self.capture_us,
             self.held_us,
             self.encode_us,
@@ -82,7 +84,8 @@ queued_bytes,bitrate_kbps,dropped";
             self.recovery,
             self.queued_bytes,
             self.bitrate_kbps,
-            self.dropped as u8
+            self.dropped as u8,
+            self.encoder_input_wait_us
         );
     }
 }
@@ -388,6 +391,7 @@ impl HostTrace {
                     connect_perf::SessionRow("frames_recorded", trace.frames.written().to_string()),
                     connect_perf::SessionRow("records_overrun", overrun.to_string()),
                     connect_perf::SessionRow("records_dropped_busy", trace.dropped().to_string()),
+                    connect_perf::SessionRow("displays", crate::capture::displays()),
                 ];
                 if let Err(error) = connect_perf::write_csv(&session_file, &session) {
                     tracing::warn!("couldn't write the performance trace: {error}");

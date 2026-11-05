@@ -8,6 +8,15 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
+/// The displays Windows has on, with their refresh rates, for the session's record: one at 60 Hz
+/// that nobody remembers would account for an encoder keeping 60 Hz time.
+pub(crate) fn displays() -> String {
+    #[cfg(windows)]
+    return dxgi::displays();
+    #[cfg(not(windows))]
+    String::new()
+}
+
 /// Where the host's video comes from.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum VideoSource {

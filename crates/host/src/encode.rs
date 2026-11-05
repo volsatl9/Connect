@@ -69,6 +69,8 @@ pub(crate) struct FrameStamp {
     pub resent: bool,
     /// From the picture being staged to the encoder starting on it.
     pub held_us: u32,
+    /// Of the encode, the wait for the encoder to take the picture.
+    pub input_wait_us: u32,
     /// When the encoder handed the frame over.
     pub encoded: Instant,
 }
@@ -201,6 +203,11 @@ pub(crate) trait VideoEncoder {
     /// Changes the target bitrate for the frames that follow, where the encoder allows it.
     fn set_bitrate(&mut self, from: u32, to: u32);
 
+    /// How long the last frame waited for the encoder to take it, where that's known.
+    fn input_wait_us(&self) -> u32 {
+        0
+    }
+
     /// Whether the encoder renews the picture band by band (intra refresh), so it never needs a
     /// keyframe unless the viewer asks for one.
     fn intra_refresh(&self) -> bool {
@@ -330,6 +337,52 @@ struct Pipeline {
     encoder: Box<dyn VideoEncoder>,
 }
 
+/// Hardware encoders budget a frame as the bitrate over the frame rate they were told, which is
+/// the screen's: a game drawing fewer frames sends that much less. 80 Mb/s came to 33 at 103 fps
+/// on a 240 Hz screen. So the encoder is told more, by what's missing of the frame rate.
+struct FrameRateScale {
+    since: Instant,
+    frames: u32,
+    scale: f64,
+}
+
+/// How often the frame rate is measured.
+const FRAME_RATE_PERIOD: Duration = Duration::from_millis(500);
+/// Fewer frames than this a second is a still screen, not the game's frame rate.
+const LEAST_MEASURED_FPS: f64 = 30.0;
+/// At most this much over the bitrate: enough for 80 fps on a 240 Hz screen.
+const MOST_SCALE: f64 = 3.0;
+/// A smaller change isn't worth telling the encoder about.
+const SCALE_STEP: f64 = 0.05;
+
+impl FrameRateScale {
+    fn new() -> Self {
+        Self { since: Instant::now(), frames: 0, scale: 1.0 }
+    }
+
+    /// Counts a frame encoded at `now`, for an encoder told `fps`.
+    fn frame(&mut self, now: Instant, fps: u32) {
+        self.frames += 1;
+        let elapsed = now.saturating_duration_since(self.since);
+        if elapsed < FRAME_RATE_PERIOD {
+            return;
+        }
+        let measured = f64::from(self.frames) / elapsed.as_secs_f64();
+        (self.since, self.frames) = (now, 0);
+        if measured >= LEAST_MEASURED_FPS {
+            let scale = (f64::from(fps) / measured).clamp(1.0, MOST_SCALE);
+            if (scale - self.scale).abs() >= self.scale * SCALE_STEP {
+                self.scale = scale;
+            }
+        }
+    }
+
+    /// What to tell an encoder to get `bitrate`.
+    fn apply(&self, bitrate: u32) -> u32 {
+        (f64::from(bitrate) * self.scale).min(f64::from(u32::MAX)) as u32
+    }
+}
+
 /// The pictures a second to aim for: the screen's refresh, or the limit if there's one below it.
 fn capped_fps(refresh: u32, limit: u32) -> u32 {
     if limit == 0 { refresh } else { refresh.min(limit) }
@@ -350,6 +403,7 @@ fn run(
     let mut failed: Vec<Codec> = Vec::new();
     let mut pipeline: Option<Pipeline> = None;
     let mut bitrate = control.bitrate.load(Ordering::Relaxed);
+    let mut frame_rate = FrameRateScale::new();
     // Whether the staged picture is newer than the last one sent. The last picture is kept
     // so a keyframe can be sent while the screen is static, and so a picture held back while
     // the network catches up can be sent once it has.
@@ -432,6 +486,7 @@ fn run(
             // The session switched codec: a new encoder, which starts with a keyframe.
             let (w, h) = active.stage.size();
             let stage = std::mem::replace(&mut active.stage, Stage::Memory(Picture::new(Layout::I420, 2, 2)));
+            bitrate = control.bitrate.load(Ordering::Relaxed);
             let rebuilt = rebuild(stage, source, codec, w, h, bitrate, fps)?;
             *active = rebuilt;
             if active.encoder.codec() != codec {
@@ -461,6 +516,7 @@ fn run(
         sent_time_us = capture_time_us;
 
         let wanted = control.bitrate.load(Ordering::Relaxed);
+        let wanted = if active.encoder.hardware() { frame_rate.apply(wanted) } else { wanted };
         if wanted != bitrate {
             active.encoder.set_bitrate(bitrate, wanted);
             bitrate = wanted;
@@ -478,6 +534,7 @@ fn run(
                 failed.push(codec);
                 let (w, h) = active.stage.size();
                 let stage = std::mem::replace(&mut active.stage, Stage::Memory(Picture::new(Layout::I420, 2, 2)));
+                bitrate = control.bitrate.load(Ordering::Relaxed);
                 *active = rebuild(stage, source, Codec::H264, w, h, bitrate, fps)?;
                 if !send(VideoEvent::Encoder { name: active.encoder.name().to_owned(), codec: Codec::H264 }) {
                     return Ok(());
@@ -489,6 +546,7 @@ fn run(
                 tracing::warn!("{} failed; recovering on the processor: {error:#}", active.encoder.name());
                 gpu = false;
                 let stage = std::mem::replace(&mut active.stage, Stage::Memory(Picture::new(Layout::I420, 2, 2)));
+                bitrate = control.bitrate.load(Ordering::Relaxed);
                 let encoder = open_software_encoder(Codec::H264, bitrate, fps)?;
                 active.stage = Stage::Memory(stage.into_memory(Layout::I420)?);
                 active.encoder = encoder;
@@ -500,6 +558,7 @@ fn run(
             Err(error) => return Err(error.context("encoding frame")),
         };
         let encoded_at = Instant::now();
+        frame_rate.frame(encoded_at, fps);
         if encoded.iter().any(|picture| picture.keyframe) {
             last_keyframe = encoded_at;
         }
@@ -507,6 +566,7 @@ fn run(
         let stamp = FrameStamp {
             capture: picture_index,
             resent,
+            input_wait_us: active.encoder.input_wait_us(),
             held_us: if resent { 0 } else { micros(started.saturating_duration_since(picture_staged)) },
             encoded: encoded_at,
         };
@@ -659,6 +719,42 @@ fn capture(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_frame_rate_under_the_screens_is_made_up_for() {
+        let mut scale = FrameRateScale::new();
+        let start = scale.since;
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        // 103 fps on a 240 Hz screen: 80 Mb/s has to be asked for as 186 to come to 80.
+        for frame in 1..=52u64 {
+            scale.frame(at(frame * 1000 / 103), 240);
+        }
+        assert_eq!(scale.apply(80_000_000) / 1_000_000, 186);
+        // A small wander isn't passed on.
+        (scale.since, scale.frames) = (at(1000), 0);
+        for frame in 1..=50u64 {
+            scale.frame(at(1000 + frame * 1000 / 100), 240);
+        }
+        assert_eq!(scale.apply(80_000_000) / 1_000_000, 186);
+    }
+
+    #[test]
+    fn a_still_screen_says_nothing_and_the_scale_has_a_limit() {
+        let mut scale = FrameRateScale::new();
+        let start = scale.since;
+        scale.frame(start + Duration::from_secs(5), 240);
+        assert_eq!(scale.apply(80_000_000), 80_000_000);
+        (scale.since, scale.frames) = (start, 0);
+        for frame in 1..=20u64 {
+            scale.frame(start + Duration::from_millis(frame * 25), 240);
+        }
+        assert_eq!(scale.apply(80_000_000), 240_000_000);
+        (scale.since, scale.frames) = (start, 0);
+        for frame in 1..=200u64 {
+            scale.frame(start + Duration::from_micros(frame * 2500), 240);
+        }
+        assert_eq!(scale.apply(80_000_000), 80_000_000);
+    }
 
     #[test]
     fn a_limit_only_ever_lowers_the_frame_rate() {

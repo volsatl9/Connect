@@ -1,5 +1,9 @@
 # Connect
 
+Version 0.10.3 gives way when Wi-Fi delay builds up, holds the bitrate through a dropout, starts
+sessions without a freeze, adds a Super button and error codes, and tells a viewer when a window
+running as administrator is in the way.
+
 Version 0.10.2 keeps fast networks like Wi-Fi from stalling after a quiet scene, sends fewer
 controller updates, and adds a frame rate limit to Settings.
 
@@ -9,6 +13,19 @@ Wayland.
 
 Version 0.10.0 adds a Gamepad page for changing what your controller's buttons do, per-device
 permissions, a window with its own title bar, an app image, a Windows installer and Linux packages.
+
+## Why a connection was refused
+
+| Code | Meaning |
+|---|---|
+| C-101 | The two PCs run incompatible versions |
+| C-102 | The two PCs have no video format in common |
+| C-103 | That PC can't host: hosting needs Windows |
+| C-104 | The host has sharing turned off |
+| C-105 | The host is in a session with someone else |
+| C-106 | The host declined |
+| C-107 | The host didn't answer in time |
+| C-108 | The host couldn't capture its screen |
 
 ## Install
 
@@ -113,8 +130,10 @@ remove it under Windows *Installed apps* ("ViGEm Bus Driver").
 The host's own mouse and keyboard always win: while the host is using one, the remote user's
 input on it pauses (and anything they held is released) until a second after the host stops.
 
-Windows won't let a normal program control one running as administrator, so to control such
-programs, run Connect as administrator on the host.
+Windows won't let a normal program control one running as administrator. If one comes to the
+front during a session, Connect tells the viewer and tries to move it behind the window that was
+there, and it doesn't pass on Ctrl+Shift+Esc, which opens Task Manager. To control such programs,
+run Connect as administrator on the host.
 
 ## While connected
 

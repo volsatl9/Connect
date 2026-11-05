@@ -14,7 +14,8 @@
 //! `replaying_a_session` sends a real session's frames, sizes and timing from a host trace
 //! (`REPLAY_FRAMES=host-…-frames.csv`, `REPLAY_FROM` and `REPLAY_TO` in seconds), over the same
 //! kind of path with room to spare (`REPLAY_MBPS`), optionally scaled (`REPLAY_SCALE`). Synthetic traffic doesn't make BBR forget the path; a game
-//! does. `CONNECT_PATH_MEMORY=0` shows plain BBR. `REPLAY_DELAY_MS` sets the delay each way.
+//! does. `CONNECT_PATH_MEMORY=0` shows plain BBR. `REPLAY_DELAY_MS` sets the delay each way,
+//! `REPLAY_IDLE_MS` the wait between connecting and the first frame.
 //!
 //! Both can wander the path's delay (`PATH_JITTER_MS`) and lose packets whatever is being sent
 //! (`PATH_LOSS_PERCENT`, from `PATH_LOSS_FROM` to `PATH_LOSS_TO` seconds in).
@@ -323,6 +324,8 @@ async fn replaying_a_session() {
         }
     });
 
+    // As while the host is asked to allow the connection.
+    tokio::time::sleep(Duration::from_millis(env("REPLAY_IDLE_MS", 0))).await;
     let started = Instant::now();
     let mut sent_at = Vec::with_capacity(frames.len());
     let (mut lowest_estimate, mut lowest_window, mut checked) = (u64::MAX, u64::MAX, 0);

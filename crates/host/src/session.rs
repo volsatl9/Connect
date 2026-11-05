@@ -41,13 +41,16 @@ const REJECT_LINGER: Duration = Duration::from_secs(3);
 /// How long a finished session may take to release the remote user's input.
 const INPUT_RELEASE: Duration = Duration::from_secs(2);
 
-const DECLINED: &str = "The host declined the connection.";
-const NO_ANSWER: &str = "The host didn't answer in time.";
-const BUSY: &str = "The host is in another session right now.";
-const NOT_ACCEPTING: &str = "The host isn't accepting connections right now.";
-const NO_CAPTURE: &str = "The host couldn't capture its screen.";
-const NO_COMMON_CODEC: &str = "The two PCs have no video format in common. Update both to the same version of Connect.";
-const CANNOT_HOST: &str = "That PC can't be shared: hosting needs Windows. It can still connect to others.";
+// Why a connection was turned away. The codes are listed in the README.
+const DECLINED: &str = "The host declined the connection. (Code C-106)";
+const NO_ANSWER: &str = "The host didn't answer in time. (Code C-107)";
+const BUSY: &str = "The host is in another session right now. (Code C-105)";
+const NOT_ACCEPTING: &str = "The host isn't accepting connections right now. (Code C-104)";
+const NO_CAPTURE: &str = "The host couldn't capture its screen. (Code C-108)";
+const NO_COMMON_CODEC: &str =
+    "The two PCs have no video format in common. Update both to the same version of Connect. (Code C-102)";
+const CANNOT_HOST: &str =
+    "That PC can't be shared: hosting needs Windows. It can still connect to others. (Code C-103)";
 
 pub(crate) async fn run(incoming: Incoming, shared: Arc<Shared>, events: mpsc::Sender<HostEvent>) {
     let conn = match incoming.accept() {
@@ -74,7 +77,7 @@ async fn serve(conn: &Connection, shared: &Shared, events: &mpsc::Sender<HostEve
     if version != PROTOCOL_VERSION {
         let reason = format!(
             "The host runs a different version of Connect (protocol {PROTOCOL_VERSION}, yours is {version}). \
-             Update both PCs to the same version."
+             Update both PCs to the same version. (Code C-101)"
         );
         return reject(conn, &mut send, &reason).await;
     }
@@ -339,6 +342,7 @@ async fn stream(
                     bandwidth_estimate: path.and_then(|p| p.bandwidth_estimate),
                     recovery_requests,
                     video_bytes,
+                    rtt: path.map(|p| p.rtt),
                 };
                 if let Some(bps) = rate.update(Instant::now(), sample) {
                     debug!(mbps = bps as f32 / 1e6, loss = rate.loss(), queued, reason = rate.reason().name(), "video bitrate changed");

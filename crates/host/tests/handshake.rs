@@ -82,7 +82,7 @@ async fn deny_rejects_with_reason() {
     assert_eq!(next(&mut client_events).await, ClientEvent::Stage(Stage::WaitingForApproval));
     req.respond(Decision::Deny);
 
-    assert_eq!(ended(&mut client_events).await, EndReason::Rejected("The host declined the connection.".into()));
+    assert_eq!(ended(&mut client_events).await, EndReason::Rejected("The host declined the connection. (Code C-106)".into()));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -92,7 +92,7 @@ async fn unanswered_request_times_out() {
     let (_client_ep, _client, mut client_events) = start_client(&host_ep).await;
 
     let req = request(&mut host_events).await;
-    assert_eq!(ended(&mut client_events).await, EndReason::Rejected("The host didn't answer in time.".into()));
+    assert_eq!(ended(&mut client_events).await, EndReason::Rejected("The host didn't answer in time. (Code C-107)".into()));
     assert!(!req.is_pending(), "the prompt can tell it expired");
 }
 
@@ -199,7 +199,7 @@ async fn second_client_is_told_host_is_busy() {
     let (_second_ep, _second, mut second_events) = start_client(&host_ep).await;
     assert_eq!(
         ended(&mut second_events).await,
-        EndReason::Rejected("The host is in another session right now.".into())
+        EndReason::Rejected("The host is in another session right now. (Code C-105)".into())
     );
 
     host.disconnect();
@@ -213,7 +213,7 @@ async fn not_accepting_turns_everyone_away() {
     let (_client_ep, _client, mut client_events) = start_client(&host_ep).await;
     assert_eq!(
         ended(&mut client_events).await,
-        EndReason::Rejected("The host isn't accepting connections right now.".into())
+        EndReason::Rejected("The host isn't accepting connections right now. (Code C-104)".into())
     );
 }
 

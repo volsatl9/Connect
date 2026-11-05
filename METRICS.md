@@ -179,7 +179,7 @@ missed or dropped.
 - `recovery_requests`: keyframe requests from the viewer since the last row, each a loss
 - `bitrate_kbps`, `ceiling_kbps`, `reason`: the encoder's target after this tick, the ceiling the
   rate controller keeps under, and why it changed (`steady`, `backlog`, `loss`, `viewer_loss`,
-  `climb`, `creep`, `loss_held`: the viewer lost frames, but the last cut did nothing for
+  `climb`, `creep`, `delay`: the round trip stayed well past its best, `loss_held`: the viewer lost frames, but the last cut did nothing for
   the loss, so the bitrate holds)
 - `video_bytes`: video handed to the network since the last row
 - `local_mouse_moves`, `local_mouse_pixels`, `local_mouse_tagged`, `local_mouse_buttons`,

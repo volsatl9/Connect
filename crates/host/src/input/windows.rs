@@ -28,11 +28,15 @@ use tracing::{debug, info, warn};
 use vigem_client::{Client, TargetId, XButtons, XGamepad, Xbox360Wired};
 use windows::{
     Win32::{
-        Foundation::{CloseHandle, ERROR_CANCELLED, HINSTANCE, LPARAM, LRESULT, WPARAM},
+        Foundation::{CloseHandle, ERROR_CANCELLED, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM},
+        Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation},
         System::{
             LibraryLoader::GetModuleHandleW,
             SystemInformation::GetTickCount64,
-            Threading::{GetCurrentThreadId, GetExitCodeProcess, WaitForSingleObject},
+            Threading::{
+                GetCurrentProcess, GetCurrentThreadId, GetExitCodeProcess, OpenProcess, OpenProcessToken,
+                PROCESS_QUERY_LIMITED_INFORMATION, WaitForSingleObject,
+            },
         },
         UI::{
             Input::KeyboardAndMouse::{
@@ -44,17 +48,18 @@ use windows::{
             },
             Shell::{SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW},
             WindowsAndMessaging::{
-                CallNextHookEx, GetMessageW, HC_ACTION, KBDLLHOOKSTRUCT, LLKHF_INJECTED, LLKHF_LOWER_IL_INJECTED,
-                LLMHF_INJECTED, LLMHF_LOWER_IL_INJECTED, MSG, MSLLHOOKSTRUCT, PM_NOREMOVE, PeekMessageW,
-                PostThreadMessageW, SW_HIDE, SetWindowsHookExW, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL,
-                WM_KEYDOWN, WM_MOUSEMOVE, WM_QUIT, WM_SYSKEYDOWN, WM_USER,
+                CallNextHookEx, GetForegroundWindow, GetMessageW, GetWindowThreadProcessId, HC_ACTION, KBDLLHOOKSTRUCT,
+                LLKHF_INJECTED, LLKHF_LOWER_IL_INJECTED, LLMHF_INJECTED, LLMHF_LOWER_IL_INJECTED, MSG, MSLLHOOKSTRUCT,
+                PM_NOREMOVE, PeekMessageW, PostThreadMessageW, SW_HIDE, SetForegroundWindow, SetWindowsHookExW,
+                SwitchToThisWindow, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_MOUSEMOVE,
+                WM_QUIT, WM_SYSKEYDOWN, WM_USER,
             },
         },
     },
     core::{HRESULT, PCWSTR, w},
 };
 
-use super::{GAMEPAD_DRIVER_URL, Held, Unavailable};
+use super::{GAMEPAD_DRIVER_URL, Held, Unavailable, keeps_input_out};
 use crate::trace::{HostTrace, InputOutcome, InputStamp};
 
 const XBUTTON1: u32 = 1;
@@ -66,6 +71,15 @@ const HOST_PRIORITY_MS: u64 = 1000;
 const POLL: Duration = Duration::from_millis(15);
 /// Least time between "the host is using it" notes to the remote user, per device.
 const NOTICE_EVERY: Duration = Duration::from_secs(10);
+
+/// How often the window in front is looked at while remote input arrives.
+const WINDOW_CHECK_EVERY: Duration = Duration::from_millis(250);
+/// Time for Windows to bring a window to the front before checking it did.
+const WINDOW_SWITCH: Duration = Duration::from_millis(50);
+const TASK_MANAGER_NOTICE: &str = "Task Manager runs as administrator on the host, so Connect doesn't open it.";
+const ADMIN_MOVED_NOTICE: &str =
+    "A program running as administrator opened on the host. Connect moved it behind so you can carry on.";
+const ADMIN_STUCK_NOTICE: &str = "The window in front on the host is running as administrator, so your input can't reach it. Ask the host to close it.";
 
 /// The ViGEmBus installer, built into the app so gamepads need no separate download.
 static DRIVER_INSTALLER: &[u8] = include_bytes!("../../vendor/vigembus/ViGEmBus_1.22.0_x64_x86_arm64.exe");
@@ -147,6 +161,7 @@ pub(super) fn run(
     let mut host_using = [false; 2];
     let mut last_notice: [Option<Instant>; 2] = [None; 2];
     let mut blocked_reported = false;
+    let mut windows = FrontWindow::new();
 
     loop {
         let event = match events.recv_timeout(POLL) {
@@ -191,9 +206,18 @@ pub(super) fn run(
                 if host_has_it && !is_release(&other) {
                     trace.host_priority_drops.fetch_add(1, Ordering::Relaxed);
                     InputOutcome::HostPriority
+                } else if !windows.reaches_admin && held.opens_task_manager(&other) {
+                    let device = other.device();
+                    let _ = unavailable.send(Unavailable { device, reason: TASK_MANAGER_NOTICE.into() });
+                    InputOutcome::Refused
                 } else {
                     held.note(&other);
-                    if send(other) {
+                    let device = other.device();
+                    let injected = send(other);
+                    if let Some(reason) = windows.check(!injected, host_has_it) {
+                        let _ = unavailable.send(Unavailable { device, reason: reason.into() });
+                    }
+                    if injected {
                         InputOutcome::Injected
                     } else {
                         if !blocked_reported {
@@ -213,6 +237,93 @@ pub(super) fn run(
 }
 
 /// Key and button releases always go through, so nothing can stay stuck down.
+/// Keeps the viewer from getting stuck behind a program running as administrator, which Windows
+/// won't let a normal program send input to. Such a window can't be closed from here, but it can
+/// be left behind another one, once, so the host never has to step in for the viewer.
+struct FrontWindow {
+    /// Connect is running as administrator itself, so input reaches everything.
+    reaches_admin: bool,
+    checked: Option<Instant>,
+    /// The last window in front that input could reach.
+    usable: Option<isize>,
+    /// The window last dealt with, so it's left alone if it comes back to the front.
+    dealt_with: Option<isize>,
+}
+
+impl FrontWindow {
+    fn new() -> Self {
+        let reaches_admin = token_elevated(unsafe { GetCurrentProcess() }).unwrap_or(false);
+        Self { reaches_admin, checked: None, usable: None, dealt_with: None }
+    }
+
+    /// Looks at the window in front after an input, `refused` or not. What to tell the viewer.
+    fn check(&mut self, refused: bool, host_busy: bool) -> Option<&'static str> {
+        if self.reaches_admin || self.checked.is_some_and(|at| at.elapsed() < WINDOW_CHECK_EVERY) {
+            return None;
+        }
+        self.checked = Some(Instant::now());
+        let front = unsafe { GetForegroundWindow() };
+        if front.is_invalid() {
+            return None;
+        }
+        if !keeps_input_out(window_elevated(front), refused) {
+            self.usable = Some(front.0 as isize);
+            self.dealt_with = None;
+            return None;
+        }
+        if self.dealt_with == Some(front.0 as isize) {
+            return None;
+        }
+        self.dealt_with = Some(front.0 as isize);
+        // The host may have opened it to use it themselves.
+        let moved = !host_busy && self.usable.is_some_and(bring_to_front);
+        Some(if moved { ADMIN_MOVED_NOTICE } else { ADMIN_STUCK_NOTICE })
+    }
+}
+
+fn bring_to_front(window: isize) -> bool {
+    let window = HWND(window as _);
+    unsafe {
+        if !SetForegroundWindow(window).as_bool() {
+            SwitchToThisWindow(window, true);
+        }
+        std::thread::sleep(WINDOW_SWITCH);
+        GetForegroundWindow() == window
+    }
+}
+
+/// Whether `window`'s program runs as administrator; `None` if Windows won't say.
+fn window_elevated(window: HWND) -> Option<bool> {
+    let mut process_id = 0;
+    unsafe { GetWindowThreadProcessId(window, Some(&mut process_id)) };
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id) }.ok()?;
+    let elevated = token_elevated(process);
+    unsafe {
+        let _ = CloseHandle(process);
+    }
+    elevated
+}
+
+fn token_elevated(process: HANDLE) -> Option<bool> {
+    let mut token = HANDLE::default();
+    unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) }.ok()?;
+    let mut elevation = TOKEN_ELEVATION::default();
+    let mut size = 0;
+    let read = unsafe {
+        GetTokenInformation(
+            token,
+            TokenElevation,
+            Some((&raw mut elevation).cast()),
+            size_of::<TOKEN_ELEVATION>() as u32,
+            &mut size,
+        )
+    };
+    unsafe {
+        let _ = CloseHandle(token);
+    }
+    read.ok().map(|()| elevation.TokenIsElevated != 0)
+}
+
 fn is_release(event: &InputEvent) -> bool {
     matches!(event, InputEvent::Key { down: false, .. } | InputEvent::MouseButton { down: false, .. })
 }

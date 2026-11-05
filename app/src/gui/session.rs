@@ -5,13 +5,14 @@ use super::{
     theme::{self, Glass},
 };
 use crate::stats_line;
-use connect_proto::DeviceClass;
+use connect_proto::{DeviceClass, input::InputEvent};
 use eframe::egui::{self, Color32, CursorGrab, Rect, RichText, Sense, TextureOptions, ViewportCommand};
 use std::time::{Duration, Instant};
 
 const SHELF_WIDTH: f32 = 180.0;
-const SHELF_HEIGHT: f32 = 362.0;
+const SHELF_HEIGHT: f32 = 396.0;
 const RECENTRE_MARGIN: f32 = 80.0;
+const LEFT_WINDOWS_KEY: u16 = 0xE05B;
 /// An unmoved pointer is reported again this often; the host hides it after a second without.
 const POINTER_REPEAT: Duration = Duration::from_millis(250);
 
@@ -187,6 +188,13 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         shelf_button(&mut controls, icons::CURSOR_CLICK, "Capture mouse", permissions.allows(DeviceClass::Mouse))
             .on_hover_text("Ctrl+Alt+M releases the mouse")
             .clicked();
+    let super_key = shelf_button(&mut controls, icons::KEYBOARD, "Super", permissions.allows(DeviceClass::Keyboard))
+        .on_hover_text("Presses the host's Windows key")
+        .clicked();
+    if super_key {
+        client.handle.send_input(InputEvent::Key { scancode: LEFT_WINDOWS_KEY, down: true });
+        client.handle.send_input(InputEvent::Key { scancode: LEFT_WINDOWS_KEY, down: false });
+    }
     let (icon, label) =
         if client.audio_muted { (icons::SPEAKER_SLASH, "Unmute audio") } else { (icons::SPEAKER_HIGH, "Mute audio") };
     if shelf_button(&mut controls, icon, label, client.audio_active).clicked() {

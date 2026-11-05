@@ -194,6 +194,19 @@ impl Drop for Output {
     }
 }
 
+const ESCAPE: u16 = 0x01;
+const LEFT_CTRL: u16 = 0x1D;
+const RIGHT_CTRL: u16 = 0xE01D;
+const LEFT_SHIFT: u16 = 0x2A;
+const RIGHT_SHIFT: u16 = 0x36;
+
+/// Whether the window in front keeps remote input out, given what's known of its process
+/// (`None` when Windows wouldn't say, as with a game under anti-cheat) and if input just failed.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn keeps_input_out(elevated: Option<bool>, refused: bool) -> bool {
+    elevated.unwrap_or(refused)
+}
+
 /// What the client is holding down right now, as far as the host has acted on it.
 #[derive(Default)]
 pub(crate) struct Held {
@@ -204,6 +217,16 @@ pub(crate) struct Held {
 }
 
 impl Held {
+    /// Whether `event` would complete Ctrl+Shift+Esc: Task Manager, which runs as administrator
+    /// on most PCs and so can't be controlled once it's open.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(crate) fn opens_task_manager(&self, event: &InputEvent) -> bool {
+        let held = |left, right| self.keys.contains(&left) || self.keys.contains(&right);
+        matches!(*event, InputEvent::Key { scancode: ESCAPE, down: true })
+            && held(LEFT_CTRL, RIGHT_CTRL)
+            && held(LEFT_SHIFT, RIGHT_SHIFT)
+    }
+
     pub(crate) fn note(&mut self, event: &InputEvent) {
         match *event {
             InputEvent::Key { scancode, down } => toggle(&mut self.keys, scancode, down),
@@ -291,6 +314,26 @@ pub(crate) fn local_activity() -> LocalActivity {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_refused_or_admin_window_counts_as_keeping_input_out() {
+        assert!(keeps_input_out(Some(true), false));
+        assert!(!keeps_input_out(Some(false), true), "not what stopped it");
+        assert!(!keeps_input_out(None, false), "a protected game, taking input");
+        assert!(keeps_input_out(None, true));
+    }
+
+    #[test]
+    fn ctrl_shift_esc_is_task_manager() {
+        let mut held = Held::default();
+        let escape = key(ESCAPE, true);
+        assert!(!held.opens_task_manager(&escape));
+        held.note(&key(RIGHT_CTRL, true));
+        assert!(!held.opens_task_manager(&escape), "Ctrl+Esc is the Start menu");
+        held.note(&key(LEFT_SHIFT, true));
+        assert!(held.opens_task_manager(&escape));
+        assert!(!held.opens_task_manager(&key(ESCAPE, false)), "a release always goes through");
+    }
 
     fn key(scancode: u16, down: bool) -> InputEvent {
         InputEvent::Key { scancode, down }

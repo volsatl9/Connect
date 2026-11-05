@@ -469,6 +469,25 @@ worst window 166 ms against 154, and the target starts climbing about a second l
 Replay doesn't reproduce Wi-Fi's own stalls, and the frame rate limit changes nothing here. Both
 need a real session.
 
+## Version 0.10.3: when Wi-Fi gives out
+
+The first 0.10.2 session had the Wi-Fi link at its worst yet: 40-50 Mb/s at a round trip of 8-90 ms,
+against 75 Mb/s at 3.2 ms the session before, two dropouts and 2,923 packets lost. At 3-6 Mb/s the
+round trip was back to 3 ms, so the queue was in the link, which the sender can't see.
+
+- A round trip 1.5 times past its best and at least 15 ms over it, for two ticks, now cuts the
+  bitrate from what's actually being sent, by 15%, or 30% at 50 ms over it. It was never a signal
+  before: the target sat at 80 Mb/s for a minute of 30-200 ms round trips.
+- A tick that sent almost nothing with video waiting says nothing about the bitrate. A 3 s dropout
+  had cut 28 Mb/s to 2.
+- A path is taken to carry 20 Mb/s until it shows otherwise, and what's remembered lasts 30 minutes,
+  not 2. A session had started with an estimate of 0.01 Mb/s and taken 2 s to send its first picture.
+
+In a model of a 40 Mb/s link under a game wanting 55, the round trip settles at 4 ms on average and
+27 ms at worst, at 38 Mb/s. Replay can't show the rest: it doesn't reproduce the start-up stall, and
+the CPU encoder ignores targets that low. A real path falling from 40 to 10 Mb/s for 8 s lost 24
+frames against 26 in 0.10.2, with a worst window of 184 ms against 166.
+
 ## Build requirement
 
 OpenH264 silently builds its C++ fallback if NASM is unavailable; install NASM so the codec

@@ -29,8 +29,12 @@ use noq_proto::{
     congestion::{Bbr3Config, Controller, ControllerFactory, ControllerMetrics},
 };
 
-/// A rate not seen again for this long is forgotten: longer than a loading screen.
-const REMEMBER: Duration = Duration::from_secs(120);
+/// A rate not seen again for this long is forgotten: longer than a loading screen, and than most
+/// breaks from a game on an idle screen.
+const REMEMBER: Duration = Duration::from_secs(30 * 60);
+/// What a path is taken to carry, in bytes per second, until it says. A session's estimate starts
+/// from the handshake and the wait to be let in: at 0.01 Mb/s, the first picture took 2 s to go.
+const ASSUMED_RATE: u64 = 20_000_000 / 8;
 /// A round trip this far over the path's best means a queue is building somewhere.
 const RTT_INFLATED: f64 = 1.5;
 /// And this far, at least. On Wi-Fi at 2 ms, ordinary jitter is several times the best round trip:
@@ -52,7 +56,7 @@ pub(crate) struct PathMemory(pub Arc<Bbr3Config>);
 
 impl ControllerFactory for PathMemory {
     fn build(self: Arc<Self>, now: Instant, current_mtu: u16) -> Box<dyn Controller> {
-        Box::new(Remembering::new(self.0.clone().build(now, current_mtu)))
+        Box::new(Remembering::new(self.0.clone().build(now, current_mtu), now))
     }
 }
 
@@ -85,10 +89,10 @@ struct Remembering {
 }
 
 impl Remembering {
-    fn new(inner: Box<dyn Controller>) -> Self {
+    fn new(inner: Box<dyn Controller>, now: Instant) -> Self {
         Self {
             inner,
-            best: None,
+            best: Some(Best { rate: ASSUMED_RATE, at: now }),
             rtt: Duration::ZERO,
             min_rtt: Duration::ZERO,
             backed_off: None,
@@ -126,7 +130,7 @@ impl Remembering {
     /// Takes in the estimate after a batch of acknowledgements.
     fn observe(&mut self, now: Instant) {
         if self.best.is_some_and(|best| now.duration_since(best.at) >= REMEMBER) {
-            self.best = None;
+            self.best = Some(Best { rate: ASSUMED_RATE, at: now });
         }
         if let Some(rate) = self.inner.metrics().bandwidth_estimate.map(|bits| bits / 8)
             && self.best.is_none_or(|best| rate >= best.rate)
@@ -304,7 +308,7 @@ mod tests {
     /// 76 Mb/s measured over a 42 ms path, then BBR's estimate collapses as it did at Kellu.
     fn busy_then_quiet(start: Instant) -> Remembering {
         let inner = Scripted::new(76_000_000, 880_000, 9_500_000);
-        let mut controller = Remembering::new(Box::new(inner));
+        let mut controller = Remembering::new(Box::new(inner), start);
         (controller.rtt, controller.min_rtt) = (Duration::from_millis(43), Duration::from_millis(42));
         controller.observe(start);
         controller.inner = Box::new(Scripted::new(1_600_000, 30_000, 200_000));
@@ -325,7 +329,7 @@ mod tests {
     fn jitter_on_a_fast_path_doesnt_forget_it() {
         let start = Instant::now();
         let inner = Scripted::new(100_000_000, 200_000, 12_500_000);
-        let mut controller = Remembering::new(Box::new(inner));
+        let mut controller = Remembering::new(Box::new(inner), start);
         (controller.rtt, controller.min_rtt) = (Duration::from_millis(3), Duration::from_micros(1600));
         controller.observe(start);
         controller.inner = Box::new(Scripted::new(61_000, 30_000, 8_000));
@@ -340,7 +344,7 @@ mod tests {
     fn a_queue_on_a_fast_path_still_pushes_back() {
         let start = Instant::now();
         let inner = Scripted::new(100_000_000, 200_000, 12_500_000);
-        let mut controller = Remembering::new(Box::new(inner));
+        let mut controller = Remembering::new(Box::new(inner), start);
         (controller.rtt, controller.min_rtt) = (Duration::from_millis(3), Duration::from_micros(1600));
         controller.observe(start);
         controller.inner = Box::new(Scripted::new(61_000, 30_000, 8_000));
@@ -366,7 +370,7 @@ mod tests {
     fn leaves_bbr_alone_while_it_knows_the_path() {
         let start = Instant::now();
         let inner = Scripted::new(76_000_000, 880_000, 9_500_000);
-        let mut controller = Remembering::new(Box::new(inner));
+        let mut controller = Remembering::new(Box::new(inner), start);
         (controller.rtt, controller.min_rtt) = (Duration::from_millis(43), Duration::from_millis(42));
         controller.observe(start);
         controller.inner = Box::new(Scripted::new(76_000_000, 50_000, 9_500_000));
@@ -378,7 +382,7 @@ mod tests {
     fn losing(start: Instant, lost: u32) -> (Remembering, Arc<AtomicU32>) {
         let inner = Scripted::new(100_000_000, 1_100_000, 12_500_000);
         let undone = inner.undone.clone();
-        let mut controller = Remembering::new(Box::new(inner));
+        let mut controller = Remembering::new(Box::new(inner), start);
         (controller.rtt, controller.min_rtt) = (Duration::from_millis(44), Duration::from_millis(40));
         controller.observe(start);
         controller.acked(start, 2000 * 1200);
@@ -412,7 +416,7 @@ mod tests {
         let start = Instant::now();
         let inner = Scripted::new(100_000_000, 1_100_000, 12_500_000);
         let undone = inner.undone.clone();
-        let mut controller = Remembering::new(Box::new(inner));
+        let mut controller = Remembering::new(Box::new(inner), start);
         (controller.rtt, controller.min_rtt) = (Duration::from_millis(70), Duration::from_millis(40));
         controller.acked(start, 2000 * 1200);
         controller.on_packet_lost(1200, 1, start);
@@ -426,7 +430,7 @@ mod tests {
         let (controller, undone) = {
             let inner = Scripted::new(100_000_000, 1_100_000, 12_500_000);
             let undone = inner.undone.clone();
-            let mut controller = Remembering::new(Box::new(inner));
+            let mut controller = Remembering::new(Box::new(inner), start);
             controller.on_packet_lost(1200, 1, start);
             (controller, undone)
         };
@@ -472,7 +476,29 @@ mod tests {
         let start = Instant::now();
         let mut controller = busy_then_quiet(start);
         controller.observe(start + REMEMBER);
-        assert_eq!(controller.metrics().pacing_rate, Some(200_000));
-        assert_eq!(controller.window(), 30_000);
+        assert_eq!(controller.metrics().pacing_rate, Some(ASSUMED_RATE));
+        assert_eq!(controller.window(), 105_000, "one round trip at the assumed rate");
+    }
+
+    /// As a session starts: an estimate from the handshake and the wait to be let in.
+    #[test]
+    fn a_new_path_isnt_held_to_its_first_estimate() {
+        let start = Instant::now();
+        let inner = Scripted::new(10_000, 5_000, 1_250);
+        let controller = Remembering::new(Box::new(inner), start);
+        assert_eq!(controller.metrics().pacing_rate, Some(ASSUMED_RATE));
+    }
+
+    /// A slow path says so: what's assumed gives way like anything remembered.
+    #[test]
+    fn a_slow_path_soon_overrules_what_was_assumed() {
+        let start = Instant::now();
+        let inner = Scripted::new(4_000_000, 20_000, 500_000);
+        let mut controller = Remembering::new(Box::new(inner), start);
+        (controller.rtt, controller.min_rtt) = (Duration::from_millis(70), Duration::from_millis(40));
+        for ms in (0..1000).step_by(10) {
+            controller.observe(start + Duration::from_millis(ms));
+        }
+        assert_eq!(controller.metrics().pacing_rate, Some(500_000));
     }
 }

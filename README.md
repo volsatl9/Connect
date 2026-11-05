@@ -1,5 +1,140 @@
 # Connect
 
+Peer-to-peer game streaming and remote desktop, built on [iroh](https://iroh.computer). Share a
+Windows PC with anyone who has your User-ID, from anywhere: directly when possible, through a relay
+when not. Version 0.11.0 is a public test build.
+
+## What it does
+
+- **Online couch co-op.** Several people can connect to one PC at once, each with their own video
+  stream, controller and permissions. The host sets how many, 8 by default.
+- **You stay in control.** You allow or deny every connection, and choose who may use the mouse,
+  keyboard, controller and desktop audio. Manage on the This PC card shows who's connected, drops
+  anyone, and can turn off everyone's mouse, keyboard or all input at once.
+- **Fits each connection.** BBR congestion control and an adaptive bitrate follow each person's
+  connection, so a slow connection only slows that person. Choose Automatic or Manual, with a maximum
+  and minimum.
+- **Built for high frame rates.** Hardware H.265 or H.264 through Media Foundation on the host and
+  Vulkan Video on the viewer, keeping pictures on the graphics card from capture to screen, up to
+  the host screen's refresh rate (240 fps at most).
+- **Controllers built in.** The gamepad driver comes with the app, and a Gamepad page remaps buttons.
+- **Measures itself.** The overlay (Ctrl+Alt+S) shows bitrate, latency and where the time goes, and
+  session files follow every frame through both PCs. See [METRICS.md](METRICS.md).
+- **Updates itself** from GitHub Releases.
+
+Windows can host and connect. Linux can connect. NVIDIA is the only hardware encoder tested so far;
+AMD and Intel encoders are detected but untested. Hosting several people has only been tested with
+simulated connectors.
+
+## Measured
+
+A real session on 0.10.5, the latest measured: an RTX 5060 PC hosting a game for an RTX 3070 Ti PC
+in another state, both on Ethernet, with a 43.6 ms round trip.
+
+| | Result |
+|---|---|
+| Frames on time | 99.96% of 20,237 |
+| Frame rate | 145 fps |
+| Video | 72–80 Mb/s of 80 set, 0 packets lost |
+| Screen to viewer's window (estimated) | p50 27.8, p95 30.6, p99 31.9 ms |
+| Of that, the network | p50 20.9 ms |
+| Encoding, decoding | 2.5 ms, 1.1 ms |
+| Input sent to the first frame that could show it | p50 52.9, p95 58.6 ms |
+
+Those exclude the game's own delay, the mouse and the monitor. Results depend on the connection: on
+weak Wi-Fi or a slow upload, delay is much higher. A session hosted from a 35 Mb/s upload had 71% of
+frames on time on 0.10.5; 0.11.0 has a fix for that, not yet proven on real hardware.
+
+## Compared with Parsec
+
+There's no head-to-head test yet, so these aren't like for like. The Parsec figures come from
+[its own 240 fps test](https://parsec.app/blog/parsec-game-streaming-total-latency-at-240-frames-per-second-c0818cc0daa5),
+which was on a local network and which Parsec says isn't meant for real-world use.
+
+| | Connect | Parsec, as published |
+|---|---|---|
+| Test | Real game over the internet, 43.6 ms round trip | Local network, gigabit Ethernet, test pattern |
+| Hardware | RTX 5060 host, RTX 3070 Ti viewer | GTX 1070 host, GTX 1050 Ti viewer |
+| Frame rate | 145 fps measured | 240 fps in that test; Parsec says it only tests at 60 fps and doesn't recommend 240 |
+| Bitrate | 72–80 Mb/s | Up to 100 Mb/s |
+| Codec | H.265 | H.264 |
+| Delay | 27.8 ms in all, about 7 ms besides the network | 4–8 ms in all |
+| How it was measured | Software timing and a clock estimate | 1000 fps camera |
+
+## Recent versions
+
+Version 0.11.0 lets several people connect to one PC at once, each with their own stream, controller
+and permissions, and fits each stream's bitrate to its connection automatically.
+
+Version 0.10.5 sends the bitrate you set when a game runs under the screen's refresh rate, settles
+under a slow upload instead of overfilling it every few seconds, and records more about the encoder
+stall that keeps 60 Hz time.
+
+Version 0.10.4 stops a crash on connecting, seen on an RTX 5060 PC, and no longer lowers the bitrate
+for a short rise in the round trip.
+
+Version 0.10.3 holds the bitrate through a dropout, starts sessions without a freeze, adds a Super
+button and error codes, and tells a viewer when a window running as administrator is in the way.
+
+Version 0.10.2 keeps fast networks like Wi-Fi from stalling after a quiet scene, sends fewer
+controller updates, and adds a frame rate limit to Settings.
+
+Version 0.10.1 fixes Xbox controllers on Linux, sends the viewer's timing files to the host so one
+PC has both sides of a session, keeps a crash log, and stops waiting for the screen's refresh under
+Wayland.
+
+Version 0.10.0 adds a Gamepad page for changing what your controller's buttons do, per-device
+permissions, a window with its own title bar, an app image, a Windows installer and Linux packages.
+
+## Why a connection was refused
+
+| Code | Meaning |
+|---|---|
+| C-101 | The two PCs run incompatible versions |
+| C-102 | The two PCs have no video format in common |
+| C-103 | That PC can't host: hosting needs Windows |
+| C-104 | The host has sharing turned off |
+| C-105 | The host has as many people connected as it allows, or this PC is already connected |
+| C-106 | The host declined |
+| C-107 | The host didn't answer in time |
+| C-108 | The host couldn't capture its screen |
+| C-109 | The host's graphics card can't take another stream |
+
+## Install
+
+From the [latest release](https://github.com/volsatl9/Connect/releases):
+
+| System | Download |
+|---|---|
+| Windows | `Connect-Installer.exe` installs for your user, with no administrator rights. It isn't code-signed yet, so Windows may warn about an unknown publisher. |
+| Debian 13+, Ubuntu 24.04+ | `connect_<version>-1_amd64.deb` |
+| Fedora 40+ | `connect-<version>-1.x86_64.rpm` |
+| Arch | `connect-<version>-1-x86_64.pkg.tar.zst` |
+
+`connect.exe` and `connect-linux-x86_64` are the bare programs, which the in-app updater uses. A
+Linux program file can't carry an image, so use a package to get the menu entry and icon. Packaged
+copies update through their package manager, not the app. Linux builds need glibc 2.39 or newer.
+
+Version 0.9.4 holds the picture through small amounts of packet loss, brings the bitrate back
+within seconds of a path recovering, and aims to clear what was left of the latency spikes. See
+PERFORMANCE.md.
+
+Version 0.9.3 halves the latency spikes of up to 80 ms that came every few seconds under load.
+BBR halved the send rate to measure the round trip; it now keeps more of its window while it does.
+The median latency on a given path doesn't change.
+
+Version 0.9.2 keeps the bitrate through quiet scenes. Connect remembers what the path has carried
+when the congestion controller loses sight of it, cuts the bitrate only for a backlog that lasts,
+and recovers when the path does. Traces now stream to disk, so long sessions keep every frame, and
+`connect trace-report` follows each frame from one PC to the other. See PERFORMANCE.md for the
+trade-offs and what's still open.
+
+Version 0.9.0 keeps frames even. Hosts no longer send a full keyframe every 600 frames; where the
+graphics card's encoder offers it, the picture is renewed a band at a time (intra refresh). The
+encoder's buffer is set to about two frames: a setting, which drivers needn't hold to. The host's
+colour conversion now runs as two small shaders, whose GPU time shows in the stats. It works with
+0.8 viewers (protocol 8).
+
 Version 0.8.0 measures. Every frame is traced from the host's screen to the viewer's window,
 and every input event from the viewer to the host. The stats overlay (Ctrl+Alt+S) shows
 p50/p95/p99 latency, frame-time spread, dropped and repeated frames, and each PC's CPU and
@@ -47,8 +182,9 @@ checks on demand.
 
 The **Connect** page shows this PC and every computer you've connected to as cards:
 
-- **This PC** (Windows) has the **Sharing** switch, which lets people ask to connect. While
-  someone is connected it says so, and **Manage** changes what they may use or disconnects them.
+- **This PC** (Windows) has the **Sharing** switch, which lets people ask to connect. While anyone
+  is connected it says so, and **Manage** lists them, changes what each may use, drops them, and
+  shows how each session is going.
 - Each saved computer has its owner's name for it and a **Connect** button. A computer is saved
   the first time it lets you in, and its name follows the owner's if they rename it. Hover a card
   and click **✕** to remove it.
@@ -68,8 +204,10 @@ remove it under Windows *Installed apps* ("ViGEm Bus Driver").
 The host's own mouse and keyboard always win: while the host is using one, the remote user's
 input on it pauses (and anything they held is released) until a second after the host stops.
 
-Windows won't let a normal program control one running as administrator, so to control such
-programs, run Connect as administrator on the host.
+Windows won't let a normal program control one running as administrator. If one comes to the
+front during a session, Connect tells the viewer and tries to move it behind the window that was
+there, and it doesn't pass on Ctrl+Shift+Esc, which opens Task Manager. To control such programs,
+run Connect as administrator on the host.
 
 ## While connected
 
@@ -166,7 +304,7 @@ connect gpu-check                   check the graphics hardware for sharing and 
 `--test-pattern` shares a generated image (1280×720 at 60 fps, or e.g. `--test-pattern=1920x1080@144`)
 and `--print-input` prints the remote input instead of acting on it, both for development. On Windows the app has no console window, so start these as
 `start /wait connect.exe id` for the terminal to wait for them. `CONNECT_CONFIG_DIR` selects a separate identity, e.g. to run two
-copies on one PC. `CONNECT_GPU_PIPELINE=0` makes a host send frames through memory instead of
+copies on one PC. `CONNECT_PRESENT=vsync` or `novsync` chooses whether the window waits for the screen's refresh; under Wayland it doesn't by default. `CONNECT_GPU_PIPELINE=0` makes a host send frames through memory instead of
 keeping them on the graphics card, for comparison.
 
 ## Third-party components

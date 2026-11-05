@@ -1,5 +1,68 @@
 # Connect
 
+Peer-to-peer game streaming and remote desktop, built on [iroh](https://iroh.computer). Share a
+Windows PC with anyone who has your User-ID, from anywhere: directly when possible, through a relay
+when not. Version 0.11.0 is a public test build.
+
+## What it does
+
+- **Online couch co-op.** Several people can connect to one PC at once, each with their own video
+  stream, controller and permissions. The host sets how many, 8 by default.
+- **You stay in control.** You allow or deny every connection, and choose who may use the mouse,
+  keyboard, controller and desktop audio. Manage on the This PC card shows who's connected, drops
+  anyone, and can turn off everyone's mouse, keyboard or all input at once.
+- **Fits each connection.** BBR congestion control and an adaptive bitrate follow each person's
+  connection, so a slow connection only slows that person. Choose Automatic or Manual, with a maximum
+  and minimum.
+- **Built for high frame rates.** Hardware H.265 or H.264 through Media Foundation on the host and
+  Vulkan Video on the viewer, keeping pictures on the graphics card from capture to screen, up to
+  the host screen's refresh rate (240 fps at most).
+- **Controllers built in.** The gamepad driver comes with the app, and a Gamepad page remaps buttons.
+- **Measures itself.** The overlay (Ctrl+Alt+S) shows bitrate, latency and where the time goes, and
+  session files follow every frame through both PCs. See [METRICS.md](METRICS.md).
+- **Updates itself** from GitHub Releases.
+
+Windows can host and connect. Linux can connect. NVIDIA is the only hardware encoder tested so far;
+AMD and Intel encoders are detected but untested. Hosting several people has only been tested with
+simulated connectors.
+
+## Measured
+
+A real session on 0.10.5, the latest measured: an RTX 5060 PC hosting a game for an RTX 3070 Ti PC
+in another state, both on Ethernet, with a 43.6 ms round trip.
+
+| | Result |
+|---|---|
+| Frames on time | 99.96% of 20,237 |
+| Frame rate | 145 fps |
+| Video | 72–80 Mb/s of 80 set, 0 packets lost |
+| Screen to viewer's window (estimated) | p50 27.8, p95 30.6, p99 31.9 ms |
+| Of that, the network | p50 20.9 ms |
+| Encoding, decoding | 2.5 ms, 1.1 ms |
+| Input sent to the first frame that could show it | p50 52.9, p95 58.6 ms |
+
+Those exclude the game's own delay, the mouse and the monitor. Results depend on the connection: on
+weak Wi-Fi or a slow upload, delay is much higher. A session hosted from a 35 Mb/s upload had 71% of
+frames on time on 0.10.5; 0.11.0 has a fix for that, not yet proven on real hardware.
+
+## Compared with Parsec
+
+There's no head-to-head test yet, so these aren't like for like. The Parsec figures come from
+[its own 240 fps test](https://parsec.app/blog/parsec-game-streaming-total-latency-at-240-frames-per-second-c0818cc0daa5),
+which was on a local network and which Parsec says isn't meant for real-world use.
+
+| | Connect | Parsec, as published |
+|---|---|---|
+| Test | Real game over the internet, 43.6 ms round trip | Local network, gigabit Ethernet, test pattern |
+| Hardware | RTX 5060 host, RTX 3070 Ti viewer | GTX 1070 host, GTX 1050 Ti viewer |
+| Frame rate | 145 fps measured | 240 fps in that test; Parsec says it only tests at 60 fps and doesn't recommend 240 |
+| Bitrate | 72–80 Mb/s | Up to 100 Mb/s |
+| Codec | H.265 | H.264 |
+| Delay | 27.8 ms in all, about 7 ms besides the network | 4–8 ms in all |
+| How it was measured | Software timing and a clock estimate | 1000 fps camera |
+
+## Recent versions
+
 Version 0.11.0 lets several people connect to one PC at once, each with their own stream, controller
 and permissions, and fits each stream's bitrate to its connection automatically.
 
@@ -119,8 +182,9 @@ checks on demand.
 
 The **Connect** page shows this PC and every computer you've connected to as cards:
 
-- **This PC** (Windows) has the **Sharing** switch, which lets people ask to connect. While
-  someone is connected it says so, and **Manage** changes what they may use or disconnects them.
+- **This PC** (Windows) has the **Sharing** switch, which lets people ask to connect. While anyone
+  is connected it says so, and **Manage** lists them, changes what each may use, drops them, and
+  shows how each session is going.
 - Each saved computer has its owner's name for it and a **Connect** button. A computer is saved
   the first time it lets you in, and its name follows the owner's if they rename it. Hover a card
   and click **✕** to remove it.

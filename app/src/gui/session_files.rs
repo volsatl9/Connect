@@ -27,10 +27,10 @@ pub fn start(config_dir: &Path) {
 }
 
 /// Follows every frame through the session just hosted, and makes room for the next.
-pub fn session_ended() {
+pub fn session_ended(stamp: u64) {
     let Some(folder) = connect_perf::trace_dir() else { return };
     let spawned = std::thread::Builder::new().name("connect-session-report".into()).spawn(move || {
-        match crate::trace_report::write(&folder) {
+        match crate::trace_report::write_session(&folder, Some(stamp)) {
             Ok((_, path)) => tracing::info!("session report: {}", path.display()),
             // A viewer from before 0.10.1 leaves only the host's files.
             Err(e) => debug!("no session report: {e:#}"),

@@ -12,7 +12,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use connect_proto::{
-    Codec,
+    Codec, now_micros,
     video::{EncodedFrame, FrameAssembler},
 };
 use iroh::endpoint::Connection;
@@ -210,6 +210,7 @@ pub(crate) async fn receive(
     shared: Arc<Shared>,
 ) {
     let mut assembler = FrameAssembler::new();
+    let (mut last_transit, mut jitter) = (None, 0.0f64);
     // Frames gone are collected now and then, not at every datagram.
     let mut fates_checked = Instant::now();
     let record_fates = |assembler: &mut FrameAssembler, all: bool| {
@@ -257,6 +258,14 @@ pub(crate) async fn receive(
             assembler.request_keyframe();
         }
         while let Some(frame) = assembler.next_frame() {
+            // RFC 3550's interarrival jitter, on when each frame left and when it was whole.
+            let left = frame.meta.capture_time_us + u64::from(frame.meta.sent_after_us);
+            let transit = now_micros() as f64 - left as f64;
+            if let Some(last) = last_transit {
+                jitter += (f64::abs(transit - last) - jitter) / 16.0;
+                shared.counters.jitter_us.store(jitter as u32, Ordering::Relaxed);
+            }
+            last_transit = Some(transit);
             match decoder.send(frame) {
                 Ok(None) => {}
                 // The decoder is too far behind to catch up: skip to a fresh keyframe.
@@ -279,6 +288,7 @@ pub(crate) async fn receive(
         c.frames_lost.store(stats.frames_lost, Ordering::Relaxed);
         c.frames_recovered.store(stats.frames_recovered, Ordering::Relaxed);
         c.frames_skipped.store(stats.frames_skipped, Ordering::Relaxed);
+        c.frames_queued.store(decoder.queued.load(Ordering::Relaxed) as u32, Ordering::Relaxed);
     }
     record_fates(&mut assembler, true);
 }

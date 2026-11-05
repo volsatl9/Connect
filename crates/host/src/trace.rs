@@ -7,7 +7,10 @@
 use std::{
     fmt::Write as _,
     path::Path,
-    sync::{Arc, atomic::AtomicU64},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use connect_perf::{CsvRecord, CsvStream, ProcessLoad, ProcessMonitor, Spool, TraceRing, cell, percentiles};
@@ -50,6 +53,14 @@ pub(crate) struct FrameRecord {
     pub bitrate_kbps: u32,
     /// The path's datagrams got smaller, and the frame was dropped.
     pub dropped: bool,
+}
+
+/// A session's stamp for its files: the time, moved on if another took that second.
+fn unique_stamp() -> u64 {
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = connect_perf::session_stamp();
+    LAST.fetch_max(now, Ordering::Relaxed);
+    LAST.fetch_add(1, Ordering::Relaxed) + 1
 }
 
 impl CsvRecord for FrameRecord {
@@ -170,12 +181,15 @@ pub(crate) enum InputOutcome {
     NotAllowed,
     /// Handed to a test channel instead of the system.
     Channel,
+    /// Moved the connector's labelled pointer only: others share the mouse.
+    PointerOnly,
 }
 
 impl InputOutcome {
     fn name(self) -> &'static str {
         match self {
             InputOutcome::Injected => "injected",
+            InputOutcome::PointerOnly => "pointer_only",
             InputOutcome::Refused => "refused",
             InputOutcome::HostPriority => "host_priority",
             InputOutcome::NotAllowed => "not_allowed",
@@ -350,7 +364,7 @@ impl HostTrace {
             network: TraceRing::new(capacity),
             load: TraceRing::new(capacity),
             host_priority_drops: AtomicU64::new(0),
-            session: connect_perf::session_stamp(),
+            session: unique_stamp(),
         }
     }
 

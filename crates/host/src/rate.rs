@@ -33,12 +33,52 @@ use std::{
 };
 
 use connect_net as net;
+use connect_proto::control::ViewerFeedback;
 use iroh::endpoint::Connection;
 
 /// How often [`RateControl::update`] runs.
 pub(crate) const TICK: Duration = Duration::from_millis(250);
 /// Never below this, however bad the path: a smeary picture beats none.
 const MIN_BPS: u32 = 2_000_000;
+/// Where a stream starts, under its maximum: high enough to look good from the first frames, low
+/// enough not to flood most uploads. It climbs from there.
+const START_BPS: u32 = 30_000_000;
+/// Until the path first pushes back, the bitrate climbs this much a tick after this long.
+const FIRST_CLIMB: f64 = 1.10;
+const FIRST_CALM: Duration = Duration::from_millis(500);
+/// What's worth sending for each pixel of each frame, in bits, in automatic mode.
+const AUTO_BITS_PER_PIXEL: f64 = 0.25;
+/// A round trip this far past its best, for two ticks, means a queue past this PC, in a modem
+/// say, that the send queue can't show.
+const DELAYED: f64 = 1.5;
+const DELAYED_BY: Duration = Duration::from_millis(15);
+const VERY_DELAYED_BY: Duration = Duration::from_millis(50);
+/// Only with the video this close to the estimate is the video the likely cause. Wi-Fi scans
+/// spiked the round trip with 34 of 120 Mb/s going, and a full upload showed 35 of 47.
+const DELAY_FILLS: f64 = 0.6;
+/// How far under what was going a delay leaves the ceiling: it was already too much.
+const DELAY_CEILING: f64 = 0.9;
+/// The best round trip seen stops counting after this long, in case the route changed.
+const BEST_RTT_LASTS: Duration = Duration::from_secs(120);
+/// The viewer getting this much less than was sent, for two reports, means video is lost or
+/// queued on the way.
+const RECEIVED_SHARE: f64 = 0.75;
+/// Reports older than this say nothing about now.
+const FEEDBACK_LASTS: Duration = Duration::from_millis(2500);
+/// A report covers about this many ticks.
+const REPORT_TICKS: usize = 4;
+/// Time for a cut for the round trip to show in it before the next.
+const BETWEEN_DELAY_CUTS: Duration = Duration::from_secs(1);
+/// Busier than this, an encoder or a decoder is the limit, not the path.
+const SATURATED: f64 = 0.95;
+const RELAXED: f64 = 0.8;
+/// Frames waiting at the viewer's decoder that say it's fallen behind.
+const DECODER_BEHIND: u32 = 8;
+/// How long the encoder has to stay saturated before it counts, and quiet before it's let off.
+const ENCODER_SATURATED_FOR: Duration = Duration::from_secs(2);
+const ENCODER_CALM_FOR: Duration = Duration::from_secs(10);
+/// How long the path has to stay beyond help at the minimum before going under it.
+const UNUSABLE_AFTER: Duration = Duration::from_secs(2);
 /// Video waiting to be sent beyond this many seconds' worth means the path can't keep up.
 const BACKLOG_HIGH: f64 = 0.060;
 const BACKLOG_SOME: f64 = 0.025;
@@ -103,6 +143,35 @@ pub(crate) struct PathSample {
     pub recovery_requests: u64,
     /// Running total of video bytes handed to the network.
     pub video_bytes: u64,
+    /// The smoothed round trip. Goes stale when nothing comes back.
+    pub rtt: Option<Duration>,
+    /// How hard the host's encoder is working, kept apart from everything about the path.
+    pub encoder: Option<EncoderLoad>,
+}
+
+/// How hard the encoding is working.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EncoderLoad {
+    /// Share of the time spent encoding, for everyone connected, 0..1.
+    pub busy: f64,
+    /// Whether a graphics card does the work, rather than the processor.
+    pub hardware: bool,
+}
+
+/// What the host's settings allow a stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BitrateLimits {
+    /// Fit the bitrate to the picture too, not only to the path.
+    pub automatic: bool,
+    pub max_bps: u32,
+    pub min_bps: u32,
+}
+
+impl BitrateLimits {
+    fn bounded(self) -> Self {
+        let max_bps = self.max_bps.max(MIN_BPS);
+        Self { max_bps, min_bps: self.min_bps.clamp(MIN_BPS, max_bps), ..self }
+    }
 }
 
 /// Why the bitrate changed at a tick, for the trace.
@@ -119,6 +188,14 @@ pub(crate) enum Reason {
     Creep,
     /// The viewer lost frames, but the last cut did nothing for the loss: holding.
     LossHeld,
+    /// The round trip stayed well past its best, with the video near what the path carries.
+    Delay,
+    /// The viewer reported getting well under what was sent.
+    ViewerRate,
+    /// The viewer's decoder is at its limit.
+    ViewerDecode,
+    /// Over the settings, this viewer's share of the upload, or what the encoder keeps up with.
+    Limit,
 }
 
 impl Reason {
@@ -131,12 +208,15 @@ impl Reason {
             Reason::Climb => "climb",
             Reason::Creep => "creep",
             Reason::LossHeld => "loss_held",
+            Reason::Delay => "delay",
+            Reason::ViewerRate => "viewer_rate",
+            Reason::ViewerDecode => "viewer_decode",
+            Reason::Limit => "limit",
         }
     }
 }
 
 pub(crate) struct RateControl {
-    max_bps: u32,
     bps: Arc<AtomicU32>,
     /// Smoothed share of packets lost on the path.
     loss: f32,
@@ -161,6 +241,34 @@ pub(crate) struct RateControl {
     loss_at_cut: Option<f32>,
     /// How long to keep under the ceiling before trying over it again.
     retry_wait: Duration,
+    /// The most and least the settings allow, and the least if the path is beyond it.
+    limits: BitrateLimits,
+    /// The screen's pixels a second, in automatic mode, once known.
+    pixels_per_second: Option<f64>,
+    /// This viewer's even share of the host's upload, with others connected.
+    share: Option<u32>,
+    /// The most the encoder has kept up with, for encoders whose work grows with the bitrate.
+    encoder_cap: Option<u32>,
+    encoder_saturated_at: Option<Instant>,
+    encoder_calm_at: Option<Instant>,
+    encoder_limited: bool,
+    /// When the path started being beyond help at the minimum.
+    unusable_since: Option<Instant>,
+    /// Whether the path has pushed back yet.
+    proved: bool,
+    /// The best round trip seen and when, and whether the last tick's was well past it.
+    best_rtt: Option<(Duration, Instant)>,
+    delayed: bool,
+    /// Whether the ceiling came from the round trip, which the estimate mustn't lift: it reads
+    /// high on a path whose queue is out of sight.
+    delay_ceiling: bool,
+    /// The last report from the viewer, and when it came.
+    feedback: Option<(ViewerFeedback, Instant)>,
+    /// Whether that report hasn't been looked at yet: each counts once.
+    new_report: bool,
+    receiving_short: bool,
+    /// The last cut for the round trip: time for it to show before the next.
+    delay_cut_at: Option<Instant>,
     /// Whether to keep a ceiling and count the viewer's losses: off with `CONNECT_RATE_CEILING=0`,
     /// to compare with 0.9.0's controller.
     learn: bool,
@@ -172,7 +280,6 @@ impl RateControl {
         let max_bps = max_bps.max(MIN_BPS);
         let now = Instant::now();
         Self {
-            max_bps,
             bps: Arc::new(AtomicU32::new(max_bps)),
             loss: 0.0,
             sent: 0,
@@ -189,9 +296,100 @@ impl RateControl {
             estimate_at_ceiling: 0,
             loss_at_cut: None,
             retry_wait: CALM_BEFORE_RAISE,
+            limits: BitrateLimits { automatic: false, max_bps, min_bps: MIN_BPS },
+            pixels_per_second: None,
+            share: None,
+            encoder_cap: None,
+            encoder_saturated_at: None,
+            encoder_calm_at: None,
+            encoder_limited: false,
+            unusable_since: None,
+            proved: true,
+            best_rtt: None,
+            delayed: false,
+            delay_ceiling: false,
+            feedback: None,
+            new_report: false,
+            receiving_short: false,
+            delay_cut_at: None,
             learn: std::env::var("CONNECT_RATE_CEILING").map_or(true, |v| v.trim() != "0"),
             reason: Reason::Steady,
         }
+    }
+
+    /// Starts under the maximum and climbs, within `limits`.
+    pub fn with_limits(limits: BitrateLimits) -> Self {
+        let limits = limits.bounded();
+        let mut rate = Self::new(limits.max_bps);
+        rate.limits = limits;
+        rate.bps.store(START_BPS.clamp(limits.min_bps, limits.max_bps), Ordering::Relaxed);
+        rate.proved = false;
+        rate
+    }
+
+    /// New settings, effective at the next tick.
+    pub fn set_limits(&mut self, limits: BitrateLimits) {
+        self.limits = limits.bounded();
+    }
+
+    /// The most the settings ask for: the maximum the encoder is opened for.
+    pub fn most(&self) -> u32 {
+        self.limits.max_bps
+    }
+
+    /// The screen's size and rate, for what's worth sending in automatic mode.
+    pub fn set_format(&mut self, width: u32, height: u32, fps: u32) {
+        self.pixels_per_second = Some(f64::from(width) * f64::from(height) * f64::from(fps.max(30)));
+    }
+
+    /// This viewer's share of the upload, or `None` for all of it.
+    pub fn set_share(&mut self, share: Option<u32>) {
+        self.share = share;
+    }
+
+    /// A report from the viewer, bounded: it can only lower the bitrate.
+    pub fn feedback(&mut self, now: Instant, report: ViewerFeedback) {
+        self.feedback = Some((report.bounded(), now));
+        self.new_report = true;
+    }
+
+    /// The most the bitrate may be now, whatever the path would take.
+    pub fn cap(&self) -> u32 {
+        let automatic = self
+            .pixels_per_second
+            .filter(|_| self.limits.automatic)
+            .map(|pixels| ((pixels * AUTO_BITS_PER_PIXEL).min(f64::from(u32::MAX)) as u32).max(START_BPS));
+        [Some(self.limits.max_bps), automatic, self.share, self.encoder_cap]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(self.limits.max_bps)
+            .max(self.limits.min_bps)
+    }
+
+    /// The most this viewer's own connection and the settings allow, whatever others take.
+    pub fn own_limit(&self) -> u32 {
+        self.ceiling.map_or(self.limits.max_bps, |(ceiling, _)| ceiling.min(self.limits.max_bps))
+    }
+
+    /// Video going now, b/s, over the last couple of seconds.
+    pub fn sending(&self) -> f64 {
+        self.recent_video.iter().sum::<f64>() / self.recent_video.len().max(1) as f64
+    }
+
+    /// The last report from the viewer.
+    pub fn report(&self) -> Option<ViewerFeedback> {
+        self.feedback.map(|(report, _)| report)
+    }
+
+    /// Whether the last tick cut the bitrate because of the path.
+    pub fn cut_for_the_path(&self) -> bool {
+        matches!(self.reason, Reason::Backlog | Reason::Loss | Reason::ViewerLoss | Reason::Delay | Reason::ViewerRate)
+    }
+
+    /// Whether the encoder, not the path, is what's holding the video back.
+    pub fn encoder_limited(&self) -> bool {
+        self.encoder_limited
     }
 
     pub fn bitrate(&self) -> u32 {
@@ -239,6 +437,7 @@ impl RateControl {
         // starting up, or a dropout. Sending less wouldn't help, and the picture would suffer for
         // a long while after, so this says nothing about the bitrate.
         let silent = self.learn && sent < MIN_SAMPLE_PACKETS;
+        self.watch_encoder(now, path.encoder, before);
         let backing_up = path.queued_bytes >= BACKLOG_MIN_BYTES && backlog > BACKLOG_SOME && !silent;
         let lasting = !self.learn || (backing_up && self.backing_up);
         self.backing_up = backing_up;
@@ -259,11 +458,19 @@ impl RateControl {
             && path.bandwidth_estimate.is_some_and(|estimate| video_bps >= estimate as f64 * TESTED_SHARE);
         let tested = steady || self.quiet_at.is_none_or(|at| now.duration_since(at) >= TESTED_FOR);
         let losing = sent >= MIN_SAMPLE_PACKETS && lost > 0 && sample > LOSS_SOME;
+        let fresh = self.feedback.filter(|(_, at)| now.duration_since(*at) <= FEEDBACK_LASTS).map(|(report, _)| report);
+        let (over, delay_cut) = self.watch_round_trip(now, path, video_bps, silent);
+        let last_second = self.recent_video.iter().rev().take(REPORT_TICKS);
+        let sending = last_second.clone().sum::<f64>() / last_second.count().max(1) as f64;
+        let (received_cut, decoder_cut) = self.watch_viewer(fresh, sending, silent);
+        let viewer_loss = fresh.is_some_and(|report| f32::from(report.loss_permille) / 1000.0 > LOSS_SOME);
         let filling = !self.learn
             || (losing && self.losing)
             || path.bandwidth_estimate.is_none_or(|estimate| video_bps >= estimate as f64 * VIDEO_SHARE);
         self.losing = losing;
-        let clamp = |bps: f64| (bps as u32).clamp(MIN_BPS, self.max_bps);
+        let cap = self.cap();
+        let floor = self.floor(now, before, backlog > BACKLOG_HIGH && lasting);
+        let clamp = |bps: f64| (bps as u32).clamp(floor, cap.max(floor));
         self.loss_at_cut = self.loss_at_cut.filter(|at_cut| self.loss >= at_cut * NO_BETTER);
         let holding = filling && viewer_lost && self.loss_at_cut.is_some();
         let congested = if lasting && backlog > BACKLOG_HIGH {
@@ -272,21 +479,30 @@ impl RateControl {
             Some((0.7, Reason::Loss))
         } else if lasting && backlog > BACKLOG_SOME {
             Some((0.85, Reason::Backlog))
-        } else if filling && sample > LOSS_SOME {
+        } else if filling && (sample > LOSS_SOME || viewer_loss) {
             Some((0.85, Reason::Loss))
         } else if filling && viewer_lost && !holding {
             Some((0.85, Reason::ViewerLoss))
+        } else if delay_cut {
+            let very = over.is_some_and(|(rtt, best)| rtt > best + VERY_DELAYED_BY);
+            Some((if very { 0.7 } else { 0.85 }, Reason::Delay))
+        } else if received_cut {
+            Some((0.85, Reason::ViewerRate))
+        } else if decoder_cut {
+            Some((0.85, Reason::ViewerDecode))
         } else {
             None
         };
         // A ceiling hit again stays: over it, only creeping, as a climb would overshoot.
         if self.retry_wait == CALM_BEFORE_RAISE
+            && !self.delay_ceiling
             && self.ceiling.is_some_and(|(_, at)| now.duration_since(at) >= FORGET_CEILING)
         {
             self.ceiling = None;
         }
         // The path measures faster than when it last gave out: it has got better.
-        if let (None, Some((ceiling, at)), Some(estimate)) = (congested, self.ceiling, path.bandwidth_estimate)
+        if let (None, false, Some((ceiling, at)), Some(estimate)) =
+            (congested, self.delay_ceiling, self.ceiling, path.bandwidth_estimate)
             && (estimate as f64 > self.estimate_at_ceiling as f64 * BETTER_PATH
                 || now.duration_since(self.calm_since) >= FOLLOW_ESTIMATE_AFTER)
         {
@@ -295,8 +511,26 @@ impl RateControl {
             }
             self.ceiling = Some((ceiling.max(clamp(estimate as f64 * VIDEO_SHARE)), at));
         }
+        if before > cap.max(floor) {
+            return self.settle(before, cap.max(floor), Reason::Limit);
+        }
         let (after, reason) = if let Some((factor, reason)) = congested {
             self.calm_since = now;
+            self.proved = true;
+            self.retry_after_failure();
+            // What was going was too much, whatever the estimate says.
+            if matches!(reason, Reason::Delay | Reason::ViewerRate | Reason::ViewerDecode) {
+                let going = f64::from(before).min(if sending > 0.0 { sending } else { video_bps });
+                let going = if reason == Reason::ViewerRate {
+                    fresh.map_or(going, |report| going.min(f64::from(report.receive_kbps) * 1000.0))
+                } else {
+                    going
+                };
+                self.ceiling = Some((clamp(going * DELAY_CEILING), now));
+                self.delay_ceiling = true;
+                self.estimate_at_ceiling = path.bandwidth_estimate.unwrap_or(u64::MAX);
+                return self.settle(before, clamp(going * factor), reason);
+            }
             // Nothing says the path is slow, only that a burst is queued: a step, not the estimate.
             if self.learn && reason == Reason::Backlog && !tested && self.loss < LOSS_NOTICED {
                 return self.settle(before, clamp(f64::from(before) * factor), reason);
@@ -310,9 +544,7 @@ impl RateControl {
             if !self.learn {
                 return self.settle(before, clamp(f64::from(before) * factor), reason);
             }
-            if matches!(self.reason, Reason::Climb | Reason::Creep) {
-                self.retry_wait = (self.retry_wait * 2).min(MOST_RETRY_WAIT);
-            }
+            self.delay_ceiling = false;
             self.ceiling = Some((ceiling, now));
             self.estimate_at_ceiling = path.bandwidth_estimate.unwrap_or(u64::MAX);
             if reason == Reason::ViewerLoss && self.loss >= LOSS_NOTICED {
@@ -322,26 +554,116 @@ impl RateControl {
         } else if holding {
             self.calm_since = now;
             (before, Reason::LossHeld)
-        } else if now.duration_since(self.calm_since) >= CALM_BEFORE_RAISE && before < self.max_bps {
+        } else if !self.proved && now.duration_since(self.calm_since) >= FIRST_CALM && before < cap {
+            (clamp(f64::from(before) * FIRST_CLIMB), Reason::Climb)
+        } else if now.duration_since(self.calm_since) >= CALM_BEFORE_RAISE && before < cap {
             match self.ceiling.map(|(ceiling, _)| clamp(f64::from(ceiling) * FAST_UNTIL)) {
                 Some(creep_from) if before >= creep_from => {
                     let waited = now.duration_since(self.calm_since) >= self.retry_wait;
                     if waited { (clamp(f64::from(before) * CREEP), Reason::Creep) } else { (before, Reason::Steady) }
                 }
                 Some(creep_from) => {
-                    let up = clamp(f64::from(before) * 1.05).max(before.saturating_add(250_000).min(self.max_bps));
+                    let up = clamp(f64::from(before) * 1.05).max(before.saturating_add(250_000).min(cap));
                     (up.min(creep_from).max(before), Reason::Climb)
                 }
                 // Up gently: about doubling in four seconds.
-                None => (
-                    clamp(f64::from(before) * 1.05).max(before.saturating_add(250_000).min(self.max_bps)),
-                    Reason::Climb,
-                ),
+                None => (clamp(f64::from(before) * 1.05).max(before.saturating_add(250_000).min(cap)), Reason::Climb),
             }
         } else {
             (before, Reason::Steady)
         };
         self.settle(before, after, reason)
+    }
+
+    /// A cut after raising the bitrate means the path's limit was found again: try it less often.
+    fn retry_after_failure(&mut self) {
+        if matches!(self.reason, Reason::Climb | Reason::Creep) {
+            self.retry_wait = (self.retry_wait * 2).min(MOST_RETRY_WAIT);
+        }
+    }
+
+    /// The round trip: how far past its best if it is, and whether that calls for a cut.
+    fn watch_round_trip(
+        &mut self,
+        now: Instant,
+        path: PathSample,
+        video_bps: f64,
+        silent: bool,
+    ) -> (Option<(Duration, Duration)>, bool) {
+        let rtt = path.rtt.filter(|rtt| !rtt.is_zero());
+        if let Some(rtt) = rtt
+            && self.best_rtt.is_none_or(|(best, at)| rtt <= best || now.duration_since(at) >= BEST_RTT_LASTS)
+        {
+            self.best_rtt = Some((rtt, now));
+        }
+        let best = self.best_rtt.map(|(best, _)| best);
+        let over = rtt.zip(best).filter(|(rtt, best)| !silent && *rtt > best.mul_f64(DELAYED).max(*best + DELAYED_BY));
+        let fills = path.bandwidth_estimate.is_some_and(|estimate| video_bps >= estimate as f64 * DELAY_FILLS);
+        let due = self.delay_cut_at.is_none_or(|at| now.duration_since(at) >= BETWEEN_DELAY_CUTS);
+        let cut = self.learn && self.delayed && over.is_some() && fills && due;
+        if cut {
+            self.delay_cut_at = Some(now);
+        }
+        self.delayed = over.is_some();
+        (over, cut)
+    }
+
+    /// A new report from the viewer, if there is one: whether what it gets falls well short of
+    /// what was sent, for the second report running, and whether its decoder is at its limit.
+    fn watch_viewer(&mut self, report: Option<ViewerFeedback>, sending: f64, silent: bool) -> (bool, bool) {
+        let Some(report) = report else {
+            self.receiving_short = false;
+            return (false, false);
+        };
+        if !std::mem::take(&mut self.new_report) {
+            return (false, false);
+        }
+        let short = !silent && sending > 0.0 && f64::from(report.receive_kbps) * 1000.0 < sending * RECEIVED_SHARE;
+        let was_short = std::mem::replace(&mut self.receiving_short, short);
+        let busy = f64::from(report.decode_us) * f64::from(report.frames_decoded) / 1e6;
+        let behind = report.frames_queued >= DECODER_BEHIND;
+        let saturated = behind || (busy > SATURATED && report.frames_dropped > 0);
+        (self.learn && short && was_short, self.learn && saturated)
+    }
+
+    /// Keeps the encoder's own limit apart from the path's. A hardware encoder's time hardly
+    /// changes with the bitrate, so that only says so; a processor's does, so the bitrate gives way.
+    fn watch_encoder(&mut self, now: Instant, encoder: Option<EncoderLoad>, before: u32) {
+        let Some(encoder) = encoder else { return };
+        let saturated = encoder.busy > SATURATED;
+        if !saturated {
+            self.encoder_saturated_at = None;
+        } else if self.encoder_saturated_at.is_none() {
+            self.encoder_saturated_at = Some(now);
+        }
+        if encoder.busy >= RELAXED {
+            self.encoder_calm_at = None;
+        } else if self.encoder_calm_at.is_none() {
+            self.encoder_calm_at = Some(now);
+        }
+        let lasting = self.encoder_saturated_at.is_some_and(|at| now.duration_since(at) >= ENCODER_SATURATED_FOR);
+        if lasting {
+            self.encoder_limited = true;
+            if !encoder.hardware {
+                self.encoder_cap = Some((f64::from(before) * 0.85) as u32);
+                self.encoder_saturated_at = Some(now);
+            }
+        } else if self.encoder_calm_at.is_some_and(|at| now.duration_since(at) >= ENCODER_CALM_FOR) {
+            self.encoder_limited = false;
+            self.encoder_cap = None;
+        }
+    }
+
+    /// The least the bitrate may be: the setting, until the path has been beyond it for a while.
+    fn floor(&mut self, now: Instant, before: u32, overwhelmed: bool) -> u32 {
+        if !overwhelmed || before > self.limits.min_bps {
+            if !overwhelmed {
+                self.unusable_since = None;
+            }
+            return self.limits.min_bps.min(before.max(MIN_BPS));
+        }
+        let since = *self.unusable_since.get_or_insert(now);
+        if now.duration_since(since) >= UNUSABLE_AFTER { MIN_BPS } else { self.limits.min_bps }
     }
 
     fn settle(&mut self, before: u32, after: u32, reason: Reason) -> Option<u32> {
@@ -430,6 +752,223 @@ mod tests {
         println!("{mbps:.0} Mb/s, {cuts} cuts after the first 20 s, queue up to {worst_queue:.0} ms");
         assert!((28.0..38.0).contains(&mbps), "{mbps:.0} Mb/s");
         assert!(worst_queue < 60.0 && cuts <= 8, "{cuts} cuts, {worst_queue:.0} ms");
+    }
+
+    fn limits(max: u32, min: u32) -> BitrateLimits {
+        BitrateLimits { automatic: true, max_bps: max * 1_000_000, min_bps: min * 1_000_000 }
+    }
+
+    /// A healthy path, a tick's worth at a time, for `rate` to climb on.
+    fn healthy(rate: &mut RateControl, ticks: u32) {
+        let start = rate.started;
+        for tick in 1..=ticks {
+            let (sent, video) = (u64::from(tick) * 1000, u64::from(tick) * 1_000_000);
+            let path = PathSample {
+                sent_packets: sent,
+                video_bytes: video,
+                bandwidth_estimate: Some(500_000_000),
+                rtt: Some(Duration::from_millis(20)),
+                ..Default::default()
+            };
+            rate.update(start + TICK * tick, path);
+        }
+    }
+
+    /// As from a PC whose upload holds 32 Mb/s behind a modem with a deep buffer: the host's own
+    /// queue stays empty, the estimate reads 47, and only the round trip shows the queue.
+    #[test]
+    fn a_queue_out_of_sight_is_found_by_the_round_trip() {
+        let mut rate = RateControl::with_limits(limits(100, 3));
+        let start = rate.started;
+        let (capacity, seconds) = (32e6, TICK.as_secs_f64());
+        let (mut queued_bits, mut video, mut sent) = (0.0f64, 0u64, 0u64);
+        let (mut late_ticks, mut bitrate_sum) = (0, 0.0);
+        for tick in 1..=1200u32 {
+            let made = f64::from(rate.bitrate()).min(60e6);
+            queued_bits = (queued_bits + (made - capacity) * seconds).max(0.0);
+            let rtt_ms = 44.0 + queued_bits / capacity * 1000.0;
+            video += (made * seconds / 8.0) as u64;
+            sent += (made * seconds / 8.0 / 1200.0) as u64;
+            let path = PathSample {
+                sent_packets: sent,
+                video_bytes: video,
+                bandwidth_estimate: Some(47_000_000),
+                rtt: Some(Duration::from_secs_f64(rtt_ms / 1000.0)),
+                ..Default::default()
+            };
+            rate.update(start + TICK * tick, path);
+            if tick > 120 {
+                late_ticks += u32::from(rtt_ms > 70.0);
+                bitrate_sum += f64::from(rate.bitrate());
+            }
+        }
+        let mbps = bitrate_sum / 1080.0 / 1e6;
+        println!("{mbps:.0} Mb/s, {late_ticks} of 1080 ticks over 70 ms");
+        assert!((24.0..33.0).contains(&mbps), "{mbps:.0} Mb/s");
+        assert!(late_ticks < 54, "{late_ticks} ticks over 70 ms");
+    }
+
+    /// Wi-Fi scans: the round trip spikes while the video is far under what the path carries.
+    #[test]
+    fn a_spike_with_room_to_spare_costs_nothing() {
+        let mut rate = RateControl::new(80_000_000);
+        let start = rate.started;
+        for tick in 1..40u32 {
+            let path = PathSample {
+                sent_packets: u64::from(tick) * 1000,
+                video_bytes: u64::from(tick) * 1_062_500,
+                bandwidth_estimate: Some(120_000_000),
+                rtt: Some(Duration::from_millis(if tick == 1 { 3 } else { 100 })),
+                ..Default::default()
+            };
+            assert_eq!(rate.update(start + TICK * tick, path), None);
+        }
+    }
+
+    #[test]
+    fn starts_low_and_climbs_to_the_maximum_and_no_further() {
+        let mut rate = RateControl::with_limits(limits(50, 3));
+        assert_eq!(rate.bitrate(), 30_000_000);
+        healthy(&mut rate, 120);
+        assert_eq!(rate.bitrate(), 50_000_000);
+        let rate = RateControl::with_limits(limits(5, 3));
+        assert_eq!(rate.bitrate(), 5_000_000);
+    }
+
+    #[test]
+    fn the_maximum_applies_as_soon_as_its_changed() {
+        let mut rate = RateControl::with_limits(limits(50, 3));
+        healthy(&mut rate, 60);
+        rate.set_limits(limits(10, 3));
+        rate.update(rate.started + TICK * 61, PathSample::default());
+        assert_eq!((rate.bitrate(), rate.reason()), (10_000_000, Reason::Limit));
+    }
+
+    #[test]
+    fn the_minimum_holds_until_the_path_is_beyond_it() {
+        let mut rate = RateControl::with_limits(limits(10, 8));
+        let start = rate.started;
+        let mut sent = 0;
+        let mut update = |rate: &mut RateControl, tick: u32| {
+            sent += 1000;
+            rate.update(
+                start + TICK * tick,
+                PathSample { sent_packets: sent, queued_bytes: 900_000, ..Default::default() },
+            );
+        };
+        for tick in 1..=7 {
+            update(&mut rate, tick);
+            assert!(rate.bitrate() >= 8_000_000, "tick {tick}: {}", rate.bitrate());
+        }
+        for tick in 8..=30 {
+            update(&mut rate, tick);
+        }
+        assert!(rate.bitrate() < 8_000_000, "{}", rate.bitrate());
+    }
+
+    #[test]
+    fn in_automatic_mode_the_picture_sets_what_is_worth_sending() {
+        let mut rate = RateControl::with_limits(limits(300, 3));
+        rate.set_format(1920, 1080, 60);
+        assert_eq!(rate.cap() / 1_000_000, 31);
+        rate.set_format(3840, 2160, 120);
+        assert_eq!(rate.cap() / 1_000_000, 248);
+        let mut manual = RateControl::with_limits(BitrateLimits { automatic: false, ..limits(300, 3) });
+        manual.set_format(1920, 1080, 60);
+        assert_eq!(manual.cap() / 1_000_000, 300);
+    }
+
+    #[test]
+    fn a_viewer_getting_less_than_was_sent_lowers_the_bitrate() {
+        let mut rate = RateControl::new(80_000_000);
+        let start = rate.started;
+        let report = ViewerFeedback { receive_kbps: 20_000, ..Default::default() };
+        let mut cut = None;
+        for tick in 1..=12u32 {
+            let path = PathSample {
+                sent_packets: u64::from(tick) * 1000,
+                video_bytes: u64::from(tick) * 6_250_000,
+                ..Default::default()
+            };
+            if tick.is_multiple_of(4) {
+                rate.feedback(start + TICK * tick, report);
+            }
+            if let Some(bps) = rate.update(start + TICK * tick, path) {
+                cut = cut.or(Some((bps, rate.reason())));
+            }
+        }
+        assert_eq!(cut, Some((17_000_000, Reason::ViewerRate)));
+    }
+
+    #[test]
+    fn a_report_counts_once() {
+        let mut rate = RateControl::new(80_000_000);
+        let start = rate.started;
+        rate.feedback(start, ViewerFeedback { receive_kbps: 20_000, ..Default::default() });
+        for tick in 1..=4u32 {
+            let path = PathSample {
+                sent_packets: u64::from(tick) * 1000,
+                video_bytes: u64::from(tick) * 6_250_000,
+                ..Default::default()
+            };
+            assert_eq!(rate.update(start + TICK * tick, path), None, "tick {tick}");
+        }
+    }
+
+    #[test]
+    fn a_report_cant_raise_the_bitrate() {
+        let mut rate = RateControl::with_limits(limits(20, 3));
+        let start = rate.started;
+        let report = ViewerFeedback { receive_kbps: u32::MAX, ..Default::default() };
+        for tick in 1..40u32 {
+            rate.feedback(start + TICK * tick, report);
+            rate.update(start + TICK * tick, PathSample { sent_packets: u64::from(tick) * 1000, ..Default::default() });
+            assert!(rate.bitrate() <= 20_000_000);
+        }
+        assert_eq!(report.bounded().receive_kbps, 10_000_000);
+    }
+
+    #[test]
+    fn a_saturated_decoder_lowers_the_bitrate() {
+        let mut rate = RateControl::new(80_000_000);
+        let start = rate.started;
+        let report = ViewerFeedback { decode_us: 10_000, frames_decoded: 100, frames_dropped: 5, ..Default::default() };
+        rate.feedback(start + TICK, report);
+        let path = PathSample { sent_packets: 1000, video_bytes: 5_000_000, ..Default::default() };
+        rate.update(start + TICK, path);
+        assert_eq!(rate.reason(), Reason::ViewerDecode);
+    }
+
+    #[test]
+    fn a_processor_encoder_gives_way_and_a_graphics_card_only_says_so() {
+        let saturated = |hardware| PathSample {
+            sent_packets: 0,
+            encoder: Some(EncoderLoad { busy: 1.0, hardware }),
+            ..Default::default()
+        };
+        for (hardware, expected_cap) in [(false, Some(68_000_000)), (true, None)] {
+            let mut rate = RateControl::new(80_000_000);
+            let start = rate.started;
+            for tick in 1..=9u32 {
+                rate.update(
+                    start + TICK * tick,
+                    PathSample { sent_packets: u64::from(tick) * 1000, ..saturated(hardware) },
+                );
+            }
+            assert!(rate.encoder_limited());
+            assert_eq!(rate.encoder_cap, expected_cap, "hardware: {hardware}");
+        }
+    }
+
+    #[test]
+    fn a_share_of_the_upload_is_kept_to_and_given_back() {
+        let mut rate = RateControl::with_limits(limits(80, 3));
+        healthy(&mut rate, 60);
+        rate.set_share(Some(25_000_000));
+        rate.update(rate.started + TICK * 61, PathSample::default());
+        assert_eq!((rate.bitrate(), rate.reason()), (25_000_000, Reason::Limit));
+        rate.set_share(None);
+        assert_eq!(rate.cap(), 80_000_000);
     }
 
     /// As in a session on Wi-Fi: video queued, nothing going out, for three seconds.

@@ -1,5 +1,8 @@
 # Connect
 
+Version 0.11.0 lets several people connect to one PC at once, each with their own stream, controller
+and permissions, and fits each stream's bitrate to its connection automatically.
+
 Version 0.10.5 sends the bitrate you set when a game runs under the screen's refresh rate, settles
 under a slow upload instead of overfilling it every few seconds, and records more about the encoder
 stall that keeps 60 Hz time.
@@ -28,10 +31,11 @@ permissions, a window with its own title bar, an app image, a Windows installer 
 | C-102 | The two PCs have no video format in common |
 | C-103 | That PC can't host: hosting needs Windows |
 | C-104 | The host has sharing turned off |
-| C-105 | The host is in a session with someone else |
+| C-105 | The host has as many people connected as it allows, or this PC is already connected |
 | C-106 | The host declined |
 | C-107 | The host didn't answer in time |
 | C-108 | The host couldn't capture its screen |
+| C-109 | The host's graphics card can't take another stream |
 
 ## Install
 

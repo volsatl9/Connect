@@ -46,6 +46,8 @@ const BUFFER_FRAMES: u32 = 2;
 /// Those frames at no more than this rate: a game under the screen's refresh has bigger frames to
 /// fit, which the bitrate is raised to allow (`encode::FrameRateScale`).
 const BUFFER_FPS: u32 = 120;
+/// Nor for more than this: a high maximum isn't reason for a larger burst.
+const BUFFER_MOST_BPS: u32 = 100_000_000;
 /// Without intra refresh, the encoder's own keyframe interval, as a time; the video thread
 /// forces one this often too (`encode::KEYFRAME_PERIOD`).
 const GOP_SECONDS: u32 = 30;
@@ -726,7 +728,7 @@ impl BurstControls {
         if let Some(frames) = settings.buffer_frames
             && supports(codec, &CODECAPI_AVEncCommonBufferSize).unwrap_or(false)
         {
-            let bytes = buffer_bytes(bitrate, fps.min(BUFFER_FPS), frames);
+            let bytes = buffer_bytes(bitrate.min(BUFFER_MOST_BPS), fps.min(BUFFER_FPS), frames);
             match set_u32(codec, &CODECAPI_AVEncCommonBufferSize, bytes) {
                 Ok(()) => {
                     self.buffer_frames = Some(frames);

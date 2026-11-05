@@ -9,8 +9,10 @@ use serde::{Deserialize, Serialize};
 
 use super::gamepad::ButtonMap;
 
-/// Offered caps on the video bitrate when sharing.
-pub const BITRATE_CHOICES_MBPS: [u32; 5] = [10, 20, 35, 50, 80];
+/// Offered maximums for the video bitrate when sharing.
+pub const BITRATE_CHOICES_MBPS: [u32; 9] = [5, 10, 15, 20, 30, 40, 50, 75, 100];
+/// Offered minimums.
+pub const MIN_BITRATE_CHOICES_MBPS: [u32; 6] = [2, 3, 5, 10, 15, 20];
 /// 0 is no limit.
 pub const FRAME_RATE_CHOICES: [u32; 5] = [0, 60, 120, 144, 240];
 
@@ -23,8 +25,14 @@ pub struct Settings {
     pub accepting: bool,
     /// Pre-selected in the Allow prompt for a device not seen before.
     pub permissions: Permissions,
-    /// Cap on the video bitrate when sharing.
+    /// Fit the bitrate to the picture as well as the connection.
+    pub bitrate_automatic: bool,
+    /// The most video a second when sharing: a ceiling, which the connection may keep it under.
     pub bitrate_mbps: u32,
+    /// The least it's let fall to while the connection is usable.
+    pub bitrate_min_mbps: u32,
+    /// How many may be connected at once.
+    pub max_connections: u32,
     /// Most frames a second sent when sharing; 0 for no limit.
     pub frame_rate_limit: u32,
     /// Devices let in without asking, before 0.10.0 kept that with each device. Read once by
@@ -74,7 +82,10 @@ impl Default for Settings {
             device_name: crate::device_name(),
             accepting: true,
             permissions: Permissions::default(),
+            bitrate_automatic: true,
             bitrate_mbps: connect_host::DEFAULT_BITRATE_MBPS,
+            bitrate_min_mbps: connect_host::DEFAULT_MIN_BITRATE_MBPS,
+            max_connections: connect_host::DEFAULT_MAX_CONNECTIONS,
             frame_rate_limit: 0,
             trusted: Vec::new(),
             computers: Vec::new(),
@@ -86,6 +97,15 @@ impl Default for Settings {
 }
 
 impl Settings {
+    /// The bitrate settings as the host takes them.
+    pub fn bitrate(&self) -> connect_host::BitrateSettings {
+        connect_host::BitrateSettings {
+            automatic: self.bitrate_automatic,
+            max_mbps: self.bitrate_mbps,
+            min_mbps: self.bitrate_min_mbps,
+        }
+    }
+
     /// Moves devices saved by earlier versions in with all the others, each with the permissions
     /// that used to apply to them all.
     pub fn adopt_trusted(&mut self) {

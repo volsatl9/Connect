@@ -189,8 +189,8 @@ async fn high_refresh_video_decodes_over_datagrams() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn second_client_is_told_host_is_busy() {
-    let (host_ep, host, mut host_events) = start_host(config()).await;
+async fn a_client_over_the_limit_is_told_the_host_is_full() {
+    let (host_ep, host, mut host_events) = start_host(HostConfig { max_connections: 1, ..config() }).await;
     let (first_ep, _first, mut first_events) = start_client(&host_ep).await;
     request(&mut host_events).await.respond(Decision::Allow(Permissions::ALL));
     accepted(&mut first_events).await;
@@ -199,7 +199,7 @@ async fn second_client_is_told_host_is_busy() {
     let (_second_ep, _second, mut second_events) = start_client(&host_ep).await;
     assert_eq!(
         ended(&mut second_events).await,
-        EndReason::Rejected("The host is in another session right now. (Code C-105)".into())
+        EndReason::Rejected("The host has as many people connected as it allows. (Code C-105)".into())
     );
 
     host.disconnect();

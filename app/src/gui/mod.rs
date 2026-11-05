@@ -29,7 +29,7 @@ use std::{
 
 use anyhow::Result;
 use connect_client::{ClientEvent, ClientHandle, Stage};
-use connect_host::{ConnectionRequest, HostConfig, HostEvent, HostHandle};
+use connect_host::{ConnectionRequest, EncoderInfo, HostConfig, HostEvent, HostHandle, SessionInfo};
 use connect_net::{
     self as net,
     iroh::{Endpoint, EndpointId},
@@ -61,6 +61,16 @@ fn present_mode() -> eframe::wgpu::PresentMode {
         _ if cfg!(target_os = "linux") && std::env::var_os("WAYLAND_DISPLAY").is_some() => PresentMode::AutoNoVsync,
         _ => PresentMode::AutoVsync,
     }
+}
+
+/// `CONNECT_TEST_PATTERN=1` shares a test image instead of the screen, for trying the hosting side
+/// with virtual connectors on a PC that can't capture its screen.
+fn test_pattern() -> Option<connect_host::VideoSource> {
+    std::env::var_os("CONNECT_TEST_PATTERN").map(|_| connect_host::VideoSource::TestPattern {
+        width: 1280,
+        height: 720,
+        fps: 60,
+    })
 }
 
 pub fn run(runtime: Runtime, config_dir: PathBuf) -> Result<()> {
@@ -246,8 +256,10 @@ enum Page {
 enum Dialog {
     /// Typing in a new computer's User-ID.
     AddComputer,
-    /// Who is using this PC, and what they may use.
+    /// Who is using this PC, and control over all of them.
     Hosting,
+    /// One of them: what they may use, and how their session is going.
+    Connector(connect_host::SessionId),
     /// What a saved device may use on this PC, and whether it's always allowed.
     Device(EndpointId),
 }
@@ -265,7 +277,10 @@ pub struct App {
     /// Connection requests waiting for Allow/Deny, oldest first.
     requests: VecDeque<Request>,
     /// Who is using this PC right now.
-    hosting: Option<Hosting>,
+    /// Everyone connected to this PC, as of this frame.
+    hosting: Vec<SessionInfo>,
+    /// What can encode on this PC, once looked up.
+    encoders: Arc<std::sync::OnceLock<Vec<EncoderInfo>>>,
     page: Page,
     /// When the current page was opened, for fading it in.
     page_since: Instant,
@@ -294,13 +309,6 @@ struct Request {
     arrived: Instant,
     always_allow: bool,
     /// What they'll be able to use if allowed; starts from the defaults.
-    permissions: Permissions,
-}
-
-struct Hosting {
-    peer: EndpointId,
-    client_name: String,
-    since: Instant,
     permissions: Permissions,
 }
 
@@ -368,8 +376,10 @@ impl App {
             HostConfig {
                 accepting: settings.accepting,
                 trusted: settings.always_allowed(),
-                bitrate_mbps: settings.bitrate_mbps,
+                bitrate: settings.bitrate(),
+                max_connections: settings.max_connections,
                 frame_rate_limit: settings.frame_rate_limit,
+                video: test_pattern().unwrap_or_default(),
                 ..HostConfig::new(settings.device_name.clone())
             },
         );
@@ -383,7 +393,17 @@ impl App {
             logo: logo_texture(ctx),
             gamepad_driver: driver::GamepadDriver::new(),
             requests: VecDeque::new(),
-            hosting: None,
+            hosting: Vec::new(),
+            encoders: {
+                let encoders: Arc<std::sync::OnceLock<Vec<EncoderInfo>>> = Arc::default();
+                let found = encoders.clone();
+                tokio::task::spawn_blocking(move || {
+                    let list = connect_host::encoder_capabilities();
+                    tracing::info!(?list, "encoders on this PC");
+                    let _ = found.set(list);
+                });
+                encoders
+            },
             page: Page::Connect,
             page_since: Instant::now(),
             dialog: None,
@@ -428,13 +448,10 @@ impl App {
                     permissions: self.settings.permissions_for(peer),
                 });
             }
-            HostEvent::SessionStarted { peer, client_name, permissions } => {
-                self.hosting = Some(Hosting { peer, client_name, since: Instant::now(), permissions });
-            }
-            HostEvent::SessionEnded { reason, .. } => {
-                self.hosting = None;
+            HostEvent::SessionStarted { .. } => {}
+            HostEvent::SessionEnded { reason, stamp, .. } => {
                 self.notify(reason, false);
-                session_files::session_ended();
+                session_files::session_ended(stamp);
             }
         }
     }
@@ -446,9 +463,8 @@ impl App {
             device.always_allow = always_allow;
         }
         self.host.set_trusted(peer, always_allow.then_some(permissions));
-        if let Some(hosting) = self.hosting.as_mut().filter(|h| h.peer == peer) {
-            hosting.permissions = permissions;
-            self.host.set_permissions(permissions);
+        if let Some(session) = self.hosting.iter().find(|session| session.peer == peer) {
+            self.host.set_session_permissions(session.id, permissions);
         }
     }
 
@@ -541,6 +557,7 @@ impl App {
         while let Ok(event) = self.host_events.try_recv() {
             self.on_host_event(event);
         }
+        self.hosting = self.host.sessions();
         let before = self.requests.len();
         self.requests.retain(|r| r.inner.is_pending());
         if self.requests.len() < before {
@@ -561,7 +578,7 @@ impl App {
         let waiting = self.client.as_ref().is_some_and(|c| !matches!(c.state, ClientState::Connected { .. }));
         if !self.requests.is_empty() || waiting {
             ctx.request_repaint_after(Duration::from_millis(250));
-        } else if self.hosting.is_some() {
+        } else if !self.hosting.is_empty() {
             ctx.request_repaint_after(Duration::from_secs(1));
         }
         if let Some((_, until)) = self.client.as_ref().and_then(|c| c.note.as_ref()) {
@@ -589,7 +606,7 @@ impl App {
             window::drag_area(ui, "page", area.with_max_y(area.top() + window::BAR_HEIGHT));
             let content = pages::sidebar(self, ui, area);
             let mut ui = ui.new_child(egui::UiBuilder::new().max_rect(content));
-            let in_session = self.hosting.is_some() || self.client.is_some();
+            let in_session = !self.hosting.is_empty() || self.client.is_some();
             self.updater.banner(&mut ui, in_session);
             egui::ScrollArea::vertical().auto_shrink(false).show(&mut ui, |ui| {
                 // Room on the right for the scroll bar, which floats over the content.

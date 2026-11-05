@@ -22,6 +22,8 @@ pub enum ClientMsg {
     Decoders(Vec<CodecSupport>),
     /// This PC couldn't decode `codec` after all; the host switches to another one.
     DecoderFailed { codec: Codec },
+    /// How the video is arriving here, about once a second. It can only lower the bitrate.
+    Feedback(ViewerFeedback),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -64,10 +66,18 @@ pub enum HostMsg {
         reason: Option<String>,
     },
     CursorShape(CursorShape),
+    /// Where the other connectors' pointers are, for drawing over the video.
+    Pointers(Vec<PeerPointer>),
     /// How the host is fitting video to the connection, about once a second.
     VideoStats {
         /// The bitrate the encoder is aiming for now, at most the host's cap.
         bitrate_kbps: u32,
+        /// The most it may use.
+        max_kbps: u32,
+        /// Why it last changed.
+        reason: String,
+        /// Whether the host's encoder is what's holding the video back.
+        encoder_limited: bool,
         /// Share of packets the path has been losing, in thousandths.
         loss_permille: u16,
         /// How busy the host's graphics card is, where it can tell.
@@ -75,6 +85,49 @@ pub enum HostMsg {
         /// Where the host's time goes, unless the host has tracing off.
         perf: Option<Box<crate::perf::HostPerf>>,
     },
+}
+
+/// What a viewer measures of the video reaching it, over the last report.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ViewerFeedback {
+    pub rtt_us: u32,
+    /// How much frames' arrival times wander, smoothed.
+    pub jitter_us: u32,
+    /// Share of frames that never arrived whole, in thousandths.
+    pub loss_permille: u16,
+    pub receive_kbps: u32,
+    pub decode_us: u32,
+    pub frames_decoded: u32,
+    /// Frames lost, or thrown away because the decoder fell behind.
+    pub frames_dropped: u32,
+    /// Frames waiting for the decoder as this was sent.
+    pub frames_queued: u32,
+}
+
+impl ViewerFeedback {
+    /// Within what a real connection could report: figures from the far side aren't trusted.
+    #[must_use]
+    pub fn bounded(self) -> Self {
+        const SECOND_US: u32 = 1_000_000;
+        Self {
+            rtt_us: self.rtt_us.min(10 * SECOND_US),
+            jitter_us: self.jitter_us.min(SECOND_US),
+            loss_permille: self.loss_permille.min(1000),
+            receive_kbps: self.receive_kbps.min(10_000_000),
+            decode_us: self.decode_us.min(SECOND_US),
+            frames_decoded: self.frames_decoded.min(10_000),
+            frames_dropped: self.frames_dropped.min(10_000),
+            frames_queued: self.frames_queued.min(10_000),
+        }
+    }
+}
+
+/// Another connector's pointer, as a share of the picture in sixteen-bit units.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerPointer {
+    pub name: String,
+    pub x: u16,
+    pub y: u16,
 }
 
 /// Serialises `msg` with its length prefix, ready to write to the stream.

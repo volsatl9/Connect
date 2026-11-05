@@ -21,13 +21,14 @@ use tokio::{
 use tracing::{debug, info, warn};
 
 use crate::{
-    ConnectionRequest, Decision, HostEvent, Shared, VideoSource,
+    ConnectionRequest, Decision, HostEvent, Refusal, SessionId, SessionStats, Shared, VideoSource,
     audio::AudioStream,
     cursor::CursorStream,
-    encode::{FrameStamp, VideoEvent, VideoStream},
+    encode::{FrameStamp, NO_ENCODER, VideoEvent, VideoStream},
     input::{self, Unavailable},
     rate::{self, PathSample, RateControl},
     trace::{FrameRecord, HostTrace, LoadRecord, NetworkRecord, Reporter},
+    uplink::Report,
     viewer_files,
 };
 
@@ -41,10 +42,19 @@ const REJECT_LINGER: Duration = Duration::from_secs(3);
 /// How long a finished session may take to release the remote user's input.
 const INPUT_RELEASE: Duration = Duration::from_secs(2);
 
+/// How often the other connectors' pointers are looked at.
+const POINTERS_EVERY: Duration = Duration::from_millis(33);
+/// A climb of this share is logged, as is every cut.
+const BITRATE_LOG_STEP: f64 = 0.1;
+/// The most often a viewer's report counts.
+const FEEDBACK_EVERY: Duration = Duration::from_millis(500);
+
 // Why a connection was turned away. The codes are listed in the README.
 const DECLINED: &str = "The host declined the connection. (Code C-106)";
 const NO_ANSWER: &str = "The host didn't answer in time. (Code C-107)";
-const BUSY: &str = "The host is in another session right now. (Code C-105)";
+const BUSY: &str = "This PC is already connected to that host. (Code C-105)";
+const FULL: &str = "The host has as many people connected as it allows. (Code C-105)";
+const NO_ENCODER_LEFT: &str = "The host's graphics card can't take another stream. (Code C-109)";
 const NOT_ACCEPTING: &str = "The host isn't accepting connections right now. (Code C-104)";
 const NO_CAPTURE: &str = "The host couldn't capture its screen. (Code C-108)";
 const NO_COMMON_CODEC: &str =
@@ -66,7 +76,7 @@ pub(crate) async fn run(incoming: Incoming, shared: Arc<Shared>, events: mpsc::S
     }
 }
 
-async fn serve(conn: &Connection, shared: &Shared, events: &mpsc::Sender<HostEvent>) -> Result<()> {
+async fn serve(conn: &Connection, shared: &Arc<Shared>, events: &mpsc::Sender<HostEvent>) -> Result<()> {
     let peer = conn.remote_id();
     let (mut send, mut recv) = timeout(HELLO_TIMEOUT, conn.accept_bi()).await.context("no hello")??;
     let hello = timeout(HELLO_TIMEOUT, net::read_msg(&mut recv)).await.context("no hello")??;
@@ -97,9 +107,12 @@ async fn serve(conn: &Connection, shared: &Shared, events: &mpsc::Sender<HostEve
     if !shared.accepting.load(std::sync::atomic::Ordering::Relaxed) {
         return reject(conn, &mut send, NOT_ACCEPTING).await;
     }
-    let Some(_slot) = shared.reserve(conn) else {
-        return reject(conn, &mut send, BUSY).await;
+    let slot = match shared.reserve(conn, &client_name) {
+        Ok(slot) => slot,
+        Err(Refusal::Full) => return reject(conn, &mut send, FULL).await,
+        Err(Refusal::AlreadyConnected) => return reject(conn, &mut send, BUSY).await,
     };
+    let id = slot.id();
 
     let granted = if let Some(permissions) = shared.trusted_permissions(&peer) {
         permissions
@@ -112,15 +125,21 @@ async fn serve(conn: &Connection, shared: &Shared, events: &mpsc::Sender<HostEve
         }
     };
 
-    let bitrate_bps = shared.bitrate_mbps.load(Ordering::Relaxed).saturating_mul(1_000_000);
-    let rate = RateControl::new(bitrate_bps);
+    let mut rate = RateControl::with_limits(shared.limits());
     let trace = Arc::new(HostTrace::new());
     let spool = start_trace(&trace);
     let backlog = Box::new(rate.backlog_check(conn.clone()));
     let limit = shared.frame_rate_limit.load(Ordering::Relaxed);
-    let mut video = VideoStream::start(shared.video.clone(), codec, rate.bitrate(), limit, backlog, trace.clone())?;
+    let mut video = VideoStream::start(&shared.hub, codec, rate.bitrate(), rate.most(), limit, backlog, trace.clone())?;
     let (width, height) = match video.next().await {
-        Some(Ok(VideoEvent::Format { width, height })) => (width, height),
+        Some(Ok(VideoEvent::Format { width, height, fps })) => {
+            rate.set_format(width, height, fps);
+            (width, height)
+        }
+        Some(Err(e)) if format!("{e:#}").contains(NO_ENCODER) => {
+            warn!("no encoder for another session: {e:#}");
+            return reject(conn, &mut send, NO_ENCODER_LEFT).await;
+        }
         Some(Err(e)) => {
             warn!("screen capture failed to start: {e:#}");
             return reject(conn, &mut send, NO_CAPTURE).await;
@@ -128,13 +147,13 @@ async fn serve(conn: &Connection, shared: &Shared, events: &mpsc::Sender<HostEve
         _ => return reject(conn, &mut send, NO_CAPTURE).await,
     };
 
-    shared.permissions.send_replace(granted);
-    let permissions = shared.permissions.subscribe();
+    let permissions = slot.start(granted);
     let welcome = HostMsg::Welcome { host_name: shared.host_name(), width, height, permissions: granted };
     net::write_msg(&mut send, &welcome).await?;
     info!(peer = %peer.fmt_short(), %client_name, width, height, ?granted, "session started");
-    let _ =
-        events.send(HostEvent::SessionStarted { peer, client_name: client_name.clone(), permissions: granted }).await;
+    let _ = events
+        .send(HostEvent::SessionStarted { id, peer, client_name: client_name.clone(), permissions: granted })
+        .await;
 
     let (unavailable_tx, unavailable) = mpsc::unbounded_channel();
     let (input_taken, taken) = oneshot::channel();
@@ -143,8 +162,9 @@ async fn serve(conn: &Connection, shared: &Shared, events: &mpsc::Sender<HostEve
         .map(|dir| tokio::spawn(viewer_files::collect(conn.clone(), taken, dir, trace.session)));
     let input = tokio::spawn(input::serve(
         conn.clone(),
-        shared.permissions.subscribe(),
+        slot.subscribe(),
         shared.input.clone(),
+        shared.sharing_pointer.clone(),
         unavailable_tx,
         trace.clone(),
         input_taken,
@@ -152,7 +172,10 @@ async fn serve(conn: &Connection, shared: &Shared, events: &mpsc::Sender<HostEve
 
     let desktop = shared.video == VideoSource::Screen;
     let codecs = Codecs { encoders, decoders, failed: Vec::new() };
-    let result = stream(conn, send, recv, video, codecs, rate, permissions, unavailable, desktop, &trace).await;
+    let size = (width, height);
+    let result =
+        stream(conn, send, recv, video, codecs, rate, permissions, unavailable, desktop, &trace, shared, id, size)
+            .await;
     let reason = end_reason(conn, &client_name, &result);
     info!(peer = %peer.fmt_short(), "session ended: {reason}");
     if conn.close_reason().is_none() {
@@ -168,7 +191,7 @@ async fn serve(conn: &Connection, shared: &Shared, events: &mpsc::Sender<HostEve
     if let Some(files) = viewer_files {
         let _ = timeout(INPUT_RELEASE, files).await;
     }
-    let _ = events.send(HostEvent::SessionEnded { peer, reason }).await;
+    let _ = events.send(HostEvent::SessionEnded { id, peer, reason, stamp: trace.session }).await;
     Ok(())
 }
 
@@ -217,6 +240,9 @@ async fn stream(
     mut unavailable: mpsc::UnboundedReceiver<Unavailable>,
     desktop: bool,
     trace: &HostTrace,
+    shared: &Shared,
+    id: SessionId,
+    mut size: (u32, u32),
 ) -> Result<()> {
     // Reading isn't cancel-safe (a half-read message would be lost), so it gets its own task.
     let (msg_tx, mut msgs) = mpsc::channel(16);
@@ -249,6 +275,14 @@ async fn stream(
     let (mut recovery_requests, mut video_bytes) = (0u64, 0u64);
     let mut last_tick = (0, 0, 0, 0, 0, crate::input::LocalActivity::default(), 0);
     let mut remote_seq = None;
+    let mut last_feedback: Option<Instant> = None;
+    // The other connectors' pointers as last sent, a tick's worth of cursor updates apart.
+    let mut pointers_sent = Vec::new();
+    let mut pointer_tick = tokio::time::interval(POINTERS_EVERY);
+    pointer_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // The bitrate last logged, so a climb says so in steps, not every tick.
+    let mut logged_bps = rate.bitrate();
+    let mut encoder_name = String::new();
     let mut audio_enabled = desktop && permissions.borrow().allows(DeviceClass::Audio);
     let mut audio = start_audio(conn, &mut send, audio_enabled).await?;
 
@@ -263,6 +297,15 @@ async fn stream(
                     debug!("client asked for a keyframe");
                     recovery_requests += 1;
                     video.request_keyframe();
+                }
+                Some(Ok(ClientMsg::Feedback(report))) => {
+                    // Reports can only lower the bitrate, and more than a viewer needs to send
+                    // are ignored.
+                    let now = Instant::now();
+                    if last_feedback.is_none_or(|at| now.duration_since(at) >= FEEDBACK_EVERY) {
+                        last_feedback = Some(now);
+                        rate.feedback(now, report);
+                    }
                 }
                 Some(Ok(ClientMsg::DecoderFailed { codec })) => {
                     codecs.failed.push(codec);
@@ -335,6 +378,7 @@ async fn stream(
                 let (sent, lost) = net::packet_counts(conn);
                 let queued = net::queued_datagram_bytes(conn);
                 let path = net::path_snapshot(conn);
+                rate.set_limits(shared.limits());
                 let sample = PathSample {
                     sent_packets: sent,
                     lost_packets: lost,
@@ -342,11 +386,35 @@ async fn stream(
                     bandwidth_estimate: path.and_then(|p| p.bandwidth_estimate),
                     recovery_requests,
                     video_bytes,
+                    rtt: path.map(|p| p.rtt),
+                    encoder: Some(video.encoder_load()),
                 };
-                if let Some(bps) = rate.update(Instant::now(), sample) {
-                    debug!(mbps = bps as f32 / 1e6, loss = rate.loss(), queued, reason = rate.reason().name(), "video bitrate changed");
+                let now = Instant::now();
+                let before = rate.bitrate();
+                if let Some(bps) = rate.update(now, sample) {
+                    let (from, to) = (f64::from(logged_bps), f64::from(bps));
+                    if bps < before || (to - from).abs() >= from * BITRATE_LOG_STEP {
+                        logged_bps = bps;
+                        info!(
+                            peer = %conn.remote_id().fmt_short(),
+                            mbps = to / 1e6,
+                            cap_mbps = rate.cap() / 1_000_000,
+                            loss = rate.loss(),
+                            queued,
+                            rtt_ms = path.map(|p| p.rtt.as_millis()),
+                            reason = rate.reason().name(),
+                            "bitrate changed"
+                        );
+                    }
                     video.set_bitrate(bps);
                 }
+                let report = Report {
+                    sending: rate.sending(),
+                    target: f64::from(rate.bitrate()),
+                    limit: f64::from(rate.own_limit()),
+                    congested: rate.bitrate() < before && rate.cut_for_the_path(),
+                };
+                rate.set_share(shared.report_upload(id, now, report));
                 let congestion = path.map_or(0, |p| p.congestion_events);
                 let local = crate::input::local_activity();
                 let host_priority = trace.host_priority_drops.load(Ordering::Relaxed);
@@ -381,11 +449,37 @@ async fn stream(
                     });
                     let stats = HostMsg::VideoStats {
                         bitrate_kbps: rate.bitrate() / 1000,
+                        max_kbps: rate.cap() / 1000,
+                        reason: rate.reason().name().to_owned(),
+                        encoder_limited: rate.encoder_limited(),
                         loss_permille: (rate.loss() * 1000.0).round() as u16,
                         gpu,
                         perf,
                     };
                     net::write_msg(&mut send, &stats).await?;
+                    let feedback = rate.report().unwrap_or_default();
+                    shared.set_stats(id, SessionStats {
+                        sending_mbps: rate.sending() as f32 / 1e6,
+                        target_mbps: rate.bitrate() as f32 / 1e6,
+                        max_mbps: rate.cap() as f32 / 1e6,
+                        reason: rate.reason().name(),
+                        rtt_ms: path.map_or(0.0, |p| p.rtt.as_secs_f32() * 1000.0),
+                        loss: rate.loss(),
+                        jitter_ms: feedback.jitter_us as f32 / 1000.0,
+                        decode_ms: feedback.decode_us as f32 / 1000.0,
+                        relayed: path.is_some_and(|p| p.kind == net::PathKind::Relay),
+                        encoder_limited: rate.encoder_limited(),
+                        encoder: encoder_name.clone(),
+                        width: size.0,
+                        height: size.1,
+                    });
+                }
+            }
+            _ = pointer_tick.tick() => {
+                let pointers = shared.pointers_for(id);
+                if pointers != pointers_sent {
+                    pointers_sent.clone_from(&pointers);
+                    net::write_msg(&mut send, &HostMsg::Pointers(pointers)).await?;
                 }
             }
             datagram = conn.read_datagram() => {
@@ -393,6 +487,7 @@ async fn stream(
                 if let Ok(position) = CursorPosition::decode(&datagram) && remote_seq.is_none_or(|seq| position.is_newer_than(seq)) {
                         remote_seq = Some(position.seq);
                         if let Some(cursor) = &cursor { cursor.set_remote_pointer(position); }
+                        shared.set_pointer(id, position.visible.then_some((position.x, position.y)));
                 }
             }
             Some(Unavailable { device, reason }) = unavailable.recv() => {
@@ -404,9 +499,12 @@ async fn stream(
                     send_frame(conn, &frame, stamp, rate.loss(), rate.bitrate() / 1000, trace)?;
                 }
                 Some(Ok(VideoEvent::Encoder { name, codec })) => {
+                    encoder_name = format!("{codec} · {name}");
                     net::write_msg(&mut send, &HostMsg::VideoEncoder { name, codec }).await?;
                 }
-                Some(Ok(VideoEvent::Format { width, height })) => {
+                Some(Ok(VideoEvent::Format { width, height, fps })) => {
+                    rate.set_format(width, height, fps);
+                    size = (width, height);
                     net::write_msg(&mut send, &HostMsg::VideoFormat { width, height }).await?;
                 }
                 Some(Err(e)) => return Err(e.context("screen capture failed")),

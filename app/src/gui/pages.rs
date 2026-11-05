@@ -18,7 +18,7 @@ use super::{
     App, ClientState, Dialog, Page, icons,
     prompt::permission_toggles,
     session_files,
-    settings::{self, BITRATE_CHOICES_MBPS, FRAME_RATE_CHOICES, KnownDevice},
+    settings::{self, BITRATE_CHOICES_MBPS, FRAME_RATE_CHOICES, KnownDevice, MIN_BITRATE_CHOICES_MBPS},
     theme::{self, Glass},
     window,
 };
@@ -30,6 +30,15 @@ const EDGE: f32 = 12.0;
 const CARD: egui::Vec2 = vec2(136.0, 178.0);
 const CARD_GAP: f32 = 12.0;
 /// How long a notice stays up.
+/// Whether this PC can be connected to: it can capture its screen, or it's sharing a test image.
+fn can_host() -> bool {
+    VideoSource::SCREEN_SUPPORTED || std::env::var_os("CONNECT_TEST_PATTERN").is_some()
+}
+
+/// In the maximum bitrate's list, for typing one in.
+const CUSTOM_BITRATE: u32 = u32::MAX;
+/// As many people as the host can ask for: their upload and graphics card set the real limit.
+const MOST_CONNECTIONS: u32 = 1000;
 const NOTICE_TIME: Duration = Duration::from_secs(6);
 const ERROR_TIME: Duration = Duration::from_secs(12);
 
@@ -131,9 +140,12 @@ pub fn sidebar(app: &mut App, ui: &mut Ui, area: Rect) -> Rect {
     if open < 0.5 {
         ui.interact(status, Id::unique("status"), Sense::hover()).on_hover_text(text);
     }
-    if let Some(hosting) = &app.hosting {
+    if let Some(first) = app.hosting.first() {
         y -= 30.0;
-        let text = format!("{} is connected", hosting.client_name);
+        let text = match app.hosting.len() {
+            1 => format!("{} is connected", first.client_name),
+            count => format!("{count} people connected"),
+        };
         painter.text(pos2(icon_x, y), Align2::CENTER_CENTER, icons::BROADCAST, theme::icon_font(17.0), theme::ACCENT);
         label(y, &text, FontId::proportional(13.0), theme::ACCENT);
         let row = Rect::from_min_max(pos2(bar.left() + 8.0, y - 14.0), pos2(bar.right() - 8.0, y + 14.0));
@@ -207,7 +219,7 @@ pub fn computers(app: &mut App, ui: &mut Ui) {
     notice(app, ui);
 
     let mut cards = Vec::with_capacity(app.settings.computers.len() + 2);
-    if VideoSource::SCREEN_SUPPORTED {
+    if can_host() {
         cards.push(Card::ThisPc);
     }
     cards.extend((0..app.settings.computers.len()).map(Card::Saved));
@@ -312,21 +324,28 @@ fn this_pc_card(app: &mut App, ui: &mut Ui, rect: Rect, action: &mut Option<Acti
     let rect = card_glass(ui, rect, Id::unique("this-pc"));
     let tint = if app.settings.accepting { theme::GOOD } else { Color32::from_gray(150) };
     computer_tile(ui, pos2(rect.center().x, rect.top() + 50.0), tint);
-    let (detail, color) = match &app.hosting {
-        Some(hosting) => (format!("In use · {}", elapsed(hosting.since)), theme::ACCENT),
+    let (detail, color) = match app.hosting.first() {
+        Some(first) => {
+            let people = match app.hosting.len() {
+                1 => String::new(),
+                count => format!(" by {count}"),
+            };
+            (format!("In use{people} · {}", elapsed(first.since)), theme::ACCENT)
+        }
         None if app.settings.accepting => ("This PC · sharing on".to_owned(), theme::DIM),
         None => ("This PC · sharing off".to_owned(), theme::DIM),
     };
     let name = app.settings.device_name.trim();
     let name_rect = card_text(ui, rect, if name.is_empty() { "This PC" } else { name }, &detail, color);
-    let about = match &app.hosting {
-        Some(hosting) => format!("{} is connected to this PC.", hosting.client_name),
-        None => "This PC. Others connect to it with your User-ID, found in Settings.".to_owned(),
+    let names = app.hosting.iter().map(|session| session.client_name.as_str()).collect::<Vec<_>>().join(", ");
+    let about = match names.is_empty() {
+        false => format!("{names} connected to this PC."),
+        true => "This PC. Others connect to it with your User-ID, found in Settings.".to_owned(),
     };
     ui.interact(name_rect, Id::unique("this-pc-name"), Sense::hover()).on_hover_text(about);
 
     let mut footer = card_footer(ui, rect);
-    if app.hosting.is_some() {
+    if !app.hosting.is_empty() {
         let width = footer.available_width();
         if footer.add(theme::secondary("Manage").small().width(width)).clicked() {
             *action = Some(Action::Manage);
@@ -405,7 +424,7 @@ fn saved_card(
     // Manage and Remove, in the corners while the pointer is over the card.
     let shown = ui.ctx().animate_bool_with_time(id.with("remove"), hovered, 0.15);
     if shown > 0.0 {
-        if VideoSource::SCREEN_SUPPORTED
+        if can_host()
             && let Some(user_id) = device.user_id()
         {
             let corner = Rect::from_center_size(pos2(rect.left() + 19.0, rect.top() + 19.0), vec2(24.0, 24.0));
@@ -454,6 +473,7 @@ pub fn dialogs(app: &mut App, ctx: &egui::Context) {
     match app.dialog {
         Some(Dialog::AddComputer) => add_dialog(app, ctx),
         Some(Dialog::Hosting) => hosting_dialog(app, ctx),
+        Some(Dialog::Connector(id)) => connector_dialog(app, ctx, id),
         Some(Dialog::Device(peer)) => device_dialog(app, ctx, peer),
         None => {}
     }
@@ -540,20 +560,98 @@ fn add_dialog(app: &mut App, ctx: &egui::Context) {
     }
 }
 
+/// Everyone connected: who they are, what they're getting, and control over all of them.
 fn hosting_dialog(app: &mut App, ctx: &egui::Context) {
-    let Some(hosting) = &mut app.hosting else {
+    if app.hosting.is_empty() {
         app.dialog = None;
         return;
+    }
+    let sessions = app.hosting.clone();
+    let mut limit = app.settings.max_connections;
+    let mut opened = None;
+    let mut dropped = None;
+    let mut disallow: &[DeviceClass] = &[];
+    let (done, dismissed) = theme::dialog(ctx, "hosting", 520.0, |ui| {
+        ui.label(RichText::new("Connected to this PC").font(theme::semibold(19.0)));
+        ui.add_space(8.0);
+        egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
+            for session in &sessions {
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new(&session.client_name).font(theme::medium(14.0)));
+                        ui.label(theme::caption(format!(
+                            "Player {} · {} · {:.1} Mb/s · {:.0} ms",
+                            session.player,
+                            elapsed(session.since),
+                            session.stats.sending_mbps,
+                            session.stats.rtt_ms
+                        )));
+                    });
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.add(theme::danger("Drop").small()).clicked() {
+                            dropped = Some(session.id);
+                        }
+                        if ui.add(theme::secondary("Manage").small()).clicked() {
+                            opened = Some(session.id);
+                        }
+                    });
+                });
+                ui.add_space(6.0);
+            }
+        });
+        ui.add_space(6.0);
+        theme::section_title(ui, "For everyone connected");
+        ui.horizontal_wrapped(|ui| {
+            if ui.add(theme::secondary("Disallow all mouse").small()).clicked() {
+                disallow = &[DeviceClass::Mouse];
+            }
+            if ui.add(theme::secondary("Disallow all keyboard").small()).clicked() {
+                disallow = &[DeviceClass::Keyboard];
+            }
+            if ui.add(theme::secondary("Disallow all").small()).clicked() {
+                disallow = &[DeviceClass::Mouse, DeviceClass::Keyboard, DeviceClass::Gamepad];
+            }
+        });
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Most people at once").font(theme::medium(14.0)));
+            ui.add(egui::DragValue::new(&mut limit).range(1..=MOST_CONNECTIONS));
+        });
+        ui.add_space(12.0);
+        theme::right_row(ui, |ui| ui.add(theme::primary("Done")).clicked())
+    });
+    if limit != app.settings.max_connections {
+        app.settings.max_connections = limit;
+        app.host.set_max_connections(limit);
+    }
+    for &device in disallow {
+        app.host.disallow_all(device);
+    }
+    if let Some(id) = dropped {
+        app.host.disconnect_session(id);
+    }
+    if let Some(id) = opened {
+        app.dialog = Some(Dialog::Connector(id));
+    } else if done || dismissed {
+        app.dialog = None;
+    }
+}
+
+/// One connector: what they may use, and how their session is going.
+fn connector_dialog(app: &mut App, ctx: &egui::Context, id: connect_host::SessionId) {
+    let Some(session) = app.hosting.iter().find(|session| session.id == id).cloned() else {
+        app.dialog = Some(Dialog::Hosting);
+        return;
     };
-    let peer = hosting.peer;
-    let mut permissions = hosting.permissions;
+    let mut permissions = session.permissions;
     let driver = &mut app.gamepad_driver;
-    let ((disconnect, done), dismissed) = theme::dialog(ctx, "hosting", 440.0, |ui| {
-        ui.label(RichText::new(format!("{} is connected", hosting.client_name)).font(theme::semibold(19.0)));
+    let ((disconnect, done), dismissed) = theme::dialog(ctx, "connector", 460.0, |ui| {
+        ui.label(RichText::new(&session.client_name).font(theme::semibold(19.0)));
         ui.label(theme::caption(format!(
-            "For {} · User-ID {}",
-            elapsed(hosting.since),
-            short_id(&hosting.peer.to_string())
+            "Player {} · connected for {} · User-ID {}",
+            session.player,
+            elapsed(session.since),
+            short_id(&session.peer.to_string())
         )));
         ui.add_space(10.0);
         theme::section_title(ui, "They can use");
@@ -561,22 +659,39 @@ fn hosting_dialog(app: &mut App, ctx: &egui::Context) {
         if permissions.allows(DeviceClass::Gamepad) {
             driver.setup_row(ui);
         }
+        ui.add_space(10.0);
+        theme::section_title(ui, "Session");
+        let stats = &session.stats;
+        let route = if stats.relayed { "relayed" } else { "direct" };
+        ui.label(theme::caption(format!(
+            "Sending {:.1} Mb/s · target {:.1} · maximum {:.0}\nLast change: {}",
+            stats.sending_mbps, stats.target_mbps, stats.max_mbps, stats.reason
+        )));
+        ui.label(theme::caption(format!(
+            "Round trip {:.0} ms ({route}) · packet loss {:.1}% · jitter {:.1} ms · decoding {:.1} ms",
+            stats.rtt_ms,
+            stats.loss * 100.0,
+            stats.jitter_ms,
+            stats.decode_ms
+        )));
+        let limit = if stats.encoder_limited { " · encoder at its limit" } else { "" };
+        ui.label(theme::caption(format!("{}×{} · {}{limit}", stats.width, stats.height, stats.encoder)));
         ui.add_space(12.0);
         theme::right_row(ui, |ui| {
-            let done = ui.add(theme::primary("Done")).clicked();
-            let disconnect = ui.add(theme::danger("Disconnect").icon(icons::SIGN_OUT)).clicked();
+            let done = ui.add(theme::primary("Back")).clicked();
+            let disconnect = ui.add(theme::danger("Drop").icon(icons::SIGN_OUT)).clicked();
             (disconnect, done)
         })
     });
-    if app.hosting.as_ref().is_some_and(|h| h.permissions != permissions) {
-        let always_allow = app.settings.device(peer).is_some_and(|d| d.always_allow);
-        app.set_device_access(peer, permissions, always_allow);
+    if session.permissions != permissions {
+        let always_allow = app.settings.device(session.peer).is_some_and(|d| d.always_allow);
+        app.set_device_access(session.peer, permissions, always_allow);
     }
     if disconnect {
-        app.host.disconnect();
+        app.host.disconnect_session(id);
     }
     if disconnect || done || dismissed {
-        app.dialog = None;
+        app.dialog = Some(Dialog::Hosting);
     }
 }
 
@@ -688,17 +803,69 @@ pub fn settings(app: &mut App, ui: &mut Ui) {
         ui.add_space(gap);
     }
 
-    if VideoSource::SCREEN_SUPPORTED {
+    if can_host() {
         theme::card(ui, |ui| {
             theme::section_title(ui, "Stream quality");
             ui.label(theme::caption(
-                "The most video data per second this PC sends when sharing. Higher looks sharper, especially at \
-                 120+ fps, but needs a faster upload. Applies from the next connection.",
+                "How much video data this PC sends to each person. The bitrate follows each connection \
+                 by itself, and these are its limits. Changes apply straight away.",
             ));
             ui.add_space(4.0);
-            let options = BITRATE_CHOICES_MBPS.map(|mbps| (mbps, format!("{mbps} Mb/s")));
-            if theme::dropdown(ui, "stream-quality", &mut app.settings.bitrate_mbps, &options) {
-                app.host.set_bitrate_mbps(app.settings.bitrate_mbps);
+            let before = app.settings.bitrate();
+            let modes = [(true, "Automatic (recommended)".to_owned()), (false, "Manual".to_owned())];
+            theme::dropdown(ui, "bitrate-mode", &mut app.settings.bitrate_automatic, &modes);
+            ui.add_space(10.0);
+            ui.label(RichText::new("Maximum bitrate").font(theme::medium(14.0)));
+            ui.label(theme::caption(
+                "The stream may use up to this. It's a limit, not a speed to hold: a slower connection \
+                 gets less. Automatic also stops at what the picture can use.",
+            ));
+            ui.add_space(4.0);
+            let mut options: Vec<(u32, String)> =
+                BITRATE_CHOICES_MBPS.iter().map(|&mbps| (mbps, format!("{mbps} Mb/s"))).collect();
+            if !BITRATE_CHOICES_MBPS.contains(&app.settings.bitrate_mbps) {
+                options.push((app.settings.bitrate_mbps, format!("{} Mb/s", app.settings.bitrate_mbps)));
+            }
+            options.push((CUSTOM_BITRATE, "Custom".to_owned()));
+            let mut chosen = app.settings.bitrate_mbps;
+            theme::dropdown(ui, "stream-quality", &mut chosen, &options);
+            if chosen != CUSTOM_BITRATE {
+                app.settings.bitrate_mbps = chosen;
+            } else if !BITRATE_CHOICES_MBPS.contains(&app.settings.bitrate_mbps) {
+                app.settings.bitrate_mbps = app.settings.bitrate_mbps.max(1);
+            } else {
+                app.settings.bitrate_mbps = 150;
+            }
+            if !BITRATE_CHOICES_MBPS.contains(&app.settings.bitrate_mbps) {
+                ui.add(egui::DragValue::new(&mut app.settings.bitrate_mbps).range(2..=1000).suffix(" Mb/s"));
+            }
+            ui.add_space(10.0);
+            ui.label(RichText::new("Minimum bitrate").font(theme::medium(14.0)));
+            ui.label(theme::caption("The stream stays above this unless the connection can't carry even that."));
+            ui.add_space(4.0);
+            let options = MIN_BITRATE_CHOICES_MBPS.map(|mbps| (mbps, format!("{mbps} Mb/s")));
+            theme::dropdown(ui, "minimum-bitrate", &mut app.settings.bitrate_min_mbps, &options);
+            if app.settings.bitrate() != before {
+                app.host.set_bitrate(app.settings.bitrate());
+            }
+            ui.add_space(10.0);
+            ui.label(RichText::new("Most people at once").font(theme::medium(14.0)));
+            ui.label(theme::caption(
+                "Each person is a separate stream, so the upload and graphics card have to carry them all. \
+                 With too many, it will run badly for everyone.",
+            ));
+            ui.add_space(4.0);
+            let before = app.settings.max_connections;
+            ui.add(egui::DragValue::new(&mut app.settings.max_connections).range(1..=MOST_CONNECTIONS));
+            if app.settings.max_connections != before {
+                app.host.set_max_connections(app.settings.max_connections);
+            }
+            if let Some(encoders) = app.encoders.get() {
+                ui.add_space(10.0);
+                ui.label(RichText::new("Encoders on this PC").font(theme::medium(14.0)));
+                for encoder in encoders.iter().filter(|encoder| encoder.usable) {
+                    ui.label(theme::caption(format!("{} · {}", encoder.kind.label(), encoder.codec)));
+                }
             }
             ui.add_space(10.0);
             ui.label(RichText::new("Frame rate limit").font(theme::medium(14.0)));

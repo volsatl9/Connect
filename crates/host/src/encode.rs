@@ -44,6 +44,8 @@ const INTRA_PERIOD_FRAMES: u32 = 600;
 const KEYFRAME_PERIOD: Duration = Duration::from_secs(30);
 /// How long one capture wait may block, so a stop request is noticed promptly.
 const POLL: Duration = Duration::from_millis(100);
+/// Why a session can't start: the graphics card has no encoding session left for it.
+pub(crate) const NO_ENCODER: &str = "no encoder available";
 /// How soon to look again while a captured picture waits for the network to catch up.
 const HELD_POLL: Duration = Duration::from_millis(2);
 
@@ -52,6 +54,7 @@ pub(crate) enum VideoEvent {
     Format {
         width: u32,
         height: u32,
+        fps: u32,
     },
     Frame(EncodedFrame, FrameStamp),
     Encoder {
@@ -82,47 +85,48 @@ pub(crate) type Backlogged = Box<dyn Fn() -> bool + Send + Sync>;
 struct Control {
     keyframe: AtomicBool,
     bitrate: AtomicU32,
+    /// The most the session may ask for, which the encoder is opened for.
+    peak: u32,
+    /// Whether a graphics card is doing the encoding.
+    hardware: AtomicBool,
     codec: Mutex<Codec>,
     stop: AtomicBool,
     frame_rate_limit: u32,
     backlogged: Backlogged,
 }
 
-/// Runs capture and encode on a dedicated thread, which stops when this is dropped.
+/// One session's video, from [`VideoHub`]. It stops when this is dropped.
 pub(crate) struct VideoStream {
     events: mpsc::Receiver<Result<VideoEvent>>,
     control: Arc<Control>,
+    busy: Arc<AtomicU32>,
 }
 
 impl VideoStream {
+    /// Joins `hub`, starting at `bitrate_bps` and never asking for more than `peak_bps`.
     pub fn start(
-        source: VideoSource,
+        hub: &VideoHub,
         codec: Codec,
         bitrate_bps: u32,
+        peak_bps: u32,
         frame_rate_limit: u32,
         backlogged: Backlogged,
         trace: Arc<HostTrace>,
     ) -> Result<Self> {
         // Small, so a slow network pushes back on the encoder instead of queueing stale frames.
-        let (tx, events) = mpsc::channel(2);
+        let (tx, events) = mpsc::channel(4);
         let control = Arc::new(Control {
             keyframe: AtomicBool::new(false),
             bitrate: AtomicU32::new(bitrate_bps),
+            peak: peak_bps.max(bitrate_bps),
+            hardware: AtomicBool::new(false),
             codec: Mutex::new(codec),
             stop: AtomicBool::new(false),
             frame_rate_limit,
             backlogged,
         });
-        let thread = control.clone();
-        std::thread::Builder::new()
-            .name("connect-video".into())
-            .spawn(move || {
-                if let Err(e) = run(&source, &tx, &thread, &trace) {
-                    let _ = tx.blocking_send(Err(e));
-                }
-            })
-            .context("starting video thread")?;
-        Ok(Self { events, control })
+        hub.join(Joiner { tx, control: control.clone(), trace })?;
+        Ok(Self { events, control, busy: hub.busy.clone() })
     }
 
     /// The next event; `None` once the thread has stopped.
@@ -133,6 +137,14 @@ impl VideoStream {
     /// Makes the next encoded frame a keyframe, even if the screen hasn't changed.
     pub fn request_keyframe(&self) {
         self.control.keyframe.store(true, Ordering::Relaxed);
+    }
+
+    /// How hard the encoding is working, for the rate controller.
+    pub fn encoder_load(&self) -> crate::rate::EncoderLoad {
+        crate::rate::EncoderLoad {
+            busy: f64::from(self.busy.load(Ordering::Relaxed)) / 1000.0,
+            hardware: self.control.hardware.load(Ordering::Relaxed),
+        }
     }
 
     /// Changes the target bitrate from the next frame on.
@@ -150,6 +162,67 @@ impl Drop for VideoStream {
     fn drop(&mut self) {
         self.control.stop.store(true, Ordering::Relaxed);
     }
+}
+
+/// Whose encoder it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncoderKind {
+    Nvenc,
+    Amf,
+    QuickSync,
+    OtherHardware,
+    Software,
+}
+
+impl EncoderKind {
+    /// From a driver's name for its encoder.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn of(name: &str) -> Self {
+        let name = name.to_lowercase();
+        if name.contains("nvidia") {
+            Self::Nvenc
+        } else if name.contains("amd") {
+            Self::Amf
+        } else if name.contains("intel") || name.contains("quick sync") {
+            Self::QuickSync
+        } else {
+            Self::OtherHardware
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Nvenc => "NVIDIA NVENC",
+            Self::Amf => "AMD AMF",
+            Self::QuickSync => "Intel Quick Sync",
+            Self::OtherHardware => "Graphics card",
+            Self::Software => "Processor",
+        }
+    }
+}
+
+/// An encoder on this PC.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncoderInfo {
+    pub kind: EncoderKind,
+    pub codec: Codec,
+    pub name: String,
+    /// Whether Connect can use it: AV1 encoders are listed, not driven yet.
+    pub usable: bool,
+}
+
+/// What can encode on this PC, separately from anything about the network.
+#[cfg_attr(not(windows), allow(clippy::vec_init_then_push))]
+pub fn encoder_capabilities() -> Vec<EncoderInfo> {
+    let mut list = Vec::new();
+    #[cfg(windows)]
+    for codec in [Codec::H265, Codec::H264, Codec::Av1] {
+        for name in mf::encoder_names(codec).unwrap_or_default() {
+            list.push(EncoderInfo { kind: EncoderKind::of(&name), codec, name, usable: codec != Codec::Av1 });
+        }
+    }
+    list.push(EncoderInfo { kind: EncoderKind::Software, codec: Codec::H264, name: "OpenH264".into(), usable: true });
+    list
 }
 
 /// The codecs this host can encode from `source`, for choosing one with the viewer.
@@ -301,24 +374,6 @@ fn open_software_encoder(codec: Codec, bitrate: u32, fps: u32) -> Result<Box<dyn
     }
 }
 
-/// Opens the graphics-card-only path for `codec` at this size: NV12 conversion on the device
-/// the capture uses, and a hardware encoder reading its textures.
-#[cfg(windows)]
-fn open_gpu_path(
-    device: &windows::Win32::Graphics::Direct3D11::ID3D11Device,
-    codec: Codec,
-    width: u32,
-    height: u32,
-    bitrate: u32,
-    fps: u32,
-) -> Result<(Stage, Box<dyn VideoEncoder>)> {
-    let converter = crate::gpu::Nv12Converter::new(device, width, height).context("GPU colour conversion")?;
-    tracing::info!(method = %converter.method(), "GPU colour conversion");
-    let encoder = or_h264(codec, |codec| mf::HardwareEncoder::new(codec, width, height, bitrate, fps, Some(device)))
-        .context("GPU encoder taking textures")?;
-    Ok((Stage::Gpu(converter), Box::new(encoder)))
-}
-
 /// Whether to try keeping pictures on the graphics card. On by default for the real screen;
 /// `CONNECT_GPU_PIPELINE=0` turns it off, e.g. to compare.
 fn gpu_pipeline_wanted(source: &VideoSource) -> bool {
@@ -329,12 +384,6 @@ fn gpu_pipeline_wanted(source: &VideoSource) -> bool {
 
 fn micros(duration: Duration) -> u32 {
     duration.as_micros().min(u32::MAX as u128) as u32
-}
-
-/// The stream's encoder and the picture it reads, rebuilt when the size or codec changes.
-struct Pipeline {
-    stage: Stage,
-    encoder: Box<dyn VideoEncoder>,
 }
 
 /// Hardware encoders budget a frame as the bitrate over the frame rate they were told, which is
@@ -388,284 +437,489 @@ fn capped_fps(refresh: u32, limit: u32) -> u32 {
     if limit == 0 { refresh } else { refresh.min(limit) }
 }
 
-fn run(
-    source: &VideoSource,
-    tx: &mpsc::Sender<Result<VideoEvent>>,
-    control: &Control,
-    trace: &HostTrace,
-) -> Result<()> {
-    let mut capturer = source.open()?;
-    let refresh = capturer.refresh_hz().unwrap_or(DEFAULT_FPS).clamp(30, 240);
-    let fps = capped_fps(refresh, control.frame_rate_limit);
-    // Turned off for the rest of the stream once anything on the graphics-card path fails.
-    let mut gpu = gpu_pipeline_wanted(source);
-    // Codecs that failed here; the stream stays off them even if the session asks again.
-    let mut failed: Vec<Codec> = Vec::new();
-    let mut pipeline: Option<Pipeline> = None;
-    let mut bitrate = control.bitrate.load(Ordering::Relaxed);
-    let mut frame_rate = FrameRateScale::new();
-    // Whether the staged picture is newer than the last one sent. The last picture is kept
-    // so a keyframe can be sent while the screen is static, and so a picture held back while
-    // the network catches up can be sent once it has.
-    let mut unsent = false;
-    let mut picture_time_us = 0;
-    // How long the staged picture took to capture, and how long it was on screen before that.
-    let (mut picture_capture_us, mut picture_present_us) = (0, 0);
-    // For the trace: captures so far, and the staged picture's number and when it was staged.
-    let mut captures = 0u64;
-    let (mut picture_index, mut picture_staged) = (0u64, Instant::now());
-    // Why the staged picture hasn't gone yet, for when a newer one replaces it.
-    let mut waiting = Replaced::No;
-    let mut sent_time_us = 0;
-    // At most one picture per refresh of the host's screen or the limit (with a little slack for
-    // jitter): a game presenting faster than that would spend bitrate on pictures nobody sees.
-    let frame_interval = Duration::from_secs(1) * 19 / (20 * fps);
-    let mut last_sent: Option<Instant> = None;
-    let mut last_keyframe = Instant::now();
-    let mut seq = 0u32;
-    let clock_start = now_micros();
-    let stream_start = Instant::now();
-    let send = |event| tx.blocking_send(Ok(event)).is_ok();
-    let wanted_codec = |failed: &[Codec]| {
-        let codec = *control.codec.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if failed.contains(&codec) { Codec::H264 } else { codec }
-    };
+/// One capture for everyone connected, as Windows lets a process duplicate a screen only once.
+/// Each session has its own encoder and bitrate on the one video thread, working through the
+/// picture in turn: a graphics card has one encoding engine to share anyway, and the converted
+/// picture stays where every encoder can read it.
+pub(crate) struct VideoHub {
+    source: VideoSource,
+    state: Arc<Mutex<HubState>>,
+    /// Share of the time spent encoding, in thousandths.
+    busy: Arc<AtomicU32>,
+}
 
-    while !control.stop.load(Ordering::Relaxed) {
-        // Until the next picture may go: the wait for a held picture's turn.
-        let slot = last_sent.map_or(Duration::ZERO, |sent| frame_interval.saturating_sub(sent.elapsed()));
-        let timeout = match (unsent, slot.is_zero()) {
+#[derive(Default)]
+struct HubState {
+    joining: Vec<Joiner>,
+    running: bool,
+}
+
+struct Joiner {
+    tx: mpsc::Sender<Result<VideoEvent>>,
+    control: Arc<Control>,
+    trace: Arc<HostTrace>,
+}
+
+impl VideoHub {
+    pub fn new(source: VideoSource) -> Self {
+        Self { source, state: Arc::default(), busy: Arc::default() }
+    }
+
+    fn join(&self, joiner: Joiner) -> Result<()> {
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.joining.push(joiner);
+        if state.running {
+            return Ok(());
+        }
+        let (source, shared, busy) = (self.source.clone(), self.state.clone(), self.busy.clone());
+        std::thread::Builder::new()
+            .name("connect-video".into())
+            .spawn(move || run_until_empty(&source, &shared, &busy))
+            .context("starting video thread")?;
+        state.running = true;
+        Ok(())
+    }
+}
+
+/// One session's side of the video thread.
+struct Output {
+    tx: mpsc::Sender<Result<VideoEvent>>,
+    control: Arc<Control>,
+    trace: Arc<HostTrace>,
+    encoder: Option<Box<dyn VideoEncoder>>,
+    /// Encode on the processor from now on: the graphics card failed this session.
+    software: bool,
+    /// Codecs that failed here; the stream stays off them even if the session asks again.
+    failed: Vec<Codec>,
+    /// What the encoder was last told, and what makes that come to the target.
+    bitrate: u32,
+    frame_rate: FrameRateScale,
+    fps: u32,
+    frame_interval: Duration,
+    /// The size the session was last told.
+    announced: Option<(u32, u32)>,
+    /// Whether the staged picture is newer than the last one sent. The last picture is kept so a
+    /// keyframe can be sent while the screen is static, and so a picture held back while the
+    /// network catches up can be sent once it has.
+    unsent: bool,
+    /// Why the staged picture hasn't gone yet, for when a newer one replaces it.
+    waiting: Replaced,
+    sent_time_us: u64,
+    last_sent: Option<Instant>,
+    last_keyframe: Instant,
+    seq: u32,
+    /// The session has gone, or its encoder can't be opened.
+    gone: bool,
+}
+
+impl Output {
+    fn new(joiner: Joiner, refresh: u32) -> Self {
+        let fps = capped_fps(refresh, joiner.control.frame_rate_limit);
+        Self {
+            bitrate: joiner.control.peak,
+            tx: joiner.tx,
+            control: joiner.control,
+            trace: joiner.trace,
+            encoder: None,
+            software: false,
+            failed: Vec::new(),
+            frame_rate: FrameRateScale::new(),
+            fps,
+            // At most one picture per refresh of the host's screen or the limit (with a little
+            // slack for jitter): a game presenting faster would spend bitrate on pictures nobody
+            // sees.
+            frame_interval: Duration::from_secs(1) * 19 / (20 * fps),
+            announced: None,
+            unsent: true,
+            waiting: Replaced::No,
+            sent_time_us: 0,
+            last_sent: None,
+            last_keyframe: Instant::now(),
+            seq: 0,
+            gone: false,
+        }
+    }
+
+    fn send(&mut self, event: VideoEvent) {
+        match self.tx.try_send(Ok(event)) {
+            Ok(()) => {}
+            // No room is a frame lost to a session that isn't keeping up, never a wait: the
+            // others are depending on this thread.
+            Err(mpsc::error::TrySendError::Full(_)) => self.control.keyframe.store(true, Ordering::Relaxed),
+            Err(mpsc::error::TrySendError::Closed(_)) => self.gone = true,
+        }
+    }
+
+    fn fail(&mut self, error: anyhow::Error) {
+        let _ = self.tx.try_send(Err(error));
+        self.gone = true;
+    }
+
+    /// How soon this session's next picture may go, given whether one is waiting.
+    fn wait(&self) -> Duration {
+        let slot = self.last_sent.map_or(Duration::ZERO, |sent| self.frame_interval.saturating_sub(sent.elapsed()));
+        match (self.unsent, slot.is_zero()) {
             (false, _) => POLL,
             (true, true) => HELD_POLL,
             (true, false) => slot.min(HELD_POLL),
-        };
-        let codec = wanted_codec(&failed);
-        let fresh = capture(
-            &mut *capturer,
-            &mut pipeline,
-            &mut gpu,
-            source,
-            codec,
-            &mut failed,
-            control.bitrate.load(Ordering::Relaxed),
-            fps,
-            timeout,
-            captures,
-            &send,
-        )?;
-        let Some(fresh) = fresh else { return Ok(()) };
+        }
+    }
+
+    fn wanted_codec(&self) -> Codec {
+        let codec = *self.control.codec.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.failed.contains(&codec) { Codec::H264 } else { codec }
+    }
+}
+
+/// The picture being sent.
+#[derive(Clone, Copy)]
+struct Staged {
+    index: u64,
+    at: Instant,
+    time_us: u64,
+    /// How long it took to capture, and how long it was on screen before that.
+    capture_us: u32,
+    present_us: u32,
+}
+
+/// Runs the video thread until nobody's left, and starts over for anyone who joined as it ended.
+fn run_until_empty(source: &VideoSource, state: &Mutex<HubState>, busy: &AtomicU32) {
+    let lock = || state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    loop {
+        let mut outputs = Vec::new();
+        if let Err(error) = run(source, state, busy, &mut outputs) {
+            for output in &mut outputs {
+                output.fail(anyhow::anyhow!("{error:#}"));
+            }
+            for joiner in lock().joining.drain(..) {
+                let _ = joiner.tx.try_send(Err(anyhow::anyhow!("{error:#}")));
+            }
+        }
+        let mut state = lock();
+        if state.joining.is_empty() {
+            state.running = false;
+            return;
+        }
+    }
+}
+
+fn run(source: &VideoSource, state: &Mutex<HubState>, busy: &AtomicU32, outputs: &mut Vec<Output>) -> Result<()> {
+    let mut capturer = source.open()?;
+    let refresh = capturer.refresh_hz().unwrap_or(DEFAULT_FPS).clamp(30, 240);
+    // Turned off for the rest of the stream once anything on the graphics-card path fails.
+    let mut gpu = gpu_pipeline_wanted(source);
+    let mut stage: Option<Stage> = None;
+    // What a picture in memory is laid out as: what the encoders read.
+    let mut layout = Layout::I420;
+    let mut captures = 0u64;
+    let mut picture: Option<Staged> = None;
+    let clock_start = now_micros();
+    let stream_start = Instant::now();
+    let (mut busy_since, mut busy_time) = (Instant::now(), Duration::ZERO);
+
+    loop {
+        {
+            let mut state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            outputs.extend(state.joining.drain(..).map(|joiner| Output::new(joiner, refresh)));
+        }
+        outputs.retain(|output| !output.gone && !output.control.stop.load(Ordering::Relaxed));
+        if outputs.is_empty() {
+            return Ok(());
+        }
+        let timeout = outputs.iter().map(Output::wait).min().unwrap_or(POLL);
+        let mut resized = false;
+        let fresh = capture(&mut *capturer, &mut stage, &mut gpu, layout, timeout, captures, &mut resized)?;
+        if resized {
+            for output in outputs.iter_mut() {
+                output.encoder = None;
+            }
+        }
         let staged = Instant::now();
-        let now_us = clock_start + stream_start.elapsed().as_micros() as u64;
         #[cfg(windows)]
-        if let Some(Pipeline { stage: Stage::Gpu(converter), .. }) = &mut pipeline {
+        if let Some(Stage::Gpu(converter)) = &mut stage {
             converter.poll_timings(|capture, gpu_us| {
-                trace.conversions.push(crate::trace::ConvertRecord { capture, gpu_us });
+                for output in outputs.iter() {
+                    output.trace.conversions.push(crate::trace::ConvertRecord { capture, gpu_us });
+                }
             });
         }
         if fresh {
-            (picture_index, picture_staged) = (captures, staged);
-            captures += 1;
-            picture_time_us = now_us;
             let timing = capturer.timing();
-            picture_capture_us = micros(staged.saturating_duration_since(timing.acquired));
-            picture_present_us = timing.present_to_capture.map_or(0, micros);
-            trace.captures.push(CaptureRecord {
-                capture: picture_index,
-                time_us: now_us,
-                capture_us: picture_capture_us,
-                present_to_capture_us: picture_present_us,
-                accumulated: timing.accumulated,
-                replaced: if unsent { waiting } else { Replaced::No },
-            });
-            unsent = true;
-        }
-        let Some(active) = &mut pipeline else { continue };
-
-        let mut force_keyframe = control.keyframe.load(Ordering::Relaxed);
-        if active.encoder.codec() != codec {
-            // The session switched codec: a new encoder, which starts with a keyframe.
-            let (w, h) = active.stage.size();
-            let stage = std::mem::replace(&mut active.stage, Stage::Memory(Picture::new(Layout::I420, 2, 2)));
-            bitrate = control.bitrate.load(Ordering::Relaxed);
-            let rebuilt = rebuild(stage, source, codec, w, h, bitrate, fps)?;
-            *active = rebuilt;
-            if active.encoder.codec() != codec {
-                failed.push(codec);
-            }
-            if !send(VideoEvent::Encoder { name: active.encoder.name().to_owned(), codec: active.encoder.codec() }) {
-                return Ok(());
-            }
-            force_keyframe = true;
-        }
-        // Hold the picture while the network catches up: sent now, it would only queue behind
-        // the rest. Likewise until its turn comes, a newer picture replacing it meanwhile. A
-        // requested keyframe goes regardless, as the viewer is stuck without one.
-        let too_soon = last_sent.is_some_and(|sent| sent.elapsed() < frame_interval);
-        let backlogged = (unsent || force_keyframe) && (control.backlogged)();
-        if !(unsent || force_keyframe) || ((backlogged || too_soon) && !force_keyframe) {
-            waiting = if backlogged { Replaced::Backlog } else { Replaced::Turn };
-            continue;
-        }
-        last_sent = Some(Instant::now());
-        control.keyframe.store(false, Ordering::Relaxed);
-        let resent = !unsent;
-        unsent = false;
-        // Stamped when captured; a static picture sent again as a keyframe is stamped anew, as
-        // hardware encoders need every timestamp later than the last.
-        let capture_time_us = picture_time_us.max(sent_time_us + 1);
-        sent_time_us = capture_time_us;
-
-        let wanted = control.bitrate.load(Ordering::Relaxed);
-        let wanted = if active.encoder.hardware() { frame_rate.apply(wanted) } else { wanted };
-        if wanted != bitrate {
-            active.encoder.set_bitrate(bitrate, wanted);
-            bitrate = wanted;
-        }
-        // The periodic keyframe never jumps the queue as a requested one does.
-        let periodic = !active.encoder.intra_refresh() && last_keyframe.elapsed() >= KEYFRAME_PERIOD;
-        let started = Instant::now();
-        let encoded = match active.encoder.encode(active.stage.input(), capture_time_us, force_keyframe || periodic) {
-            Ok(encoded) => encoded,
-            Err(error) if active.encoder.codec() != Codec::H264 => {
-                // A codec only the graphics card does: H.264 instead, on the graphics card if it
-                // will, where the picture already is.
-                let codec = active.encoder.codec();
-                tracing::warn!("{} failed; switching to H.264: {error:#}", active.encoder.name());
-                failed.push(codec);
-                let (w, h) = active.stage.size();
-                let stage = std::mem::replace(&mut active.stage, Stage::Memory(Picture::new(Layout::I420, 2, 2)));
-                bitrate = control.bitrate.load(Ordering::Relaxed);
-                *active = rebuild(stage, source, Codec::H264, w, h, bitrate, fps)?;
-                if !send(VideoEvent::Encoder { name: active.encoder.name().to_owned(), codec: Codec::H264 }) {
-                    return Ok(());
-                }
-                active.encoder.encode(active.stage.input(), capture_time_us, true)?
-            }
-            Err(error) if active.encoder.hardware() || !matches!(active.stage, Stage::Memory(_)) => {
-                // Carry on on the processor: OpenH264, reading the picture from memory.
-                tracing::warn!("{} failed; recovering on the processor: {error:#}", active.encoder.name());
-                gpu = false;
-                let stage = std::mem::replace(&mut active.stage, Stage::Memory(Picture::new(Layout::I420, 2, 2)));
-                bitrate = control.bitrate.load(Ordering::Relaxed);
-                let encoder = open_software_encoder(Codec::H264, bitrate, fps)?;
-                active.stage = Stage::Memory(stage.into_memory(Layout::I420)?);
-                active.encoder = encoder;
-                if !send(VideoEvent::Encoder { name: active.encoder.name().to_owned(), codec: Codec::H264 }) {
-                    return Ok(());
-                }
-                active.encoder.encode(active.stage.input(), capture_time_us, true)?
-            }
-            Err(error) => return Err(error.context("encoding frame")),
-        };
-        let encoded_at = Instant::now();
-        frame_rate.frame(encoded_at, fps);
-        if encoded.iter().any(|picture| picture.keyframe) {
-            last_keyframe = encoded_at;
-        }
-        let encode_time_us = micros(encoded_at.duration_since(started));
-        let stamp = FrameStamp {
-            capture: picture_index,
-            resent,
-            input_wait_us: active.encoder.input_wait_us(),
-            held_us: if resent { 0 } else { micros(started.saturating_duration_since(picture_staged)) },
-            encoded: encoded_at,
-        };
-        let codec = active.encoder.codec();
-        for picture in encoded {
-            let meta = FrameMeta {
-                seq,
-                keyframe: picture.keyframe,
-                codec,
-                capture_time_us: picture.capture_time_us,
-                encode_time_us,
-                present_to_capture_us: picture_present_us,
-                capture_us: picture_capture_us,
-                // Filled in as the frame goes out.
-                sent_after_us: 0,
+            let staged_picture = Staged {
+                index: captures,
+                at: staged,
+                time_us: clock_start + stream_start.elapsed().as_micros() as u64,
+                capture_us: micros(staged.saturating_duration_since(timing.acquired)),
+                present_us: timing.present_to_capture.map_or(0, micros),
             };
-            seq = seq.wrapping_add(1);
-            if !send(VideoEvent::Frame(EncodedFrame { meta, data: picture.data, arrival: None }, stamp)) {
-                return Ok(());
+            picture = Some(staged_picture);
+            captures += 1;
+            for output in outputs.iter_mut() {
+                output.trace.captures.push(CaptureRecord {
+                    capture: staged_picture.index,
+                    time_us: staged_picture.time_us,
+                    capture_us: staged_picture.capture_us,
+                    present_to_capture_us: staged_picture.present_us,
+                    accumulated: timing.accumulated,
+                    replaced: if output.unsent { output.waiting } else { Replaced::No },
+                });
+                output.unsent = true;
             }
+            // Nobody stays last in line.
+            outputs.rotate_left(1);
+        }
+        let (Some(picture), true) = (picture, stage.is_some()) else { continue };
+        for index in 0..outputs.len() {
+            let others_running = outputs.iter().enumerate().any(|(i, o)| i != index && o.encoder.is_some());
+            let Some(current) = stage.as_mut() else { break };
+            let step = serve(&mut outputs[index], current, source, picture, others_running, &mut layout);
+            busy_time += step.encoding;
+            if step.leave_gpu {
+                // Everyone carries on from memory.
+                gpu = false;
+                let memory = stage.take().context("no picture staged")?.into_memory(Layout::I420)?;
+                layout = Layout::I420;
+                stage = Some(Stage::Memory(memory));
+                for output in outputs.iter_mut() {
+                    output.encoder = None;
+                }
+                break;
+            }
+        }
+        let since = busy_since.elapsed();
+        if since >= FRAME_RATE_PERIOD {
+            let share = busy_time.as_secs_f64() / since.as_secs_f64();
+            busy.store((share * 1000.0).min(1000.0) as u32, Ordering::Relaxed);
+            (busy_since, busy_time) = (Instant::now(), Duration::ZERO);
         }
     }
-    Ok(())
 }
 
-/// A pipeline for `codec` around the picture already staged.
-fn rebuild(
-    stage: Stage,
+#[derive(Default)]
+struct Step {
+    encoding: Duration,
+    /// The graphics-card path can't go on, for anyone.
+    leave_gpu: bool,
+}
+
+/// Opens this session's encoder if it needs one.
+fn prepare(output: &mut Output, stage: &Stage, source: &VideoSource, others_running: bool) -> Step {
+    let (width, height) = stage.size();
+    let wanted = output.wanted_codec();
+    if output.encoder.as_ref().is_some_and(|encoder| encoder.codec() == wanted) {
+        return Step::default();
+    }
+    if output.encoder.as_ref().is_some_and(|encoder| encoder.codec() == Codec::H264 && !encoder.hardware()) {
+        return Step::default(); // nothing faster to go back to
+    }
+    let peak = output.control.peak;
+    let opened = if output.software {
+        open_software_encoder(Codec::H264, peak, output.fps)
+    } else {
+        open_encoder(stage, source, wanted, width, height, peak, output.fps)
+    };
+    match opened {
+        Ok(encoder) => {
+            if encoder.codec() != wanted {
+                output.failed.push(wanted);
+            }
+            output.control.hardware.store(encoder.hardware(), Ordering::Relaxed);
+            output.bitrate = peak;
+            let (name, codec) = (encoder.name().to_owned(), encoder.codec());
+            output.encoder = Some(encoder);
+            output.control.keyframe.store(true, Ordering::Relaxed);
+            if output.announced != Some((width, height)) {
+                output.announced = Some((width, height));
+                output.send(VideoEvent::Format { width, height, fps: output.fps });
+            }
+            output.send(VideoEvent::Encoder { name, codec });
+            Step::default()
+        }
+        // With others encoding, the graphics card is fine and this is one encoder too many.
+        Err(error) if !others_running && !matches!(stage, Stage::Memory(_)) => {
+            tracing::warn!("GPU-only pipeline unavailable, going through memory: {error:#}");
+            Step { leave_gpu: true, ..Step::default() }
+        }
+        Err(error) => {
+            output.fail(error.context(NO_ENCODER));
+            Step::default()
+        }
+    }
+}
+
+/// Gives this session the staged picture, if it's due one.
+fn serve(
+    output: &mut Output,
+    stage: &mut Stage,
+    source: &VideoSource,
+    picture: Staged,
+    others_running: bool,
+    layout: &mut Layout,
+) -> Step {
+    let step = prepare(output, stage, source, others_running);
+    if step.leave_gpu || output.gone {
+        return step;
+    }
+    let Some(encoder) = &mut output.encoder else { return step };
+    // The first encoder through decides how pictures in memory are laid out.
+    if let (Stage::Memory(staged), InputKind::Picture(wanted), false) = (&mut *stage, encoder.input(), others_running)
+        && staged.layout() != wanted
+    {
+        *staged = staged.to_layout(wanted);
+        *layout = wanted;
+    }
+
+    let mut force_keyframe = output.control.keyframe.load(Ordering::Relaxed);
+    // Hold the picture while the network catches up: sent now, it would only queue behind the
+    // rest. Likewise until its turn comes, a newer picture replacing it meanwhile. A requested
+    // keyframe goes regardless, as the viewer is stuck without one.
+    let too_soon = output.last_sent.is_some_and(|sent| sent.elapsed() < output.frame_interval);
+    let backlogged = (output.unsent || force_keyframe) && (output.control.backlogged)();
+    let no_room = output.tx.capacity() == 0;
+    if no_room || !(output.unsent || force_keyframe) || ((backlogged || too_soon) && !force_keyframe) {
+        output.waiting = if backlogged { Replaced::Backlog } else { Replaced::Turn };
+        return step;
+    }
+    output.last_sent = Some(Instant::now());
+    output.control.keyframe.store(false, Ordering::Relaxed);
+    let resent = !output.unsent;
+    output.unsent = false;
+    // Stamped when captured; a static picture sent again as a keyframe is stamped anew, as
+    // hardware encoders need every timestamp later than the last.
+    let capture_time_us = picture.time_us.max(output.sent_time_us + 1);
+    output.sent_time_us = capture_time_us;
+
+    let wanted = output.control.bitrate.load(Ordering::Relaxed);
+    let wanted = if encoder.hardware() { output.frame_rate.apply(wanted) } else { wanted };
+    if wanted != output.bitrate {
+        encoder.set_bitrate(output.bitrate, wanted);
+        output.bitrate = wanted;
+    }
+    // The periodic keyframe never jumps the queue as a requested one does.
+    let periodic = !encoder.intra_refresh() && output.last_keyframe.elapsed() >= KEYFRAME_PERIOD;
+    force_keyframe |= periodic;
+    let converted = match (&*stage, encoder.input()) {
+        (Stage::Memory(staged), InputKind::Picture(wanted)) if staged.layout() != wanted => {
+            Some(staged.to_layout(wanted))
+        }
+        _ => None,
+    };
+    let input = converted.as_ref().map_or_else(|| stage.input(), Input::Picture);
+    let started = Instant::now();
+    let result = encoder.encode(input, capture_time_us, force_keyframe);
+    let encoded_at = Instant::now();
+    let encoding = encoded_at.duration_since(started);
+    let encoded = match result {
+        Ok(encoded) => encoded,
+        Err(error) if encoder.codec() != Codec::H264 => {
+            // A codec only the graphics card does: H.264 instead, on the graphics card if it
+            // will, where the picture already is.
+            tracing::warn!("{} failed; switching to H.264: {error:#}", encoder.name());
+            let codec = encoder.codec();
+            output.failed.push(codec);
+            output.encoder = None;
+            output.unsent = true;
+            return Step { encoding, ..step };
+        }
+        Err(error) if encoder.hardware() || !matches!(stage, Stage::Memory(_)) => {
+            // Carry on on the processor: OpenH264, reading the picture from memory.
+            tracing::warn!("{} failed; recovering on the processor: {error:#}", encoder.name());
+            output.software = true;
+            output.encoder = None;
+            output.unsent = true;
+            return Step { encoding, leave_gpu: !matches!(stage, Stage::Memory(_)) };
+        }
+        Err(error) => {
+            output.fail(error.context("encoding frame"));
+            return Step { encoding, ..step };
+        }
+    };
+    output.frame_rate.frame(encoded_at, output.fps);
+    if encoded.iter().any(|picture| picture.keyframe) {
+        output.last_keyframe = encoded_at;
+    }
+    let encode_time_us = micros(encoding);
+    let stamp = FrameStamp {
+        capture: picture.index,
+        resent,
+        input_wait_us: encoder.input_wait_us(),
+        held_us: if resent { 0 } else { micros(started.saturating_duration_since(picture.at)) },
+        encoded: encoded_at,
+    };
+    let codec = encoder.codec();
+    for encoded_picture in encoded {
+        let meta = FrameMeta {
+            seq: output.seq,
+            keyframe: encoded_picture.keyframe,
+            codec,
+            capture_time_us: encoded_picture.capture_time_us,
+            encode_time_us,
+            present_to_capture_us: picture.present_us,
+            capture_us: picture.capture_us,
+            // Filled in as the frame goes out.
+            sent_after_us: 0,
+        };
+        output.seq = output.seq.wrapping_add(1);
+        output.send(VideoEvent::Frame(EncodedFrame { meta, data: encoded_picture.data, arrival: None }, stamp));
+    }
+    Step { encoding, ..step }
+}
+
+/// An encoder for `codec` that reads the staged picture, wherever it is.
+fn open_encoder(
+    stage: &Stage,
     source: &VideoSource,
     codec: Codec,
     width: u32,
     height: u32,
     bitrate: u32,
     fps: u32,
-) -> Result<Pipeline> {
+) -> Result<Box<dyn VideoEncoder>> {
     #[cfg(windows)]
-    if let Stage::Gpu(converter) = &stage {
-        match or_h264(codec, |codec| {
+    if let Stage::Gpu(converter) = stage {
+        let encoder = or_h264(codec, |codec| {
             mf::HardwareEncoder::new(codec, width, height, bitrate, fps, Some(converter.device()))
-        }) {
-            Ok(encoder) => return Ok(Pipeline { stage, encoder: Box::new(encoder) }),
-            Err(error) => tracing::warn!("GPU {codec} encoder taking textures unavailable: {error:#}"),
-        }
+        })
+        .context("GPU encoder taking textures")?;
+        return Ok(Box::new(encoder));
     }
-    let encoder = open_memory_encoder(source, codec, width, height, bitrate, fps)?;
-    let InputKind::Picture(layout) = encoder.input() else { bail!("memory encoder wants textures") };
-    Ok(Pipeline { stage: Stage::Memory(stage.into_memory(layout)?), encoder })
+    #[cfg(not(windows))]
+    let _ = stage;
+    open_memory_encoder(source, codec, width, height, bitrate, fps)
 }
 
-/// Waits up to `timeout` for a new screen image and stages it for the encoder, (re)building
-/// the pipeline when the size changes; a `codec` that couldn't be opened goes in `failed`.
-/// `Some(true)` with a new picture staged, `Some(false)` without, `None` once the session has
-/// gone.
-#[expect(clippy::too_many_arguments)]
+/// Waits up to `timeout` for a new screen image and stages it, replacing the stage (and setting
+/// `resized`) when the size changes. Whether a new picture was staged.
 fn capture(
     capturer: &mut dyn Capturer,
-    pipeline: &mut Option<Pipeline>,
+    stage: &mut Option<Stage>,
     gpu: &mut bool,
-    source: &VideoSource,
-    codec: Codec,
-    failed: &mut Vec<Codec>,
-    bitrate: u32,
-    fps: u32,
+    layout: Layout,
     timeout: Duration,
     capture_index: u64,
-    send: &dyn Fn(VideoEvent) -> bool,
-) -> Result<Option<bool>> {
-    // Announces a new size and encoder; false if the session has gone.
-    let mut announce = |pipeline: &Pipeline| {
-        if pipeline.encoder.codec() != codec {
-            failed.push(codec);
-        }
-        let (width, height) = pipeline.stage.size();
-        send(VideoEvent::Format { width, height })
-            && send(VideoEvent::Encoder { name: pipeline.encoder.name().to_owned(), codec: pipeline.encoder.codec() })
-    };
+    resized: &mut bool,
+) -> Result<bool> {
     // The screen in memory: from the capture itself, or, after the GPU path just failed, read
     // back from the image it captured.
     #[cfg_attr(not(windows), expect(unused_mut))]
     let mut read_back_latest = false;
     #[cfg(not(windows))]
-    let _ = (gpu, capture_index);
+    let _ = (&gpu, capture_index);
 
     #[cfg(windows)]
     if *gpu && let Some(dxgi) = capturer.as_dxgi() {
-        let Some((w, h)) = dxgi.next_texture(timeout)? else { return Ok(Some(false)) };
+        let Some((w, h)) = dxgi.next_texture(timeout)? else { return Ok(false) };
         // 4:2:0 chroma needs even dimensions; drop an odd last row/column.
         let (w, h) = (w & !1, h & !1);
         ensure!(w > 0 && h > 0, "captured an empty image");
-        let current = pipeline.as_ref().filter(|p| matches!(p.stage, Stage::Gpu(_))).map(|p| p.stage.size());
+        let current = stage.as_ref().filter(|stage| matches!(stage, Stage::Gpu(_))).map(Stage::size);
         if current != Some((w, h)) {
-            match open_gpu_path(dxgi.device(), codec, w, h, bitrate, fps) {
-                Ok((stage, encoder)) => {
-                    tracing::info!(%codec, "keeping pictures on the GPU from capture to encoder");
-                    let built = Pipeline { stage, encoder };
-                    if !announce(&built) {
-                        return Ok(None);
-                    }
-                    *pipeline = Some(built);
+            match crate::gpu::Nv12Converter::new(dxgi.device(), w, h).context("GPU colour conversion") {
+                Ok(converter) => {
+                    tracing::info!(method = %converter.method(), "GPU colour conversion");
+                    tracing::info!("keeping pictures on the GPU from capture to encoder");
+                    *stage = Some(Stage::Gpu(converter));
+                    *resized = true;
                 }
                 Err(error) => {
                     tracing::warn!("GPU-only pipeline unavailable, going through memory: {error:#}");
@@ -675,13 +929,14 @@ fn capture(
             }
         }
         if *gpu {
-            let Some(Pipeline { stage: Stage::Gpu(converter), .. }) = pipeline else { unreachable!("built above") };
+            let Some(Stage::Gpu(converter)) = stage else { unreachable!("built above") };
             match converter.convert(dxgi.latest(), Some(capture_index)) {
-                Ok(()) => return Ok(Some(true)),
+                Ok(()) => return Ok(true),
                 Err(error) => {
                     tracing::warn!("GPU colour conversion failed, going through memory: {error:#}");
                     *gpu = false;
-                    *pipeline = None;
+                    *stage = None;
+                    *resized = true;
                     read_back_latest = true;
                 }
             }
@@ -698,27 +953,30 @@ fn capture(
     } else {
         capturer.next_frame(timeout)?
     };
-    let Some(frame) = frame else { return Ok(Some(false)) };
+    let Some(frame) = frame else { return Ok(false) };
     let (w, h) = (frame.width & !1, frame.height & !1);
     ensure!(w > 0 && h > 0, "captured an empty image");
-    let current = pipeline.as_ref().filter(|p| matches!(p.stage, Stage::Memory(_))).map(|p| p.stage.size());
+    let current = stage.as_ref().filter(|stage| matches!(stage, Stage::Memory(_))).map(Stage::size);
     if current != Some((w, h)) {
-        let encoder = open_memory_encoder(source, codec, w, h, bitrate, fps).context("starting video encoder")?;
-        let InputKind::Picture(layout) = encoder.input() else { bail!("memory encoder wants textures") };
-        let built = Pipeline { stage: Stage::Memory(Picture::new(layout, w as usize, h as usize)), encoder };
-        if !announce(&built) {
-            return Ok(None);
-        }
-        *pipeline = Some(built);
+        *stage = Some(Stage::Memory(Picture::new(layout, w as usize, h as usize)));
+        *resized = true;
     }
-    let Some(Pipeline { stage: Stage::Memory(picture), .. }) = pipeline else { unreachable!("built above") };
+    let Some(Stage::Memory(picture)) = stage else { unreachable!("built above") };
     picture.convert_from_bgra(frame.bgra, frame.stride);
-    Ok(Some(true))
+    Ok(true)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encoders_are_told_apart_by_name() {
+        assert_eq!(EncoderKind::of("NVIDIA HEVC Encoder MFT"), EncoderKind::Nvenc);
+        assert_eq!(EncoderKind::of("AMDh264Encoder"), EncoderKind::Amf);
+        assert_eq!(EncoderKind::of("Intel Quick Sync Video H.264 Encoder MFT"), EncoderKind::QuickSync);
+        assert_eq!(EncoderKind::of("Something New"), EncoderKind::OtherHardware);
+    }
 
     #[test]
     fn a_frame_rate_under_the_screens_is_made_up_for() {

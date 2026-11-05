@@ -129,8 +129,13 @@ fn device_name() -> String {
 /// what each PC spends on it. METRICS.md says what each figure measures.
 pub(crate) fn stats_line(s: &Stats) -> String {
     let rtt = s.rtt.map_or("–".into(), |r| format!("{:.0} ms", r.as_secs_f32() * 1000.0));
-    let target = s.host_mbps.map_or(String::new(), |m| format!(" (target {m:.1})"));
-    let loss = s.loss.map_or(String::new(), |l| format!(" · packet loss {:.1}%", l * 100.0));
+    let target = s.host_mbps.map_or(String::new(), |m| {
+        let max = s.host_max_mbps.map_or(String::new(), |max| format!(" · maximum {max:.0}"));
+        let why = if s.host_reason.is_empty() { String::new() } else { format!(" · {}", s.host_reason) };
+        format!(" (target {m:.1}{max}{why})")
+    });
+    let loss =
+        s.loss.map_or(String::new(), |l| format!(" · packet loss {:.1}% · jitter {:.1} ms", l * 100.0, s.jitter_ms));
     let mut text = format!(
         "{} · RTT {rtt} · {:.0} fps · {:.1} Mb/s{target}{loss}\nFrames lost {} · repaired {} · skipped {} · superseded {}",
         s.path.label(),

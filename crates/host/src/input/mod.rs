@@ -5,7 +5,13 @@
 #[cfg(windows)]
 mod windows;
 
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::HashSet,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use anyhow::Result;
 use connect_net as net;
@@ -61,6 +67,7 @@ pub(crate) async fn serve(
     conn: Connection,
     mut permissions: watch::Receiver<Permissions>,
     sink: InputSink,
+    sharing_pointer: Arc<AtomicBool>,
     unavailable: mpsc::UnboundedSender<Unavailable>,
     trace: Arc<HostTrace>,
     taken: oneshot::Sender<()>,
@@ -76,6 +83,7 @@ pub(crate) async fn serve(
 
     let mut output = Output::open(sink, unavailable, trace.clone());
     let mut held = Held::default();
+    let mut pointer = SharedPointer::default();
     loop {
         tokio::select! {
             input = events.recv() => {
@@ -85,8 +93,17 @@ pub(crate) async fn serve(
                     debug!(?event, "ignoring malformed input");
                 } else if permissions.borrow().allows(event.device()) {
                     let event = clamp(event);
-                    held.note(&event);
-                    output.send(event, Some(stamp));
+                    let (first, event) = pointer.route(event, sharing_pointer.load(Ordering::Relaxed));
+                    if let Some(first) = first {
+                        output.send(first, None);
+                    }
+                    match event {
+                        Some(event) => {
+                            held.note(&event);
+                            output.send(event, Some(stamp));
+                        }
+                        None => trace.inputs.push(stamp.record("mouse_move_to", InputOutcome::PointerOnly)),
+                    }
                 } else {
                     trace.inputs.push(stamp.record(event.kind(), InputOutcome::NotAllowed));
                 }
@@ -101,6 +118,37 @@ pub(crate) async fn serve(
     }
     for event in held.release_all() {
         output.send(event, None);
+    }
+}
+
+/// With several people on the mouse, each moves only their own labelled pointer, and the real one
+/// jumps there for a click, a drag or the wheel.
+#[derive(Default)]
+struct SharedPointer {
+    /// Where this connector's pointer is and the real one isn't.
+    waiting: Option<InputEvent>,
+    buttons_down: u32,
+}
+
+impl SharedPointer {
+    /// What to send for `event`: a move first if it's needed, then the event if it goes at all.
+    fn route(&mut self, event: InputEvent, sharing: bool) -> (Option<InputEvent>, Option<InputEvent>) {
+        match event {
+            InputEvent::MouseMoveTo { .. } if sharing && self.buttons_down == 0 => {
+                self.waiting = Some(event);
+                (None, None)
+            }
+            InputEvent::MouseMoveTo { .. } => {
+                self.waiting = None;
+                (None, Some(event))
+            }
+            InputEvent::MouseButton { down, .. } => {
+                self.buttons_down = if down { self.buttons_down + 1 } else { self.buttons_down.saturating_sub(1) };
+                (self.waiting.take(), Some(event))
+            }
+            InputEvent::MouseWheel { .. } => (self.waiting.take(), Some(event)),
+            other => (None, Some(other)),
+        }
     }
 }
 
@@ -314,6 +362,23 @@ pub(crate) fn local_activity() -> LocalActivity {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn with_a_shared_pointer_only_clicks_move_the_real_one() {
+        let mut pointer = SharedPointer::default();
+        let to = InputEvent::MouseMoveTo { x: 10, y: 20 };
+        let down = InputEvent::MouseButton { button: MouseButton::Left, down: true };
+        let up = InputEvent::MouseButton { button: MouseButton::Left, down: false };
+        assert_eq!(pointer.route(to, true), (None, None));
+        assert_eq!(pointer.route(down, true), (Some(to), Some(down)));
+        // A drag goes as it happens.
+        assert_eq!(pointer.route(to, true), (None, Some(to)));
+        assert_eq!(pointer.route(up, true), (None, Some(up)));
+        assert_eq!(pointer.route(to, true), (None, None));
+        // Alone, moves go through.
+        assert_eq!(pointer.route(to, false), (None, Some(to)));
+        assert_eq!(pointer.route(down, false), (None, Some(down)));
+    }
 
     #[test]
     fn only_a_refused_or_admin_window_counts_as_keeping_input_out() {

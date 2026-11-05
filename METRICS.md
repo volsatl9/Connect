@@ -181,7 +181,10 @@ or dropped, and on Windows the displays in use with their refresh rates (`displa
 - `recovery_requests`: keyframe requests from the viewer since the last row, each a loss
 - `bitrate_kbps`, `ceiling_kbps`, `reason`: the encoder's target after this tick, the ceiling the
   rate controller keeps under, and why it changed (`steady`, `backlog`, `loss`, `viewer_loss`,
-  `climb`, `creep`, `loss_held`: the viewer lost frames, but the last cut did nothing for
+  `climb`, `creep`, `delay` (the round trip stayed well past its best with the video near the
+  estimate), `viewer_rate` (the viewer reported getting well under what was sent), `viewer_decode`
+  (its decoder is at its limit), `limit` (over the settings, this viewer's share of the upload, or
+  what the encoder keeps up with), `loss_held`: the viewer lost frames, but the last cut did nothing for
   the loss, so the bitrate holds)
 - `video_bytes`: video handed to the network since the last row
 - `local_mouse_moves`, `local_mouse_pixels`, `local_mouse_tagged`, `local_mouse_buttons`,
@@ -195,7 +198,8 @@ or dropped, and on Windows the displays in use with their refresh rates (`displa
 - `client_time_us_viewer_clock` (the viewer's clock; don't compare it with the others)
 - `received_us`, `done_us`, `inject_us` (host clock)
 
-and `outcome`: `injected`, `refused` (Windows blocked it, e.g. an elevated window has focus),
+and `outcome`: `pointer_only` (moved the connector's labelled pointer, as others share the mouse),
+`injected`, `refused` (Windows blocked it, e.g. an elevated window has focus),
 `host_priority` (the host user is using that device), `not_allowed`, or `channel` (test sink).
 
 **`viewer-*-frames.csv`**, one row per frame decoded:

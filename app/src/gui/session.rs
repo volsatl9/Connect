@@ -80,14 +80,21 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         );
     }
     draw_host_cursor(client, ui, video_rect, image_size);
+    draw_pointers(client, ui, video_rect);
     ui.allocate_rect(area, Sense::hover());
     if client.show_stats {
-        let galley = ui.painter().layout(
-            stats_line(&client.handle.stats()),
-            egui::FontId::monospace(12.0),
-            Color32::WHITE,
-            area.width() - 48.0,
+        let stats = client.handle.stats();
+        let (width, height) = client.video.size().map_or((0.0, 0.0), |size| (size.x, size.y));
+        let limited = if stats.encoder_limited { " · host's encoder at its limit" } else { "" };
+        let line = format!(
+            "{}\n{width:.0}×{height:.0} · {:.0} fps · {}{limited} · encoding {:.1} ms · decoding {:.1} ms",
+            stats_line(&stats),
+            stats.fps,
+            client.encoder,
+            stats.encode_ms,
+            stats.decode_ms
         );
+        let galley = ui.painter().layout(line, egui::FontId::monospace(12.0), Color32::WHITE, area.width() - 48.0);
         let rect = Rect::from_min_size(
             egui::pos2(area.left() + 16.0, area.bottom() - galley.size().y - 26.0),
             galley.size() + egui::vec2(20.0, 14.0),
@@ -286,6 +293,25 @@ fn draw_host_cursor(client: &mut ClientSession, ui: &egui::Ui, video: Rect, imag
 
 /// Tells the host where this user's pointer is over the picture, when it moved, and now and then
 /// regardless so the host knows it's still current.
+/// The other connectors' pointers, each with their name.
+fn draw_pointers(client: &ClientSession, ui: &egui::Ui, video: Rect) {
+    let painter = ui.painter();
+    for pointer in client.handle.pointers() {
+        let at = video.min
+            + egui::vec2(
+                f32::from(pointer.x) / f32::from(u16::MAX) * video.width(),
+                f32::from(pointer.y) / f32::from(u16::MAX) * video.height(),
+            );
+        painter.circle_filled(at, 5.0, theme::ACCENT);
+        painter.circle_stroke(at, 5.0, egui::Stroke::new(1.5, Color32::WHITE));
+        let font = egui::FontId::proportional(12.0);
+        let name = painter.layout_no_wrap(pointer.name, font, Color32::WHITE);
+        let label = Rect::from_min_size(at + egui::vec2(9.0, 7.0), name.size() + egui::vec2(10.0, 4.0));
+        painter.rect_filled(label, 4.0, Color32::from_black_alpha(170));
+        painter.galley(label.min + egui::vec2(5.0, 2.0), name, Color32::WHITE);
+    }
+}
+
 fn send_pointer(client: &mut ClientSession, position: (u16, u16, bool)) {
     if client.pointer_sent.is_some_and(|(sent, at)| sent == position && at.elapsed() < POINTER_REPEAT) {
         return;

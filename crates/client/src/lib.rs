@@ -39,7 +39,7 @@ use anyhow::{Result, bail};
 use connect_net::{self as net, PathKind};
 use connect_proto::{
     CLOSE_NORMAL, CLOSE_REJECTED, Codec, DeviceClass, PROTOCOL_VERSION, Permissions,
-    control::{ClientMsg, HostMsg},
+    control::{ClientMsg, HostMsg, PeerPointer, ViewerFeedback},
     cursor::{CursorPosition, CursorShape},
     input::{InputEvent, TimedInput},
     now_micros,
@@ -206,7 +206,7 @@ pub struct RemoteCursor {
 }
 
 /// Figures for the stats overlay, refreshed about once a second.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Stats {
     pub path: PathKind,
     pub rtt: Option<Duration>,
@@ -223,6 +223,14 @@ pub struct Stats {
     pub dropped: u64,
     /// The bitrate the host is aiming for, fitted to the connection; at most its cap.
     pub host_mbps: Option<f32>,
+    /// The most the host may send now, whatever is being sent.
+    pub host_max_mbps: Option<f32>,
+    /// Why the target last changed.
+    pub host_reason: String,
+    /// Whether the host's encoder is what's holding the video back.
+    pub encoder_limited: bool,
+    /// How much frames' arrival times wander.
+    pub jitter_ms: f32,
     /// Share of packets the host sees going missing, 0..1.
     pub loss: Option<f32>,
     pub encode_ms: f32,
@@ -272,6 +280,10 @@ impl Default for Stats {
             frames_skipped: 0,
             dropped: 0,
             host_mbps: None,
+            host_max_mbps: None,
+            host_reason: String::new(),
+            encoder_limited: false,
+            jitter_ms: 0.0,
             loss: None,
             encode_ms: 0.0,
             decode_ms: 0.0,
@@ -315,6 +327,8 @@ struct Shared {
     /// Numbers input events for the trace.
     input_seq: AtomicU32,
     host_gpu: Mutex<Option<GpuLoad>>,
+    host_reason: Mutex<String>,
+    pointers: Mutex<Vec<PeerPointer>>,
     host_perf: Mutex<Option<HostPerf>>,
     cursor: Mutex<(CursorPosition, Option<Arc<CursorShape>>, Instant)>,
     cursor_sequence: AtomicU64,
@@ -335,7 +349,12 @@ struct Counters {
     frames_superseded: AtomicU64,
     /// From the host's last report; `u32::MAX` until one arrives.
     host_kbps: AtomicU32,
+    host_max_kbps: AtomicU32,
+    encoder_limited: AtomicBool,
     loss_permille: AtomicU32,
+    jitter_us: AtomicU32,
+    /// Frames waiting for the decoder.
+    frames_queued: AtomicU32,
     encode_us: AtomicU64,
     decode_us: AtomicU64,
     frames_skipped: AtomicU64,
@@ -396,8 +415,11 @@ pub fn connect(
         audio_muted: AtomicBool::new(false),
         audio_generation: AtomicU64::new(0),
         audio_failure: Mutex::new(None),
+        host_reason: Mutex::new(String::new()),
+        pointers: Mutex::new(Vec::new()),
         counters: Counters {
             host_kbps: AtomicU32::new(u32::MAX),
+            host_max_kbps: AtomicU32::new(u32::MAX),
             clock_offset_us: AtomicI64::new(i64::MIN),
             ..Default::default()
         },
@@ -461,8 +483,13 @@ impl ClientHandle {
         lock(&self.0.decoder).clone()
     }
 
+    /// The other connectors' pointers, to draw over the video.
+    pub fn pointers(&self) -> Vec<PeerPointer> {
+        lock(&self.0.pointers).clone()
+    }
+
     pub fn stats(&self) -> Stats {
-        *lock(&self.0.stats)
+        lock(&self.0.stats).clone()
     }
 
     pub fn cursor(&self) -> RemoteCursor {
@@ -653,11 +680,20 @@ async fn stream(
                 Some(Ok(HostMsg::VideoEncoder { name, codec })) => {
                     events.send(ClientEvent::VideoEncoder { name, codec }).await
                 }
-                Some(Ok(HostMsg::VideoStats { bitrate_kbps, loss_permille, gpu, perf })) => {
+                Some(Ok(HostMsg::VideoStats {
+                    bitrate_kbps, max_kbps, reason, encoder_limited, loss_permille, gpu, perf,
+                })) => {
                     *lock(&shared.host_gpu) = gpu;
                     *lock(&shared.host_perf) = perf.map(|perf| *perf);
+                    *lock(&shared.host_reason) = reason;
                     shared.counters.host_kbps.store(bitrate_kbps, Ordering::Relaxed);
+                    shared.counters.host_max_kbps.store(max_kbps, Ordering::Relaxed);
+                    shared.counters.encoder_limited.store(encoder_limited, Ordering::Relaxed);
                     shared.counters.loss_permille.store(loss_permille.into(), Ordering::Relaxed);
+                }
+                Some(Ok(HostMsg::Pointers(pointers))) => {
+                    *lock(&shared.pointers) = pointers;
+                    (shared.wake)();
                 }
                 Some(Ok(HostMsg::CursorShape(shape))) => {
                     anyhow::ensure!(shape.is_valid(), "invalid host cursor image");
@@ -698,7 +734,9 @@ async fn stream(
                     events.send(ClientEvent::AudioStatus { active: false, reason: Some(reason) }).await;
                 }
                 net::write_msg(&mut send, &ClientMsg::Ping { client_time_us: now_micros() }).await?;
-                window.update(conn, shared);
+                if let Some(feedback) = window.update(conn, shared) {
+                    net::write_msg(&mut send, &ClientMsg::Feedback(feedback)).await?;
+                }
             }
             _ = conn.closed() => return Ok(None),
             _ = shared.disconnect.notified() => return Ok(Some(EndReason::Disconnected)),
@@ -826,11 +864,12 @@ impl StatsWindow {
         }
     }
 
-    fn update(&mut self, conn: &Connection, shared: &Shared) {
+    /// Refreshes the stats, and returns how the video arrived for the host to go by.
+    fn update(&mut self, conn: &Connection, shared: &Shared) -> Option<ViewerFeedback> {
         let c = &shared.counters;
         let secs = self.at.elapsed().as_secs_f32();
         if secs < 0.5 {
-            return; // the first tick fires at once; rates need a real window
+            return None; // the first tick fires at once; rates need a real window
         }
         let (bytes, decoded) = (c.bytes.load(Ordering::Relaxed), c.frames_decoded.load(Ordering::Relaxed));
         let (path, rtt) = net::selected_path(conn);
@@ -864,6 +903,18 @@ impl StatsWindow {
         });
         let gone = c.frames_lost.load(Ordering::Relaxed) + c.frames_skipped.load(Ordering::Relaxed);
         let superseded = frames.flatten().map_or(0, |f| u64::from(f.superseded));
+        let dropped = gone.saturating_sub(self.gone);
+        let decoded_now = decoded - self.frames;
+        let feedback = ViewerFeedback {
+            rtt_us: rtt.map_or(0, |r| r.as_micros().min(u128::from(u32::MAX)) as u32),
+            jitter_us: c.jitter_us.load(Ordering::Relaxed),
+            loss_permille: (dropped * 1000 / (decoded_now + dropped).max(1)) as u16,
+            receive_kbps: ((bytes - self.bytes) as f32 * 8.0 / secs / 1000.0) as u32,
+            decode_us: c.decode_us.load(Ordering::Relaxed).min(u64::from(u32::MAX)) as u32,
+            frames_decoded: decoded_now.min(u64::from(u32::MAX)) as u32,
+            frames_dropped: dropped.min(u64::from(u32::MAX)) as u32,
+            frames_queued: c.frames_queued.load(Ordering::Relaxed),
+        };
         *lock(&shared.stats) = Stats {
             path,
             rtt,
@@ -878,6 +929,13 @@ impl StatsWindow {
                 u32::MAX => None,
                 kbps => Some(kbps as f32 / 1000.0),
             },
+            host_max_mbps: match c.host_max_kbps.load(Ordering::Relaxed) {
+                u32::MAX => None,
+                kbps => Some(kbps as f32 / 1000.0),
+            },
+            host_reason: lock(&shared.host_reason).clone(),
+            encoder_limited: c.encoder_limited.load(Ordering::Relaxed),
+            jitter_ms: c.jitter_us.load(Ordering::Relaxed) as f32 / 1000.0,
             loss: (c.host_kbps.load(Ordering::Relaxed) != u32::MAX)
                 .then(|| c.loss_permille.load(Ordering::Relaxed) as f32 / 1000.0),
             encode_ms: c.encode_us.load(Ordering::Relaxed) as f32 / 1000.0,
@@ -895,6 +953,7 @@ impl StatsWindow {
         };
         (self.at, self.bytes, self.frames, self.gone) = (Instant::now(), bytes, decoded, gone);
         (shared.wake)();
+        Some(feedback)
     }
 }
 

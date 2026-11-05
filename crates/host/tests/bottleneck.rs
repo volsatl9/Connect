@@ -194,7 +194,7 @@ async fn video_through_a_bottleneck() {
     let host_ep = net::bind_local_endpoint_at(SecretKey::generate(), "[::1]:0").await.unwrap();
     let config = HostConfig {
         video: VideoSource::NoisyTestPattern { width: 1280, height: 720, fps },
-        bitrate_mbps: cap,
+        bitrate: connect_host::BitrateSettings { automatic: false, max_mbps: cap, min_mbps: 2 },
         ..HostConfig::new("Bottleneck host")
     };
     let (host, mut host_events) = connect_host::start(host_ep.clone(), config);

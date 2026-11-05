@@ -475,7 +475,15 @@ fn sessions(dir: &Path, role: &str, suffix: &str) -> Result<Vec<(u64, PathBuf)>>
 
 /// Reports on the newest session in `dir`: the text, and the path it's saved to.
 pub fn write(dir: &Path) -> Result<(String, PathBuf)> {
-    let hosts = sessions(dir, "host-", "-frames.csv")?;
+    write_session(dir, None)
+}
+
+/// Reports on the session stamped `only`, or the newest in `dir`.
+pub fn write_session(dir: &Path, only: Option<u64>) -> Result<(String, PathBuf)> {
+    let mut hosts = sessions(dir, "host-", "-frames.csv")?;
+    if let Some(only) = only {
+        hosts.retain(|(stamp, _)| *stamp == only);
+    }
     let viewers = sessions(dir, "viewer-", "-frames.csv")?;
     let (Some((host, host_path)), false) = (hosts.first(), viewers.is_empty()) else {
         bail!("{} needs host-…-frames.csv and viewer-…-frames.csv from one session", dir.display());

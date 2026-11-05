@@ -540,6 +540,34 @@ so it isn't a heavy game. It's still unexplained. `host-*-frames.csv` now splits
 encoder to take a picture from the wait for it to come out, and the session file lists the displays
 in use with their refresh rates.
 
+## Version 0.11.0: many connectors, each at its own bitrate
+
+- **One capture, many streams.** Windows lets a process duplicate a screen once, so one thread
+  captures and converts, and each session has its own encoder and bitrate on that thread, in
+  rotating order. No session can make it wait: one that isn't keeping up loses a frame and gets a
+  keyframe. A graphics card has one encoding engine to share anyway, so each stream takes its turn:
+  at the 2.5 ms a frame seen on the RTX 5060, that's about 400 frames a second among everyone.
+- **Adaptive bitrate.** BBR stays the congestion controller, and `RateControl` stays the one thing
+  that sets the bitrate. A stream starts at 30 Mb/s and climbs to its maximum, cuts on loss, a send
+  backlog, a round trip that stays up with the video near the estimate, a viewer receiving well
+  under what was sent, or a decoder at its limit, and recovers gradually. Automatic mode also stops
+  at 0.25 bits per pixel per frame. Manual mode doesn't, and neither disables the path's limits.
+- **Viewer reports** go once a second on the authenticated control stream. They're bounded, ignored
+  if more frequent than every 500 ms, and can only lower the bitrate.
+- **The encoder is a separate limit.** Over 95% busy for 2 s, a processor encoder has its own cap
+  lowered. A graphics card's time hardly changes with the bitrate, so that's reported, not acted on.
+- **The upload.** Each session keeps to its own viewer's connection, so a slow viewer only slows
+  itself. Two or more cutting within 2 s means the upload is full: from then on it's split evenly,
+  and what someone can't use goes to the others.
+
+In a model of a 32 Mb/s upload whose queue the host can't see, under a game wanting 60 Mb/s, with an
+estimate reading 47, the bitrate settles at 28 Mb/s with 5 of 1,080 ticks over 70 ms. Virtual
+connectors on one PC cover 8 streams at once, dropping one, permissions, pointers, and every
+connector's files reaching the host. They use OpenH264 and no real network: no real encoder has run
+several sessions at once, and encoding limits per card aren't measured. Encoder detection covers
+which encoders and codecs a PC has, not the resolutions and frame rates each supports; `connect
+gpu-check` tests those.
+
 ## Build requirement
 
 OpenH264 silently builds its C++ fallback if NASM is unavailable; install NASM so the codec

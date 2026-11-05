@@ -488,6 +488,28 @@ In a model of a 40 Mb/s link under a game wanting 55, the round trip settles at 
 the CPU encoder ignores targets that low. A real path falling from 40 to 10 Mb/s for 8 s lost 24
 frames against 26 in 0.10.2, with a worst window of 184 ms against 166.
 
+## Version 0.10.4: one Vulkan instance
+
+The crash after Allow came down to a read through a bad pointer in `loader_get_icd_and_device`, in
+the Vulkan loader (`vulkan-1.dll` 1.4.357, offset 0x48100), while it walked its list of instances.
+It came with the first session on one RTX 5060 PC, nearly every time. With hardware decoding off,
+the app had a single instance and didn't crash. With the window on its own device, it crashed on
+leaving fullscreen instead. The app now keeps one instance until it exits, never destroys one to
+ask what the card decodes, and keeps its decoding devices too. Why that PC's loader list went bad
+isn't established, and the fix needs a test on that PC.
+
+The round trip no longer lowers the bitrate. On Wi-Fi, scans about every 37 s took the radio away
+for about 118 ms at a time, and the rule read those as a queue: 80 Mb/s went to a target of 9-25 for
+up to 20 s, while the round trip stayed up at 5 Mb/s, so the cut did nothing. All 637 ticks of a
+wired session stayed `steady`. The loss and backlog rules remain, so a link that's really too slow
+is still found, later than the rule found it.
+
+On a wired session over 43 ms, input took 52.8 ms from being sent to the first frame drawn that
+could show it (keys 52.5 ms), about 10 ms of that in Connect. Input arrives 7 ms over its fastest
+at the median and 13 ms at p99, against 2.8 and 5.3 for video coming the other way. Replaying the
+same session on Linux, with the same video and 360 inputs a second, added 1.2 ms at the median and
+2.2 at p99. So the rest is the viewer's upload or something on Windows; which isn't known.
+
 ## Build requirement
 
 OpenH264 silently builds its C++ fallback if NASM is unavailable; install NASM so the codec

@@ -6,7 +6,7 @@
 //! for the same upload path as software-decoded ones; what that still saves is the decode
 //! itself.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use anyhow::{Context, Result, ensure};
 use connect_proto::Codec;
@@ -35,13 +35,30 @@ pub struct SharedGpu {
 }
 
 static SHARED: OnceLock<Arc<SharedGpu>> = OnceLock::new();
+/// The app's one Vulkan instance, here until it exits. With a second one created and destroyed
+/// while the window ran, an RTX 5060 PC crashed inside the Vulkan loader, walking its list of
+/// instances, nearly every time it connected.
+static INSTANCE: OnceLock<Result<Arc<VulkanInstance>, String>> = OnceLock::new();
+/// Devices for pictures in memory, one a codec: destroying them walks that list too.
+static MEMORY_DEVICES: Mutex<Vec<(Codec, Arc<VulkanDevice>, String)>> = Mutex::new(Vec::new());
+
+/// The app's Vulkan instance.
+pub(crate) fn instance() -> Result<Arc<VulkanInstance>> {
+    INSTANCE
+        .get_or_init(|| VulkanInstance::new().map_err(|e| e.to_string()))
+        .clone()
+        .map_err(anyhow::Error::msg)
+        .context("loading Vulkan")
+}
 
 impl SharedGpu {
     /// Opens the graphics card best placed to decode (see [`open_device`]) with a wgpu device
     /// on it for the window. Fails where no card decodes H.264 through Vulkan.
     pub fn open() -> Result<Arc<Self>> {
-        let instance = VulkanInstance::new().context("loading Vulkan")?;
+        let instance = instance()?;
         let (device, name) = open_device(&instance, Codec::H264)?;
+        // Now, not when connecting: what the card decodes is settled before the window needs it.
+        crate::decoder::probe();
         Ok(Arc::new(Self { device, _instance: instance, name }))
     }
 
@@ -85,6 +102,17 @@ fn open_device(instance: &Arc<VulkanInstance>, codec: Codec) -> Result<(Arc<Vulk
     Ok((device, name))
 }
 
+/// The device for decoding `codec` into memory, opened the first time it's asked for.
+fn memory_device(codec: Codec) -> Result<(Arc<VulkanDevice>, String)> {
+    let mut devices = MEMORY_DEVICES.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some((_, device, name)) = devices.iter().find(|(wanted, ..)| *wanted == codec) {
+        return Ok((device.clone(), name.clone()));
+    }
+    let (device, name) = open_device(&instance()?, codec)?;
+    devices.push((codec, device.clone(), name.clone()));
+    Ok((device, name))
+}
+
 enum Output {
     /// Pictures copied back to memory.
     Bytes(BytesDecoder),
@@ -97,8 +125,6 @@ enum Output {
 pub(crate) struct GpuDecoder {
     codec: Codec,
     output: Output,
-    /// Keeps a decoder's own device alive (the shared one lives in [`SHARED`]).
-    _instance: Option<Arc<VulkanInstance>>,
     /// The graphics card doing the work, for the session panel.
     pub(crate) name: String,
 }
@@ -116,24 +142,23 @@ impl GpuDecoder {
                 Codec::Av1 => anyhow::bail!("no hardware AV1 decoding yet"),
             };
             match output {
-                Ok(output) => return Ok(Self { codec, output, _instance: None, name: shared.name.clone() }),
+                Ok(output) => return Ok(Self { codec, output, name: shared.name.clone() }),
                 Err(e) => tracing::info!("the window's graphics card can't decode {codec}: {e}"),
             }
         }
         Self::in_memory(codec)
     }
 
-    /// A hardware decoder on its own device, handing out pictures in memory.
+    /// A hardware decoder on a device of its codec's, handing out pictures in memory.
     pub(crate) fn in_memory(codec: Codec) -> Result<Self> {
         let parameters = DecoderParameters { usage_flags: DecoderUsageFlags::STREAMING, ..Default::default() };
-        let instance = VulkanInstance::new().context("loading Vulkan")?;
-        let (device, name) = open_device(&instance, codec)?;
+        let (device, name) = memory_device(codec)?;
         let output = match codec {
             Codec::H264 => Output::Bytes(device.create_bytes_decoder_h264(parameters)?),
             Codec::H265 => Output::BytesH265(device.create_bytes_decoder_h265(parameters)?),
             Codec::Av1 => anyhow::bail!("no hardware AV1 decoding yet"),
         };
-        Ok(Self { codec, output, _instance: Some(instance), name })
+        Ok(Self { codec, output, name })
     }
 
     pub(crate) fn codec(&self) -> Codec {

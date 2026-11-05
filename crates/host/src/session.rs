@@ -342,7 +342,6 @@ async fn stream(
                     bandwidth_estimate: path.and_then(|p| p.bandwidth_estimate),
                     recovery_requests,
                     video_bytes,
-                    rtt: path.map(|p| p.rtt),
                 };
                 if let Some(bps) = rate.update(Instant::now(), sample) {
                     debug!(mbps = bps as f32 / 1e6, loss = rate.loss(), queued, reason = rate.reason().name(), "video bitrate changed");

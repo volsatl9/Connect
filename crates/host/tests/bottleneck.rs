@@ -17,6 +17,9 @@
 //! does. `CONNECT_PATH_MEMORY=0` shows plain BBR. `REPLAY_DELAY_MS` sets the delay each way,
 //! `REPLAY_IDLE_MS` the wait between connecting and the first frame.
 //!
+//! `REPLAY_INPUT_HZ` also sends input the other way at that rate, as a mouse does, and reports how
+//! long it took over the path's delay.
+//!
 //! Both can wander the path's delay (`PATH_JITTER_MS`) and lose packets whatever is being sent
 //! (`PATH_LOSS_PERCENT`, from `PATH_LOSS_FROM` to `PATH_LOSS_TO` seconds in).
 
@@ -313,6 +316,33 @@ async fn replaying_a_session() {
     let client = net::connect(&receiver, addr).await.unwrap();
     let conn = accepted.await.unwrap();
 
+    // Input the other way, stamped with when it was written, read as the host reads it.
+    let clock = Instant::now();
+    let input_ms = Arc::new(Mutex::new(Vec::new()));
+    let input_hz = env("REPLAY_INPUT_HZ", 0.0f64);
+    if input_hz > 0.0 {
+        let mut stream = client.open_uni().await.unwrap();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs_f64(1.0 / input_hz));
+            loop {
+                tick.tick().await;
+                let at = clock.elapsed().as_micros() as u64;
+                if stream.write_all(&at.to_le_bytes()).await.is_err() {
+                    return;
+                }
+            }
+        });
+        let (host_side, recording) = (conn.clone(), input_ms.clone());
+        tokio::spawn(async move {
+            let mut stream = host_side.accept_uni().await.unwrap();
+            let mut at = [0; 8];
+            while stream.read_exact(&mut at).await.is_ok() {
+                let took = clock.elapsed().as_micros() as u64 - u64::from_le_bytes(at);
+                recording.lock().unwrap().push(took as f64 / 1000.0 - path.delay.as_secs_f64() * 1000.0);
+            }
+        });
+    }
+
     // Each datagram starts with its frame's number; the last to arrive says when a frame was whole.
     let arrived = Arc::new(Mutex::new(vec![(None::<Instant>, 0usize); frames.len()]));
     let recording = arrived.clone();
@@ -367,6 +397,20 @@ async fn replaying_a_session() {
         times.iter().filter(|ms| **ms > 60.0).count()
     );
     println!("lowest estimate {:.1} Mb/s, lowest window {} KB", lowest_estimate as f64 / 1e6, lowest_window / 1024);
+    let mut input = input_ms.lock().unwrap().clone();
+    if !input.is_empty() {
+        input.sort_unstable_by(f64::total_cmp);
+        let at = |share: f64| input[((input.len() - 1) as f64 * share) as usize];
+        println!(
+            "{} inputs, ms over the path's delay: p10 {:.2} p50 {:.2} p90 {:.2} p99 {:.2} max {:.2}",
+            input.len(),
+            at(0.1),
+            at(0.5),
+            at(0.9),
+            at(0.99),
+            at(1.0)
+        );
+    }
 
     conn.close(0u32.into(), b"done");
     sender.close().await;

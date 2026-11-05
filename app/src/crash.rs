@@ -35,6 +35,16 @@ pub fn watch(folder: PathBuf) {
     }
 }
 
+/// Takes faults back from anything loaded since that set its own handler, as a graphics driver
+/// may: no report came from a crash inside the Vulkan loader.
+pub fn rewatch() {
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::System::Diagnostics::Debug::SetUnhandledExceptionFilter;
+        SetUnhandledExceptionFilter(Some(fault));
+    }
+}
+
 fn record(what: &str) {
     let Some(folder) = FOLDER.get() else { return };
     let stamp = connect_perf::session_stamp();

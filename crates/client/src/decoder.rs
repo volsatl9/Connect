@@ -95,8 +95,8 @@ pub(crate) fn probe() -> &'static [GpuDecodeSupport] {
 
 /// Lists the graphics cards that decode anything through Vulkan Video, and what.
 pub fn gpu_decode_support() -> Result<Vec<GpuDecodeSupport>> {
-    use gpu_video::{VulkanInstance, capabilities::VulkanDeviceType};
-    let instance = VulkanInstance::new().context("loading Vulkan")?;
+    use gpu_video::capabilities::VulkanDeviceType;
+    let instance = crate::gpu_decode::instance()?;
     Ok(instance
         .iter_adapters()
         .context("listing graphics cards")?

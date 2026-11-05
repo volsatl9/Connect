@@ -1,8 +1,10 @@
 # Connect
 
-Version 0.10.3 gives way when Wi-Fi delay builds up, holds the bitrate through a dropout, starts
-sessions without a freeze, adds a Super button and error codes, and tells a viewer when a window
-running as administrator is in the way.
+Version 0.10.4 stops a crash on connecting, seen on an RTX 5060 PC, and no longer lowers the bitrate
+for a short rise in the round trip.
+
+Version 0.10.3 holds the bitrate through a dropout, starts sessions without a freeze, adds a Super
+button and error codes, and tells a viewer when a window running as administrator is in the way.
 
 Version 0.10.2 keeps fast networks like Wi-Fi from stalling after a quiet scene, sends fewer
 controller updates, and adds a frame rate limit to Settings.

@@ -68,17 +68,6 @@ const CREEP: f64 = 1.0025;
 /// sent, and taking that for the path cut 80 Mb/s to the floor at a backlog with nothing lost.
 const TESTED_SHARE: f64 = 0.5;
 const TESTED_FOR: Duration = Duration::from_secs(2);
-/// The round trip this long past its best, for two ticks, means a queue on the path the sender
-/// can't see, such as Wi-Fi's: the video gives way. The time matters as much as the share, as
-/// Wi-Fi jitters by several times a very low round trip with nothing queued.
-const DELAYED: f64 = 1.5;
-const DELAYED_BY: Duration = Duration::from_millis(15);
-/// This far past it, a harder cut.
-const VERY_DELAYED_BY: Duration = Duration::from_millis(50);
-/// Time for a cut to show in the round trip before the next.
-const BETWEEN_DELAY_CUTS: Duration = Duration::from_secs(1);
-/// With less video than this going, the delay isn't the video's doing.
-const DELAY_NEEDS_BPS: f64 = 8_000_000.0;
 /// How far over its value at the ceiling the estimate has to be for the path to count as better.
 const BETTER_PATH: f64 = 1.25;
 /// After this long without trouble, the ceiling follows the estimate however little it moved.
@@ -106,8 +95,6 @@ pub(crate) struct PathSample {
     pub recovery_requests: u64,
     /// Running total of video bytes handed to the network.
     pub video_bytes: u64,
-    /// The smoothed round trip. Goes stale when nothing comes back.
-    pub rtt: Option<Duration>,
 }
 
 /// Why the bitrate changed at a tick, for the trace.
@@ -124,8 +111,6 @@ pub(crate) enum Reason {
     Creep,
     /// The viewer lost frames, but the last cut did nothing for the loss: holding.
     LossHeld,
-    /// The round trip stayed well past its best.
-    Delay,
 }
 
 impl Reason {
@@ -138,7 +123,6 @@ impl Reason {
             Reason::Climb => "climb",
             Reason::Creep => "creep",
             Reason::LossHeld => "loss_held",
-            Reason::Delay => "delay",
         }
     }
 }
@@ -157,10 +141,6 @@ pub(crate) struct RateControl {
     losing: bool,
     started: Instant,
     calm_since: Instant,
-    /// The best round trip seen, whether the last tick's was well past it, and the last cut for it.
-    best_rtt: Option<Duration>,
-    delayed: bool,
-    delay_cut_at: Option<Instant>,
     /// When the video last used less than [`TESTED_SHARE`] of the bitrate.
     quiet_at: Option<Instant>,
     /// Roughly what the path carried when it last proved too slow, and when.
@@ -191,9 +171,6 @@ impl RateControl {
             losing: false,
             started: now,
             calm_since: now,
-            best_rtt: None,
-            delayed: false,
-            delay_cut_at: None,
             quiet_at: None,
             ceiling: None,
             estimate_at_ceiling: 0,
@@ -258,17 +235,6 @@ impl RateControl {
             self.quiet_at = Some(now);
         }
         let tested = self.quiet_at.is_none_or(|at| now.duration_since(at) >= TESTED_FOR);
-        let rtt = path.rtt.filter(|rtt| !rtt.is_zero());
-        if let Some(rtt) = rtt {
-            self.best_rtt = Some(self.best_rtt.map_or(rtt, |best| best.min(rtt)));
-        }
-        let over = rtt.zip(self.best_rtt).filter(|(rtt, best)| !silent && *rtt > delayed_past(*best));
-        let delay_cut = self.learn
-            && self.delayed
-            && over.is_some()
-            && video_bps >= DELAY_NEEDS_BPS
-            && self.delay_cut_at.is_none_or(|at| now.duration_since(at) >= BETWEEN_DELAY_CUTS);
-        self.delayed = over.is_some();
         let losing = sent >= MIN_SAMPLE_PACKETS && lost > 0 && sample > LOSS_SOME;
         let filling = !self.learn
             || (losing && self.losing)
@@ -287,9 +253,6 @@ impl RateControl {
             Some((0.85, Reason::Loss))
         } else if filling && viewer_lost && !holding {
             Some((0.85, Reason::ViewerLoss))
-        } else if delay_cut {
-            let very = over.is_some_and(|(rtt, best)| rtt > best + VERY_DELAYED_BY);
-            Some((if very { 0.7 } else { 0.85 }, Reason::Delay))
         } else {
             None
         };
@@ -305,14 +268,6 @@ impl RateControl {
         }
         let (after, reason) = if let Some((factor, reason)) = congested {
             self.calm_since = now;
-            // From what's going, not the target: video well under it would feel no cut at all.
-            if reason == Reason::Delay {
-                let sending = f64::from(before).min(video_bps);
-                self.delay_cut_at = Some(now);
-                self.ceiling = Some((clamp(sending), now));
-                self.estimate_at_ceiling = path.bandwidth_estimate.unwrap_or(u64::MAX);
-                return self.settle(before, clamp(sending * factor), reason);
-            }
             // Nothing says the path is slow, only that a burst is queued: a step, not the estimate.
             if self.learn && reason == Reason::Backlog && !tested && self.loss < LOSS_NOTICED {
                 return self.settle(before, clamp(f64::from(before) * factor), reason);
@@ -361,11 +316,6 @@ impl RateControl {
     }
 }
 
-/// The round trip past which a path counts as delayed, given its best.
-fn delayed_past(best: Duration) -> Duration {
-    best.mul_f64(DELAYED).max(best + DELAYED_BY)
-}
-
 fn backlogged(queued_bytes: usize, bps: u32) -> bool {
     queued_bytes > HOLD_MIN_BYTES && queued_bytes as f64 * 8.0 > bps as f64 * HOLD_BACKLOG
 }
@@ -412,95 +362,7 @@ mod tests {
         assert_eq!(rate.bitrate(), 80_000_000);
     }
 
-    /// As in a session on Wi-Fi: 50 of 80 Mb/s going, and the round trip up from 3 to 60 ms.
-    #[test]
-    fn a_round_trip_that_stays_up_cuts_from_what_is_being_sent() {
-        let mut rate = RateControl::new(80_000_000);
-        let start = rate.started;
-        let at = |tick: u32| start + TICK * tick;
-        let path = |tick: u64, ms: u64, bps: u64| PathSample {
-            sent_packets: tick * 1000,
-            video_bytes: tick * bps / 8 / 4,
-            rtt: Some(Duration::from_millis(ms)),
-            ..Default::default()
-        };
-        assert_eq!(rate.update(at(1), path(1, 3, 50_000_000)), None);
-        assert_eq!(rate.update(at(2), path(2, 60, 50_000_000)), None, "one tick is a spike");
-        assert_eq!(rate.update(at(3), path(3, 60, 50_000_000)), Some(35_000_000));
-        assert_eq!(rate.reason(), Reason::Delay);
-        assert_eq!(rate.ceiling(), Some(50_000_000));
-        // A second to show, then another if it hasn't.
-        assert_eq!(rate.update(at(4), path(4, 60, 35_000_000)), None);
-        assert_eq!(rate.update(at(7), path(7, 60, 35_000_000)), Some(24_500_000));
-    }
-
-    /// A Wi-Fi link that carries 40 Mb/s, a game that would send 55, and everything over 40 queued
-    /// where the host can't see it, adding to the round trip.
-    #[test]
-    fn settles_under_a_link_the_queue_of_which_it_cant_see() {
-        let mut rate = RateControl::new(80_000_000);
-        let start = rate.started;
-        let (capacity, seconds) = (40e6, TICK.as_secs_f64());
-        let (mut queued_bits, mut video, mut sent) = (0.0f64, 0u64, 0u64);
-        let (mut rtt_sum, mut rtt_worst, mut bitrate_sum, mut settled) = (0.0, 0.0f64, 0.0, 0.0);
-        for tick in 1..=240u32 {
-            let bps = f64::from(rate.bitrate()).min(55e6);
-            queued_bits = (queued_bits + (bps - capacity) * seconds).max(0.0);
-            let rtt_ms = 3.0 + queued_bits / capacity * 1000.0;
-            video += (bps * seconds / 8.0) as u64;
-            sent += (bps * seconds / 8.0 / 1200.0) as u64;
-            let path = PathSample {
-                sent_packets: sent,
-                video_bytes: video,
-                rtt: Some(Duration::from_secs_f64(rtt_ms / 1000.0)),
-                ..Default::default()
-            };
-            rate.update(start + TICK * tick, path);
-            if tick > 60 {
-                rtt_sum += rtt_ms;
-                rtt_worst = rtt_worst.max(rtt_ms);
-                bitrate_sum += bps;
-                settled += 1.0;
-            }
-        }
-        let (rtt, mbps) = (rtt_sum / settled, bitrate_sum / settled / 1e6);
-        println!("{rtt:.0} ms round trip on average, {rtt_worst:.0} at worst, {mbps:.0} Mb/s");
-        assert!(rtt < 30.0 && rtt_worst < 100.0, "{rtt:.0} ms on average, {rtt_worst:.0} at worst");
-        assert!(mbps > 28.0, "{mbps:.0} Mb/s");
-    }
-
-    #[test]
-    fn jitter_alone_is_no_delay() {
-        let mut rate = RateControl::new(80_000_000);
-        let start = rate.started;
-        for tick in 1..40u32 {
-            let path = PathSample {
-                sent_packets: u64::from(tick) * 1000,
-                video_bytes: u64::from(tick) * 2_500_000,
-                // 1.6 ms at best, and several times that all along: over 1.5 times, under 15 ms more.
-                rtt: Some(Duration::from_micros(if tick == 1 { 1600 } else { 12_000 })),
-                ..Default::default()
-            };
-            assert_eq!(rate.update(start + TICK * tick, path), None);
-        }
-    }
-
-    #[test]
-    fn a_slow_round_trip_is_no_reason_to_cut_a_trickle() {
-        let mut rate = RateControl::new(80_000_000);
-        let start = rate.started;
-        for tick in 1..10u32 {
-            let path = PathSample {
-                sent_packets: u64::from(tick) * 100,
-                video_bytes: u64::from(tick) * 100_000,
-                rtt: Some(Duration::from_millis(if tick == 1 { 3 } else { 300 })),
-                ..Default::default()
-            };
-            assert_eq!(rate.update(start + TICK * tick, path), None);
-        }
-    }
-
-    /// As at the end of the same session: video queued, nothing going out, for three seconds.
+    /// As in a session on Wi-Fi: video queued, nothing going out, for three seconds.
     #[test]
     fn a_dropout_doesnt_cost_the_bitrate() {
         let mut rate = RateControl::new(80_000_000);
@@ -514,7 +376,6 @@ mod tests {
                 queued_bytes: if tick <= 2 { 0 } else { 300_000 },
                 video_bytes: 1_000_000,
                 bandwidth_estimate: Some(47_000_000),
-                rtt: Some(Duration::from_millis(if tick == 1 { 3 } else { 89 })),
                 ..Default::default()
             };
             rate.update(start + TICK * tick, path);

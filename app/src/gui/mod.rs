@@ -456,6 +456,7 @@ impl App {
         if self.client.is_some() {
             return;
         }
+        crate::crash::rewatch();
         let ctx = ctx.clone();
         let (handle, events) =
             connect_client::connect(self.endpoint.clone(), host_id, self.settings.device_name.clone(), move || {
